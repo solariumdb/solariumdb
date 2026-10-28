@@ -1,0 +1,4355 @@
+
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Buffers.Text;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using Kahuna.Server.Locks;
+using Kahuna.Persistence.Protos;
+using Kahuna.Server.Persistence;
+using Kahuna.Server.Persistence.Backend;
+using Kahuna.Server.Persistence.Pitr;
+using Kommander.Time;
+using Kommander.WAL;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Solarium;
+using Solarium.Storage;
+using Google.Protobuf;
+using Kahuna.Server.KeyValues;
+using Kahuna.Server.Locks.Data;
+using Kahuna.Shared.Communication.Grpc;
+
+namespace Solarium.Kahuna;
+
+/// <summary>
+/// Kahuna's persistence backend on Solarium: a port of Kahuna's RocksDB backend that keeps its rows, keys
+/// and column families, so the same logic serves the same reads, prunes and checkpoints.
+/// Implements the <see cref="IPersistenceBackend"/> interface along with IDisposable.
+/// </summary>
+/// <remarks>
+/// This class allows storing and retrieving data categorized into different column families
+/// such as key-values and locks. The implementation ensures efficient read-write operations
+/// and transactional support through Solarium's atomic, synced write batches.
+/// </remarks>
+internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposable
+{
+    /// <summary>
+    /// Defines a constant string value used as a marker suffix appended to keys
+    /// within the database operations. This marker is utilized to represent the
+    /// "current" version of an item in storage, ensuring unique identification
+    /// of the latest state of a record.
+    /// </summary>
+    private const string CurrentMarker = "~CURRENT";
+
+    // UTF-8 encoding of CurrentMarker for allocation-free key construction. The Debug.Assert
+    // below catches any future edit to the const that forgets to update this literal.
+    private static ReadOnlySpan<byte> CurrentMarkerUtf8 => "~CURRENT"u8;
+
+    // Per-key no-revision provenance marker. Sorts after "~CURRENT" and after numeric revision
+    // suffixes, so it is the last row in a logical key's contiguous group. Its value packs the
+    // earliest and latest HLC the key was written with SetNoRevision (6 × int64, little-endian:
+    // earliest node/physical/counter then latest node/physical/counter). It never maps to a logical
+    // key on read (revision/current scans skip it) and is dropped from as-of images.
+    private static ReadOnlySpan<byte> NoRevMarkerUtf8 => "~NOREV"u8;
+    
+    private const int NoRevProvenanceSize = 6 * sizeof(long);
+
+    // Guard for stackalloc on key buffers. Inputs are caller-controlled, so we must bound the
+    // stack frame; anything larger goes through ArrayPool. Real keys are well under this, so the
+    // ArrayPool path is rarely taken while the per-call stack zeroing stays cheap.
+    private const int KeyStackThreshold = 256;
+
+    /// <summary>
+    /// Keys per MultiGet when the flush path reads current heads, which bounds the row keys and
+    /// values one call holds.
+    /// </summary>
+    private const int HeadReadBatchSize = 128;
+
+    /// <summary>
+    /// Represents the default write options for write operations in the persistence backend.
+    /// Configured with synchronization enabled to ensure durability by flushing changes to disk
+    /// before returning control to the calling code.
+    /// </summary>
+    /// <remarks>
+    /// This is a deliberate second fsync: writes already pass through the durable Raft WAL before
+    /// reaching this backend. Sync is retained because the checkpoint mechanism can truncate the WAL
+    /// once a partition is checkpointed, after which this store becomes the source of truth for that
+    /// data — dropping sync here would risk losing checkpointed state on a crash. Relaxing it would
+    /// require ordering guarantees between checkpoint/WAL-truncation and this store's flush, which is
+    /// out of scope for the table-tuning change.
+    /// </remarks>
+    private static readonly WriteOptions DefaultWriteOptions = WriteOptions.Synced;
+
+    // The kv family's memtable, as the RocksDB backend sizes it: a larger memtable absorbs more writes
+    // before it flushes. Locks are small and short-lived, so their family gets a much smaller one.
+    private const long KvWriteBufferSize = 64 * 1024 * 1024;
+
+    private const long LocksWriteBufferSize = 8 * 1024 * 1024;
+
+    // The options of both families, for the live store and for the checkpoint copies that a trim or a
+    // merge rewrites. Up to three kv memtables let writes go on into a fresh one while two earlier
+    // ones flush. Tables are LZ4-compressed, as the RocksDB backend's are with RocksDB's default
+    // Snappy: the current row and the history row of a write hold the same value side by side, in
+    // one block, so the second copy costs almost nothing.
+    private static readonly IReadOnlyDictionary<string, ColumnFamilyOptions> FamilyOptions = new Dictionary<string, ColumnFamilyOptions>(StringComparer.Ordinal)
+    {
+        ["kv"] = new() { WriteBufferSize = KvWriteBufferSize, MaxWriteBufferNumber = 3, Compression = CompressionType.Lz4 },
+        ["locks"] = new() { WriteBufferSize = LocksWriteBufferSize, MaxWriteBufferNumber = 2, Compression = CompressionType.Lz4 },
+    };
+
+    /// <summary>
+    /// The cache of every store in the process that is not given one: 256 MiB for the index and filter blocks of
+    /// their tables, as the RocksDB backend's process-wide block cache of that size. It holds no data blocks, so
+    /// it covers the indexes and filters of about 12 GB of tables, 6 GB with LZ4; past that, a lookup that misses
+    /// reads one partition of its table's index and filter again from the file (see <c>docs/kahuna.md</c>).
+    /// </summary>
+    internal static Cache SharedBlockCache { get; } = new(256L * 1024 * 1024);
+
+    // The options of both families with their index and filter blocks in the cache, pinned at level 0, as the
+    // RocksDB backend's cache_index_and_filter_blocks and pin_l0_filter_and_index_blocks_in_cache.
+    private static Dictionary<string, ColumnFamilyOptions> CachedFamilyOptions(Cache cache)
+    {
+        Dictionary<string, ColumnFamilyOptions> options = new(StringComparer.Ordinal);
+        foreach (KeyValuePair<string, ColumnFamilyOptions> family in FamilyOptions)
+            options[family.Key] = family.Value with { BlockCache = cache, CacheIndexAndFilterBlocks = true, PinL0FilterAndIndexBlocksInCache = true };
+
+        return options;
+    }
+
+    // Mutable only under the swap fence's write side: the storage-failure recovery path closes the
+    // wedged instance and reopens it in place (see TryRecoverFromStorageFailure). Every use of
+    // these three fields must run between EnterDbFence and ExitDbFence, which guarantees the
+    // handles stay alive and stable for the duration of the operation.
+    private SolariumDb db;
+
+    private ColumnFamily columnFamilyKeys;
+
+    private ColumnFamily columnFamilyLocks;
+
+    private readonly string path;
+
+    private readonly string dbRevision;
+
+    // Open-time settings retained so a recovery reopen reproduces the original configuration: the reopen
+    // gets the same limiter and the same memtable budget, so each budget stays one budget.
+    private readonly IStorageEnvironment environment;
+
+    private readonly RateLimiter? rateLimiter;
+
+    private readonly int compactionThreads;
+
+    private readonly Cache blockCache;
+
+    private readonly WriteBufferManager? writeBufferManager;
+
+    /// <summary>
+    /// Swap fence for the close-and-reopen recovery path. Every operation that touches the
+    /// database holds the read side; the recovery swap holds the write side, so it waits for
+    /// in-flight operations (including full iterator scans and checkpoint saves) and blocks new
+    /// ones for the duration of the swap. Uncontended read acquisition is nanoseconds against
+    /// the microseconds of a read, so the fence does not tax the hot read path.
+    /// </summary>
+    private readonly ReaderWriterLockSlim swapFence = new(LockRecursionPolicy.NoRecursion);
+
+    /// <summary>
+    /// True while the engine is closed: between a recovery close and a successful reopen, and
+    /// after <see cref="Dispose"/>. Guarded by <see cref="swapFence"/>. While set, every
+    /// operation fails with a managed <see cref="IOException"/> instead of touching a disposed
+    /// database.
+    /// </summary>
+    private bool storageUnavailable;
+
+    private bool disposed;
+
+    /// <summary>
+    /// Reports write failures that this backend converts into a <c>false</c> return — see the
+    /// store methods' failure contract. Never null (falls back to <see cref="NullLogger"/>).
+    /// </summary>
+    private readonly ILogger logger;
+
+    // Durable pruned-history floor, stored in the kv column family under a reserved meta key and
+    // written in the SAME WriteBatch as the revision deletes that advance it — so a crash can never
+    // leave the floor trailing the deleted history. The '\0'-prefixed key never collides with a user
+    // key and is inert to the ~CURRENT / numeric-revision scans (which never see a '\0' prefix).
+    private static ReadOnlySpan<byte> PrunedFloorKeyUtf8 => "\0pitr_pruned_history_floor"u8;
+
+    // The floor's key before the '\0' prefix: a leading space. A store that pruned under an older
+    // build holds its floor only here, and an absent floor reads as "never pruned" — the value that
+    // licenses a backup to trust already-deleted history. So when the current key is absent, the
+    // load falls back to this key and copies the value forward. The legacy key is left in place so
+    // a rollback to an older build still reads a valid floor.
+    private static ReadOnlySpan<byte> LegacyPrunedFloorKeyUtf8 => " pitr_pruned_history_floor"u8;
+
+    // A floor that refuses every real cut: returned when the durable floor is unreadable/corrupt for a
+    // store that may have pruned, so backups fail closed until integrity is re-established.
+    private static readonly HLCTimestamp FailClosedFloor = new(int.MaxValue, long.MaxValue, uint.MaxValue);
+
+    private readonly Lock _floorLock = new();
+
+    private HLCTimestamp? _prunedFloorCache; // null until first loaded from the DB
+
+    private bool _prunedFloorCorrupt;
+
+    // ── Tilde-key registry ─────────────────────────────────────────────────────────────────
+    //
+    // The kv column family interleaves, in one sorted keyspace, the rows of a logical key
+    // ("X~<revision>", "X~CURRENT", "X~NOREV") with the rows of any *other* logical key that
+    // starts with "X~" (keys may legally contain '~'). A range scan that wants only ~CURRENT
+    // rows therefore cannot blindly seek from a revision row "X~<rev>" to "X~CURRENT": the
+    // skipped window may hold the complete row blocks of such sibling keys, and skipping them
+    // silently drops their rows from the scan.
+    //
+    // Every key that can hide inside that window necessarily contains '~'. The registry
+    // records, durably and monotonically, a covering prefix for every logical key ever stored
+    // that contains '~': the key's bucket prefix (everything up to and including its last '/'),
+    // or the empty prefix for a slashless key. A seek-skip over the revision rows of block X is
+    // sound exactly when no registered prefix can cover a key that starts with "X~" — checked
+    // by TildeRegistryBlocksSkip. Prefix granularity keeps the registry bounded by the number
+    // of buckets that hold tilde keys (schema-shaped, not data-shaped).
+    //
+    // Registry rows live at "\0tilde/<prefix>" in the kv family — the '\0' prefix keeps them
+    // inert to every user scan, like the pruned-history floor row. They are written in the SAME
+    // WriteBatch as the first tilde key of their bucket, so a crash can never persist a tilde
+    // key without its registry row. The in-memory snapshot is updated BEFORE the batch commits:
+    // an over-registration only suppresses an optimization, never correctness.
+    //
+    // The registry is authoritative only for stores that have run registry-aware code for their
+    // whole life: a sentinel row is written when the store is first opened with an empty kv
+    // family. A pre-existing store without the sentinel keeps today's step-over-every-row scan
+    // behavior (correct, slow) — its historical tilde keys were never registered.
+    private static ReadOnlySpan<byte> TildeRegistryRowPrefixUtf8 => "\0tilde/"u8;
+
+    private static ReadOnlySpan<byte> TildeRegistrySentinelKeyUtf8 => "\0tilde_registry"u8;
+
+    /// <summary>
+    /// Immutable snapshot of the registered tilde prefixes. Replaced wholesale under
+    /// <see cref="_tildeRegistryLock"/>; read lock-free by scans on scheduler threads.
+    /// </summary>
+    private volatile string[] tildePrefixes = [];
+
+    /// <summary>
+    /// True when the registry provably covers every tilde key the store has ever held, i.e. the
+    /// store carried the registry sentinel from its first non-empty open. False for stores
+    /// created by older builds: their scans never seek-skip.
+    /// </summary>
+    private volatile bool tildeRegistryAuthoritative;
+
+    private readonly Lock _tildeRegistryLock = new();
+
+    /// <summary>
+    /// Consecutive non-current rows a scan steps over inside one run before it attempts a
+    /// seek past the rest of the block. Blocks with fewer revisions than this never pay a
+    /// seek or a registry check; deep blocks pay this many steps plus one seek.
+    /// </summary>
+    private const int RevisionRunSeekThreshold = 8;
+
+    // ── Revision-prune memo ─────────────────────────────────────────────────────────────────
+    //
+    // The targeted prune runs inside every flush cycle for every key that cycle flushed. Without
+    // a memo each visit walks the key's whole revision block — an iterator step, a value
+    // decode and a key copy per "<key>~<rev>" row — only to learn that nothing is old enough, or
+    // numerous enough, to delete. A hot key accrues revisions at its write rate, so that walk grows
+    // without bound and the prune's share of the flush cycle grows with it, until the writer spends
+    // most of every cycle pruning nothing and the unflushed backlog grows faster than it drains.
+    // (Observed under a bank-transfer workload: ~4,000 hot keys at hundreds of revisions each cost seconds of prune
+    // per cycle against a one-second flush budget; the backlog filled the heap in ten minutes.)
+    //
+    // The memo records, per key, what the last walk learned and what changed since: the number of
+    // history rows and the commit time of the oldest non-current row. Both move only through this
+    // backend — StoreKeyValuesFenced advances them as it writes, DeleteFamilyRows drops them with
+    // the rows — so a visit decides in O(1) whether a walk could delete anything: count retention
+    // needs more history rows than it keeps, age retention needs the oldest non-current row to be
+    // older than the cutoff. A key that satisfies neither is skipped. The memo is conservative by
+    // construction — every update between walks pushes it towards "eligible" (a smaller oldest
+    // timestamp, a larger row count) — so a stale memo costs a needless walk, never a missed prune.
+    // Keys without a memo always walk; a walk that stops on the delete budget drops the memo so the
+    // key walks again next cycle.
+    //
+    // Bounded: past MaxPruneMemos a targeted walk clears the table and the next walks rebuild it, a
+    // correctness-neutral reset that costs each key one extra walk. A sweep walk never clears it: the
+    // sweep visits keys in order, so on a keyspace larger than the bound a clearing sweep would empty
+    // the table before it came back to any key and never get a hit. A full table only stops the sweep
+    // from adding memos, so it keeps a stable share of hits instead.
+    private sealed class PruneMemo
+    {
+        /// <summary>History rows ("&lt;key&gt;~&lt;rev&gt;") known for the key, including the current
+        /// revision's own row. Exact after a walk; only ever incremented between walks.</summary>
+        public int HistoryRows;
+
+        /// <summary>Commit physical time of the oldest history row that is not the current revision's,
+        /// or <see cref="long.MaxValue"/> when none exists. Exact after a walk; only lowered between walks.</summary>
+        public long OldestNonCurrentPhysical;
+
+        /// <summary>Commit physical time of the oldest non-current row the last walk's floor did NOT
+        /// protect (below the floor-boundary revision), or <see cref="long.MaxValue"/>. Equals
+        /// <see cref="OldestNonCurrentPhysical"/> when no floor was active. While a floor stands, this is
+        /// the row age retention can still reach — the one that decides whether a floor-blocked key is
+        /// worth walking again. Only lowered between walks.</summary>
+        public long OldestUnprotectedPhysical;
+
+        /// <summary>True when the last walk found deletable rows the snapshot floor made it keep: the key
+        /// is worth walking again only once the floor moves, more history arrives, or an unprotected row
+        /// ages past the cutoff.</summary>
+        public bool FloorBlocked;
+
+        /// <summary>Floor the last walk ran under; meaningful when <see cref="FloorBlocked"/>.</summary>
+        public HLCTimestamp FloorAtWalk;
+
+        /// <summary>History rows the last walk saw; meaningful when <see cref="FloorBlocked"/>.</summary>
+        public int HistoryRowsAtWalk;
+    }
+
+    /// <summary>Upper bound on memoized keys; ~100 bytes each, so the table stays well under 32 MB.</summary>
+    private const int MaxPruneMemos = 200_000;
+
+    /// <summary>Memo table bound in effect; <see cref="MaxPruneMemos"/> unless a test lowers it.</summary>
+    internal int PruneMemoCapacity { get; set; } = MaxPruneMemos;
+
+    private readonly Dictionary<string, PruneMemo> pruneMemos = new(StringComparer.Ordinal);
+
+    private readonly Lock _pruneMemoLock = new();
+
+    /// <summary>
+    /// Raw key bytes at which the next backend-wide revision sweep should resume, or <c>null</c> to
+    /// start from the beginning of the column family. Carried across sweep passes so each pass scans
+    /// a bounded slice of the keyspace instead of the whole column family every interval.
+    /// </summary>
+    private byte[]? sweepCursor;
+
+    /// <summary>
+    /// Incremented after every write that adds or removes key/value rows on behalf of a caller
+    /// (<see cref="StoreKeyValues"/>, <see cref="DeleteKeyValues"/>) — never by the prune's own deletes.
+    /// A prune walk reads through an iterator snapshot; a walk that saw the generation move while it ran
+    /// may have missed a row, so it records no memo. The sweep uses the same counter to prove that
+    /// nothing was written since its last complete clean cycle.
+    /// </summary>
+    private long keyRowsGeneration;
+
+    // ── Sweep quiescence ────────────────────────────────────────────────────────────────────
+    //
+    // A cycle is the run of sweep passes from the start of the column family to its end. On a store
+    // with no writes, the only things that can make a key prunable again are a moved snapshot floor,
+    // different retention settings, or age retention reaching the oldest row it may delete. A cycle
+    // that left no work behind therefore proves the store clean until one of those happens, and the
+    // next cycle is skipped in O(1) instead of re-walking every key. Without this, an idle node with
+    // more logical keys than MaxPruneMemos re-walked its whole keyspace on every cleanup interval and,
+    // because a full cycle took longer than the interval, never stopped.
+    //
+    // Touched only by the sweep, which runs on the single background writer under the read side of
+    // the swap fence, and by the recovery reopen, which holds the write side.
+
+    /// <summary>What a complete clean sweep cycle proved; null while no such proof stands.</summary>
+    private sealed record SweepQuiescence(
+        long Generation,
+        HLCTimestamp Floor,
+        int RetentionCount,
+        TimeSpan RetentionAge,
+        long AgeFrontierPhysical);
+
+    private SweepQuiescence? sweepQuiescence;
+
+    /// <summary>False once the running cycle left work behind or its inputs changed between passes.</summary>
+    private bool sweepCycleClean;
+
+    private long sweepCycleGeneration;
+
+    private HLCTimestamp sweepCycleFloor;
+
+    private int sweepCycleRetentionCount;
+
+    private TimeSpan sweepCycleRetentionAge;
+
+    /// <summary>
+    /// Earliest commit time, over the keys the running cycle visited, at which age retention could make
+    /// one of them prunable again (see the frontier that PruneRevisionsForKey reports).
+    /// </summary>
+    private long sweepCycleAgeFrontier;
+
+    /// <summary>
+    /// One maintenance iterator shared by every key walk of a prune call, instead of one per key. The
+    /// iterator is a snapshot, so the generation is sampled before it is created: a write that lands
+    /// later moves the generation and voids the memo.
+    /// </summary>
+    private sealed class PruneWalkCursor(SolariumPersistenceBackend owner) : IDisposable
+    {
+        private Iterator? iterator;
+
+        public long Generation { get; private set; }
+
+        public Iterator Iterator
+        {
+            get
+            {
+                if (iterator is null)
+                {
+                    Generation = Volatile.Read(ref owner.keyRowsGeneration);
+                    iterator = owner.db.NewIterator(owner.columnFamilyKeys);
+                }
+
+                return iterator;
+            }
+        }
+
+        public void Dispose() => iterator?.Dispose();
+    }
+
+    /// <summary>
+    /// Opens, or creates, the store in <c>{path}/{dbRevision}</c> on <paramref name="environment"/> (the
+    /// default storage environment when null), with the column families <c>kv</c> and <c>locks</c>.
+    /// <paramref name="compactionBytesPerSec"/> above 0 paces the store's flush and compaction writes with a
+    /// <see cref="RateLimiter"/> of that rate, and <paramref name="maxBackgroundCompactions"/> above 0 sets the
+    /// compactions that run at once (see <see cref="CompactionThreads"/> for the defaults). The tables of both
+    /// families keep their index and filter blocks in <paramref name="blockCache"/>, pinned at level 0, as the
+    /// RocksDB backend's do in its block cache; null, the default, is <see cref="SharedBlockCache"/>.
+    /// <paramref name="writeBufferManager"/>, when given, charges the store's memtables to a budget it may share
+    /// with other databases, the node's WAL among them.
+    /// </summary>
+    public SolariumPersistenceBackend(string path = ".", string dbRevision = "v1", ILogger? logger = null, IStorageEnvironment? environment = null,
+        long compactionBytesPerSec = 0, int maxBackgroundCompactions = 0, Cache? blockCache = null,
+        WriteBufferManager? writeBufferManager = null)
+    {
+        this.path = path;
+        this.dbRevision = dbRevision;
+        this.environment = environment ?? DefaultStorageEnvironment.Instance;
+        rateLimiter = compactionBytesPerSec > 0 ? new RateLimiter(compactionBytesPerSec) : null;
+        compactionThreads = maxBackgroundCompactions > 0 ? maxBackgroundCompactions
+            : rateLimiter is not null ? Math.Max(2, System.Environment.ProcessorCount / 2)
+            : 1;
+        this.blockCache = blockCache ?? SharedBlockCache;
+        this.writeBufferManager = writeBufferManager;
+        this.logger = logger ?? NullLogger.Instance;
+
+        db = OpenStore(out columnFamilyKeys, out columnFamilyLocks);
+
+        InitializeTildeRegistry();
+    }
+
+    /// <summary>
+    /// The compactions of the store that run at once: the count given, else <c>max(2, CPUs / 2)</c> with a
+    /// compaction rate, as the RocksDB backend, else one. Without a rate, several compactions running at once
+    /// take the disk from the store's synced writes: on a disk that commits synced writes at about 100 MB/s,
+    /// they slowed batches of 1,024 rows to a third, where a rate of 50 MB/s made them as fast as one thread's.
+    /// </summary>
+    internal int CompactionThreads => compactionThreads;
+
+    /// <summary>The limiter that paces the store's flush and compaction writes, or null with no compaction rate.</summary>
+    internal RateLimiter? CompactionRateLimiter => rateLimiter;
+
+    /// <summary>The cache of the tables' index and filter blocks.</summary>
+    internal Cache BlockCache => blockCache;
+
+    /// <summary>The storage environment the store does its file I/O through.</summary>
+    internal IStorageEnvironment Environment => environment;
+
+    /// <summary>
+    /// Flushes both families' memtables to tables and returns the bytes their open tables keep out of the cache
+    /// (<c>rocksdb.estimate-table-readers-mem</c>). For tests, with no recovery running.
+    /// </summary>
+    internal long FlushAndMeasureTableMemoryForTesting()
+    {
+        long bytes = 0;
+        foreach (ColumnFamily family in new[] { columnFamilyKeys, columnFamilyLocks })
+        {
+            db.Flush(family, wait: true);
+            bytes += long.Parse(db.GetProperty("rocksdb.estimate-table-readers-mem", family)!, System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        return bytes;
+    }
+
+    /// <summary>The memtable budget the store charges, or null when it has none.</summary>
+    internal WriteBufferManager? MemTableBudget => writeBufferManager;
+
+    /// <summary>
+    /// Loads the tilde-key registry and decides whether it is authoritative for this store.
+    /// A store whose kv family holds no user rows yet (fresh, or internal '\0' rows only) gets
+    /// the sentinel written now — nothing unregistered can already exist, and every later write
+    /// passes through <see cref="StoreKeyValuesFenced"/>, which registers as it stores. A store
+    /// with user rows but no sentinel predates the registry: its historical tilde keys are
+    /// unknown, so scans never seek-skip there. Runs from the constructor and after a recovery
+    /// reopen; both hold no fence, and no reader exists yet (constructor) or every reader is
+    /// blocked on the swap fence's write side (recovery).
+    /// </summary>
+    private void InitializeTildeRegistry()
+    {
+        bool sentinelPresent = db.Get(TildeRegistrySentinelKeyUtf8, columnFamilyKeys) is not null;
+
+        if (!sentinelPresent)
+        {
+            if (KvFamilyHoldsUserRows())
+            {
+                tildeRegistryAuthoritative = false;
+                tildePrefixes = [];
+                if (logger.IsEnabled(LogLevel.Information))
+                    logger.LogInformation(
+                        "SolariumDb store at {Path}/{Revision} predates the tilde-key registry; range scans keep the step-over-history behavior",
+                        path, dbRevision);
+                return;
+            }
+
+            // Not synced: a crash before this lands re-runs the same empty-store check on the
+            // next open and rewrites the sentinel — no user write can slip in before the
+            // constructor returns.
+            db.Put(TildeRegistrySentinelKeyUtf8, ReadOnlySpan<byte>.Empty, columnFamilyKeys);
+        }
+
+        List<string> prefixes = [];
+
+        using (Iterator iterator = db.NewIterator(columnFamilyKeys))
+        {
+            iterator.Seek(TildeRegistryRowPrefixUtf8);
+
+            while (iterator.Valid())
+            {
+                ReadOnlySpan<byte> rawKey = iterator.Key();
+                if (!rawKey.StartsWith(TildeRegistryRowPrefixUtf8))
+                    break;
+
+                prefixes.Add(Encoding.UTF8.GetString(rawKey[TildeRegistryRowPrefixUtf8.Length..]));
+                iterator.Next();
+            }
+        }
+
+        tildePrefixes = prefixes.ToArray();
+        tildeRegistryAuthoritative = true;
+    }
+
+    /// <summary>
+    /// True when the kv family holds at least one row outside the reserved '\0' internal
+    /// namespace and the legacy space-prefixed floor row. Only such rows can be revision or
+    /// sibling rows a seek-skip would have to reason about.
+    /// </summary>
+    private bool KvFamilyHoldsUserRows()
+    {
+        using Iterator iterator = db.NewIterator(columnFamilyKeys);
+        iterator.SeekToFirst();
+
+        while (iterator.Valid())
+        {
+            ReadOnlySpan<byte> rawKey = iterator.Key();
+
+            if ((rawKey.Length > 0 && rawKey[0] == 0) || rawKey.SequenceEqual(LegacyPrunedFloorKeyUtf8))
+            {
+                iterator.Next();
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Opens the store at its configured path with the retained open-time settings. Used by the
+    /// constructor and by the storage-failure recovery reopen
+    /// (<see cref="TryRecoverFromStorageFailure"/>).
+    /// </summary>
+    /// <remarks>
+    /// A torn record at the tail of the WAL, the residue of a crash mid-append or of an append cut short
+    /// by a full disk, is cut at open; damage with intact records after it refuses to open. Every write
+    /// here is synced (<see cref="DefaultWriteOptions"/>), so a cut record was never acknowledged.
+    /// </remarks>
+    private SolariumDb OpenStore(out ColumnFamily kvFamily, out ColumnFamily locksFamily)
+    {
+        DbOptions options = new()
+        {
+            Environment = environment,
+            CreateIfMissing = true,
+            CreateMissingColumnFamilies = true,
+            ColumnFamilyOptions = CachedFamilyOptions(blockCache),
+            MaxBackgroundCompactions = compactionThreads,
+            RateLimiter = rateLimiter,
+            WriteBufferManager = writeBufferManager,
+        };
+
+        SolariumDb database = SolariumDb.Open(Path.Combine(path, dbRevision), options, ["kv", "locks"]);
+
+        kvFamily = database.GetColumnFamily("kv");
+        locksFamily = database.GetColumnFamily("locks");
+
+        return database;
+    }
+
+    /// <summary>
+    /// Enters the swap fence's read side. Throws a managed <see cref="IOException"/> while the
+    /// engine is closed (mid-recovery after a failed reopen, or after Dispose) instead of letting
+    /// the caller touch a disposed database. Callers must pair this with
+    /// <see cref="ExitDbFence"/> in a <c>finally</c> block.
+    /// </summary>
+    private void EnterDbFence()
+    {
+        swapFence.EnterReadLock();
+
+        if (storageUnavailable)
+        {
+            swapFence.ExitReadLock();
+            throw new IOException(
+                $"The Solarium store at '{path}/{dbRevision}' is closed after a storage failure; recovery has not reopened it yet.");
+        }
+    }
+
+    private void ExitDbFence() => swapFence.ExitReadLock();
+
+    /// <summary>
+    /// Reopen preflight: a reopen while the volume is still (nearly) full cannot succeed — Solarium
+    /// needs room for a fresh WAL and manifest — and closing the wedged instance would take the
+    /// read path down with it. Requires a modest floor of free space before any swap is attempted.
+    /// When the free space cannot be determined, the reopen is allowed rather than blocked.
+    /// </summary>
+    private const long MinFreeBytesForReopen = 64L * 1024 * 1024;
+
+    private bool HasFreeSpaceForReopen()
+    {
+        try
+        {
+            string? root = Path.GetPathRoot(Path.GetFullPath(path));
+            return root is null || new DriveInfo(root).AvailableFreeSpace >= MinFreeBytesForReopen;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private const int RecoveryReopenAttempts = 5;
+
+    /// <summary>
+    /// Storage-failure recovery: closes the Solarium database and reopens it at the same path.
+    /// <para>
+    /// Solarium refuses every write after a failed WAL append (for example ENOSPC), as RocksDB latches a background error: every
+    /// later write returns the cached error without new I/O, and with no <c>SstFileManager</c>
+    /// installed the engine never re-checks the disk on its own. The binding exposes no resume
+    /// call, so a close-and-reopen is the only way to clear the latch in-process. The write-behind
+    /// design makes the swap safe: the background writer retains failed batches, and the
+    /// durability floor advances only after data lands, so nothing acknowledged is lost.
+    /// </para>
+    /// <para>
+    /// Concurrent readers, iterators, and checkpoint calls block on the swap fence for the
+    /// duration of the swap and resume against the fresh instance. The reopen uses the same
+    /// tail-tolerant WAL recovery mode as every open (see <see cref="OpenStore"/>): a WAL append
+    /// cut short by ENOSPC leaves a torn tail record, and that record belongs to the failed,
+    /// never-acknowledged batch the writer still retains and will rewrite.
+    /// </para>
+    /// Returns <c>true</c> when the engine is open again; <c>false</c> when the volume is still
+    /// full (nothing was closed) or every bounded reopen attempt failed (the store then reports
+    /// <see cref="IOException"/> until a later recovery call succeeds).
+    /// </summary>
+    public bool TryRecoverFromStorageFailure()
+    {
+        if (!HasFreeSpaceForReopen())
+        {
+            logger.LogWarning(
+                "SolariumDb store at {Path}/{Revision} cannot be reopened yet: the volume still has less than {MinFree} bytes free",
+                path, dbRevision, MinFreeBytesForReopen);
+            return false;
+        }
+
+        swapFence.EnterWriteLock();
+
+        try
+        {
+            if (disposed)
+                return false;
+
+            if (!storageUnavailable)
+            {
+                // Closing releases the path's LOCK file, so a second instance can open the path. After a
+                // failed write the close's own WAL flush can fail too; it reports that after it released
+                // the files and the lock, so the reopen goes on.
+                try
+                {
+                    db.Dispose();
+                }
+                catch (SolariumException ex)
+                {
+                    logger.LogWarning(ex, "Solarium store at {Path}/{Revision} reported a failure while it closed for recovery", path, dbRevision);
+                }
+
+                storageUnavailable = true;
+            }
+
+            for (int attempt = 1; attempt <= RecoveryReopenAttempts; attempt++)
+            {
+                try
+                {
+                    db = OpenStore(out columnFamilyKeys, out columnFamilyLocks);
+                    InitializeTildeRegistry();
+                    ClearPruneMemos();
+                    ResetSweepQuiescence();
+                    storageUnavailable = false;
+
+                    logger.LogWarning(
+                        "SolariumDb store at {Path}/{Revision} was closed and reopened after a storage failure (attempt {Attempt})",
+                        path, dbRevision, attempt);
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex,
+                        "SolariumDb store at {Path}/{Revision} failed reopen attempt {Attempt}/{Max}",
+                        path, dbRevision, attempt, RecoveryReopenAttempts);
+
+                    if (attempt < RecoveryReopenAttempts)
+                        Thread.Sleep(200 * attempt);
+                }
+            }
+
+            return false;
+        }
+        finally
+        {
+            swapFence.ExitWriteLock();
+        }
+    }
+
+    public HLCTimestamp GetPrunedHistoryFloor()
+    {
+        EnterDbFence();
+        try
+        {
+            lock (_floorLock)
+                return CurrentPrunedFloorLocked();
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    private const int PrunedFloorSize = 24;
+
+    // Must hold _floorLock. Lazily loads the durable floor from the DB; a corrupt/unreadable value for
+    // a store that may have pruned yields FailClosedFloor so backups refuse every cut until repaired.
+    private HLCTimestamp CurrentPrunedFloorLocked()
+    {
+        if (_prunedFloorCorrupt)
+            return FailClosedFloor;
+        
+        if (_prunedFloorCache is null)
+        {
+            try
+            {
+                byte[]? data = db.Get(PrunedFloorKeyUtf8, columnFamilyKeys);
+
+                // Absent under the current key: consult the legacy key before concluding "never
+                // pruned" (see LegacyPrunedFloorKeyUtf8). A valid legacy floor is adopted and
+                // copied to the current key; a wrong-length legacy value fails closed below, the
+                // same as a wrong-length current one.
+                if (data is null)
+                {
+                    data = db.Get(LegacyPrunedFloorKeyUtf8, columnFamilyKeys);
+
+                    if (data is not null && data.Length == PrunedFloorSize)
+                    {
+                        // Best-effort migration: a lost write only means the next load falls back
+                        // to the legacy key again, so a Put failure is not a floor failure.
+                        try { db.Put(PrunedFloorKeyUtf8, data, columnFamilyKeys); }
+                        catch { /* re-migrated on the next load */ }
+                    }
+                }
+
+                if (data is null)
+                    _prunedFloorCache = HLCTimestamp.Zero; // never pruned
+                else if (data.Length == PrunedFloorSize)
+                    _prunedFloorCache = UnpackPrunedFloor(data);
+                else
+                    _prunedFloorCorrupt = true;
+            }
+            catch
+            {
+                _prunedFloorCorrupt = true;
+            }
+        }
+        return _prunedFloorCorrupt ? FailClosedFloor : _prunedFloorCache!.Value;
+    }
+
+    // Adds a floor Put to the delete batch when the candidate advances the floor, so the floor lands
+    // atomically with the deletes. Returns the value to commit to the in-memory cache after the batch
+    // is durably written, or Zero when nothing was staged.
+    private HLCTimestamp StagePrunedFloor(WriteBatch batch, HLCTimestamp candidate)
+    {
+        lock (_floorLock)
+        {
+            HLCTimestamp current = CurrentPrunedFloorLocked();
+            
+            if (_prunedFloorCorrupt || candidate.CompareTo(current) <= 0)
+                return HLCTimestamp.Zero;
+            
+            batch.Put(PrunedFloorKeyUtf8, PackPrunedFloor(candidate), columnFamilyKeys);
+            return candidate;
+        }
+    }
+
+    private void CommitPrunedFloor(HLCTimestamp value)
+    {
+        lock (_floorLock)
+        {
+            if (!_prunedFloorCorrupt && (_prunedFloorCache is null || value.CompareTo(_prunedFloorCache.Value) > 0))
+                _prunedFloorCache = value;
+        }
+    }
+
+    private static byte[] PackPrunedFloor(HLCTimestamp t)
+    {
+        byte[] b = new byte[PrunedFloorSize];
+        BinaryPrimitives.WriteInt64LittleEndian(b.AsSpan(0, 8), t.N);
+        BinaryPrimitives.WriteInt64LittleEndian(b.AsSpan(8, 8), t.L);
+        BinaryPrimitives.WriteInt64LittleEndian(b.AsSpan(16, 8), t.C);
+        return b;
+    }
+
+    private static HLCTimestamp UnpackPrunedFloor(ReadOnlySpan<byte> b) =>
+        new((int)BinaryPrimitives.ReadInt64LittleEndian(b[..8]),
+            BinaryPrimitives.ReadInt64LittleEndian(b.Slice(8, 8)),
+            (uint)BinaryPrimitives.ReadInt64LittleEndian(b.Slice(16, 8)));
+
+    /// <summary>
+    /// Metadata-key prefix for per-partition application-durability floors. The leading space sorts
+    /// the rows before every real key, keeping them out of prefix/range scans. (The PITR
+    /// pruned-history floor used this idiom too before it moved to a '\0' prefix; these rows keep
+    /// the space so existing stores read their floors unchanged.)
+    /// </summary>
+    private const string DurabilityFloorKeyPrefix = " durability_floor_";
+
+    private static ReadOnlySpan<byte> DurabilityFloorKeyPrefixUtf8 => " durability_floor_"u8;
+
+    public bool StoreDurabilityFloors(IReadOnlyList<(int PartitionId, long Floor)> floors)
+    {
+        EnterDbFence();
+        try
+        {
+            return StoreDurabilityFloorsFenced(floors);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private bool StoreDurabilityFloorsFenced(IReadOnlyList<(int PartitionId, long Floor)> floors)
+    {
+        WriteBatch batch = new();
+
+        Span<byte> value = stackalloc byte[8];
+
+        foreach ((int partitionId, long floor) in floors)
+        {
+            byte[] key = Encoding.UTF8.GetBytes(DurabilityFloorKeyPrefix + partitionId);
+
+            // Monotonic guard (parity with the SQLite backend's MAX() upsert): the caller's
+            // advanced-only filter resets with the process, so the first write after a restart can
+            // carry a floor below the persisted one — replay re-registers from the checkpoint, and
+            // the fresh watermark starts under the previous run's floor. Regressing the persisted
+            // floor is stale-low-safe but widens the next restart's replay for nothing.
+            byte[]? current = db.Get(key, columnFamilyKeys);
+            if (current is { Length: 8 } && BinaryPrimitives.ReadInt64LittleEndian(current) >= floor)
+                continue;
+
+            BinaryPrimitives.WriteInt64LittleEndian(value, floor);
+            batch.Put(key, value, columnFamilyKeys);
+        }
+
+        // The store contract is "false on failure", never a throw: the background writer's
+        // failure path re-parks failed batches for retry, and it keys off the return value.
+        // A SolariumException here (e.g. ENOSPC) escaping instead of returning false is what
+        // silently dropped batches and froze durability floors under a full disk.
+        try
+        {
+            db.Write(batch, DefaultWriteOptions);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "SolariumDb write of {Count} durability floors failed", floors.Count);
+            return false;
+        }
+
+        return true;
+    }
+
+    public long GetDurabilityFloor(int partitionId)
+    {
+        EnterDbFence();
+        try
+        {
+            byte[]? data = db.Get(Encoding.UTF8.GetBytes(DurabilityFloorKeyPrefix + partitionId), columnFamilyKeys);
+
+            return data is { Length: 8 } ? BinaryPrimitives.ReadInt64LittleEndian(data) : -1;
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    public bool RemoveDurabilityFloor(int partitionId)
+    {
+        EnterDbFence();
+        try
+        {
+            db.Delete(Encoding.UTF8.GetBytes(DurabilityFloorKeyPrefix + partitionId), columnFamilyKeys);
+            return true;
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    /// <summary>
+    /// Stores a batch of lock-related items in the database's locks column family.
+    /// </summary>
+    /// <param name="items">A list of <see cref="PersistenceRequestItem"/> representing the locks and their associated metadata to be stored.</param>
+    /// <returns>Returns <c>true</c> if the operation completes successfully.</returns>
+    public bool StoreLocks(List<PersistenceRequestItem> items)
+    {
+        EnterDbFence();
+        try
+        {
+            return StoreLocksFenced(items);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private bool StoreLocksFenced(List<PersistenceRequestItem> items)
+    {
+        WriteBatch batch = new();
+
+        // The list is not mutated while it is being written out, so iterate its backing storage by
+        // reference — each item is a wide struct and a by-value foreach would copy every one.
+        // One message shell serves every serialization in the batch; the reset restores every
+        // field so an owner-less record cannot inherit the prior record's owner.
+        RocksDbLockMessage kvm = new();
+
+        foreach (ref readonly PersistenceRequestItem item in CollectionsMarshal.AsSpan(items))
+        {
+            ResetLockMessage(kvm);
+
+            kvm.ExpiresPhysical = item.ExpiresPhysical;
+            kvm.ExpiresCounter = item.ExpiresCounter;
+            kvm.LastUsedPhysical = item.LastUsedPhysical;
+            kvm.LastUsedCounter = item.LastUsedCounter;
+            kvm.LastModifiedPhysical = item.LastModifiedPhysical;
+            kvm.LastModifiedCounter = item.LastModifiedCounter;
+            kvm.FencingToken = item.Revision;
+            kvm.State = item.State;
+
+            if (item.Value != null)
+                kvm.Owner = UnsafeByteOperations.UnsafeWrap(item.Value);
+
+            PutLocksItems(batch, in item, kvm, columnFamilyLocks);
+        }
+
+        // "false on failure" contract — see StoreDurabilityFloors for the reasoning.
+        try
+        {
+            db.Write(batch, DefaultWriteOptions);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "SolariumDb write of {Count} locks failed", items.Count);
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Inserts lock items into the database using the specified write batch, item data,
+    /// lock message, and column family handle.
+    /// </summary>
+    /// <param name="batch">The write batch used for batching multiple write operations.</param>
+    /// <param name="item">The lock item containing key, revision, and additional metadata.</param>
+    /// <param name="kvm">The lock row message to be serialized and persisted.</param>
+    /// <param name="columnFamily">The column family handle identifying the column family where the data is stored.</param>
+    private static void PutLocksItems(WriteBatch batch, in PersistenceRequestItem item, RocksDbLockMessage kvm, ColumnFamily columnFamily)
+    {
+        int serializedSize = kvm.CalculateSize();
+        int keyLen = Encoding.UTF8.GetByteCount(item.Key);
+        // The ~<revision> key is the larger of the two indices; one bounded buffer serves both.
+        // 21 = '~'(1) + 20 digits (long.MinValue = -9223372036854775808 is 20 chars including '-').
+        int maxLen = keyLen + 21;
+
+        byte[]? rentedKey = null;
+        byte[] rentedSer = ArrayPool<byte>.Shared.Rent(serializedSize);
+        
+        Span<byte> buffer = maxLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rentedKey = ArrayPool<byte>.Shared.Rent(maxLen));
+        
+        try
+        {
+            using (CodedOutputStream cos = new(rentedSer))
+                kvm.WriteTo(cos);
+
+            ReadOnlySpan<byte> serialized = rentedSer.AsSpan(0, serializedSize);
+
+            // ~CURRENT key: encode key + CurrentMarker suffix without an intermediate string.
+            System.Diagnostics.Debug.Assert(CurrentMarker.Length == CurrentMarkerUtf8.Length,
+                "CurrentMarker string and CurrentMarkerUtf8 span have drifted — update the u8 literal");
+            
+            Encoding.UTF8.GetBytes(item.Key, buffer);
+            CurrentMarkerUtf8.CopyTo(buffer[keyLen..]);
+            batch.Put(buffer[..(keyLen + CurrentMarkerUtf8.Length)], serialized, columnFamily);
+
+            // ~<revision> key: reuse the key bytes already at buffer[0..keyLen), overwrite the suffix.
+            buffer[keyLen] = (byte)'~';
+            bool formatted = Utf8Formatter.TryFormat(item.Revision, buffer[(keyLen + 1)..], out int revLen);
+            System.Diagnostics.Debug.Assert(formatted, "Utf8Formatter.TryFormat failed for revision key");
+            batch.Put(buffer[..(keyLen + 1 + revLen)], serialized, columnFamily);
+        }
+        finally
+        {
+            if (rentedKey is not null)
+                ArrayPool<byte>.Shared.Return(rentedKey);
+            
+            ArrayPool<byte>.Shared.Return(rentedSer);
+        }
+    }
+
+    /// <summary>
+    /// Stores a collection of key-value pairs and their associated metadata into the persistence backend.
+    /// The current row per key is advanced monotonically by (revision, commit HLC): the same committed
+    /// mutation is queued independently by the owning actor and the Raft consumer, so a delayed older
+    /// duplicate can arrive after a newer head — in the same batch or a later one — and must never
+    /// regress what a read serves as current. Older records still land as retained history.
+    /// </summary>
+    /// <param name="items">A list of <see cref="PersistenceRequestItem"/> objects, each representing key-value pairs and metadata to be stored.</param>
+    /// <returns>Returns <c>true</c> if the operation is successfully completed.</returns>
+    public bool StoreKeyValues(List<PersistenceRequestItem> items)
+    {
+        EnterDbFence();
+        try
+        {
+            return StoreKeyValuesFenced(items);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private bool StoreKeyValuesFenced(List<PersistenceRequestItem> items)
+    {
+        WriteBatch batch = new();
+
+        // Batch-local no-revision provenance so multiple no-revision writes to the same key within one
+        // batch merge correctly (a db.Get would not see this batch's own not-yet-committed puts).
+        Dictionary<string, (HLCTimestamp Earliest, HLCTimestamp Latest)>? pendingNoRev = null;
+
+        Span<PersistenceRequestItem> span = CollectionsMarshal.AsSpan(items);
+
+        // The newest candidate per logical key competes for the current row; the newest candidate per
+        // (key, revision) owns that retained-history row. Both orderings are revision-first with the
+        // commit HLC as the same-revision tiebreak, because delete and extend records legitimately
+        // reuse a revision number with a newer commit HLC.
+        Dictionary<string, int> currentCandidates = new(span.Length, StringComparer.Ordinal);
+        Dictionary<(string Key, long Revision), int> historyCandidates = new(span.Length);
+
+        for (int i = 0; i < span.Length; i++)
+        {
+            ref readonly PersistenceRequestItem item = ref span[i];
+
+            if (!currentCandidates.TryGetValue(item.Key, out int currentIdx)
+                || IsNewerCandidate(in item, in span[currentIdx]))
+                currentCandidates[item.Key] = i;
+
+            // No-revision writes keep no history row.
+            if (!item.NoRevision)
+            {
+                (string Key, long Revision) historyKey = (item.Key, item.Revision);
+                if (!historyCandidates.TryGetValue(historyKey, out int historyIdx)
+                    || CompareLastModified(in item, in span[historyIdx]) > 0)
+                    historyCandidates[historyKey] = i;
+            }
+        }
+
+        // Batched reads of each distinct key's current row resolve the durable heads.
+        // All flush-path stores are serialized on the writer queue and the install/restore callers
+        // run quiesced, so the read-compare-write below is not racing another store for these keys.
+        Dictionary<string, StoredKeyValueOrdering> durableHeads;
+        try
+        {
+            durableHeads = ReadCurrentHeads(currentCandidates.Keys);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "SolariumDb read of {Count} current heads failed", currentCandidates.Count);
+            return false;
+        }
+
+        // Row plan: which physical rows each item writes. Decided before serialization so each
+        // written item is serialized exactly once even when it owns both of its rows.
+        bool[] writeCurrent = new bool[span.Length];
+        bool[] writeHistory = new bool[span.Length];
+
+        foreach (KeyValuePair<string, int> candidate in currentCandidates)
+        {
+            ref readonly PersistenceRequestItem item = ref span[candidate.Value];
+
+            if (!durableHeads.TryGetValue(candidate.Key, out StoredKeyValueOrdering head)
+                || IsNewerThanStored(in item, in head))
+                writeCurrent[candidate.Value] = true;
+        }
+
+        // History rows above the durable head cannot exist yet (the head is at or above every row
+        // ever written), so they are written unconditionally. A record at or below the head may
+        // collide with a durably newer same-revision row (set superseded by delete/extend reusing
+        // the revision), so those few are read — ordering fields only — before being written.
+        byte[]? rentedHistoryKey = null;
+        Span<byte> historyKeyBuffer = stackalloc byte[KeyStackThreshold];
+
+        try
+        {
+            foreach (KeyValuePair<(string Key, long Revision), int> candidate in historyCandidates)
+            {
+                if (!durableHeads.TryGetValue(candidate.Key.Key, out StoredKeyValueOrdering head)
+                    || candidate.Key.Revision > head.Revision)
+                {
+                    writeHistory[candidate.Value] = true;
+                    continue;
+                }
+
+                int keyLen = Encoding.UTF8.GetByteCount(candidate.Key.Key);
+                // 21 = '~'(1) + 20 digits (long.MinValue = -9223372036854775808 is 20 chars including '-').
+                int maxLen = keyLen + 21;
+
+                Span<byte> rowKey = historyKeyBuffer;
+                if (maxLen > rowKey.Length)
+                {
+                    if (rentedHistoryKey is null || rentedHistoryKey.Length < maxLen)
+                    {
+                        if (rentedHistoryKey is not null)
+                            ArrayPool<byte>.Shared.Return(rentedHistoryKey);
+                        rentedHistoryKey = ArrayPool<byte>.Shared.Rent(maxLen);
+                    }
+
+                    rowKey = rentedHistoryKey;
+                }
+
+                Encoding.UTF8.GetBytes(candidate.Key.Key, rowKey);
+                rowKey[keyLen] = (byte)'~';
+                bool formatted = Utf8Formatter.TryFormat(candidate.Key.Revision, rowKey[(keyLen + 1)..], out int revLen);
+                System.Diagnostics.Debug.Assert(formatted, "Utf8Formatter.TryFormat failed for guarded history row key");
+
+                byte[]? storedRow = db.Get(rowKey[..(keyLen + 1 + revLen)], columnFamilyKeys);
+                if (storedRow is null)
+                {
+                    writeHistory[candidate.Value] = true;
+                    continue;
+                }
+
+                StoredKeyValueOrdering storedOrdering = DecodeKeyValueOrdering(storedRow);
+                if (CompareLastModifiedToStored(in span[candidate.Value], in storedOrdering) > 0)
+                    writeHistory[candidate.Value] = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "SolariumDb read of guarded history rows failed");
+            return false;
+        }
+        finally
+        {
+            if (rentedHistoryKey is not null)
+                ArrayPool<byte>.Shared.Return(rentedHistoryKey);
+        }
+
+        // One message shell serves every serialization in the batch; PutStoreItems refills it fully.
+        RocksDbKeyValueMessage reusableMessage = new();
+
+        for (int i = 0; i < span.Length; i++)
+        {
+            ref readonly PersistenceRequestItem item = ref span[i];
+
+            if (writeCurrent[i] || writeHistory[i])
+                PutStoreItems(batch, in item, reusableMessage, writeCurrent[i], writeHistory[i], columnFamilyKeys);
+
+            if (item.NoRevision)
+                RecordNoRevisionWrite(batch, item.Key,
+                    new(item.LastModifiedNode, item.LastModifiedPhysical, (uint)item.LastModifiedCounter),
+                    pendingNoRev ??= new(StringComparer.Ordinal));
+        }
+
+        RegisterTildeKeys(batch, span);
+
+        // "false on failure" contract — see StoreDurabilityFloors for the reasoning.
+        try
+        {
+            db.Write(batch, DefaultWriteOptions);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "SolariumDb write of {Count} key-values failed", items.Count);
+            return false;
+        }
+
+        // After the write lands and before the memos move: a walk that sampled the old generation
+        // either sees the new one when it records its memo, or records first and is then corrected
+        // by NotePruneMemoStoredRows below.
+        if (span.Length > 0)
+            Interlocked.Increment(ref keyRowsGeneration);
+
+        NotePruneMemoStoredRows(span, writeCurrent, writeHistory, durableHeads);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Advances the prune memos of the keys a committed batch touched, so a later prune visit can
+    /// still decide eligibility without a walk. Every history row written counts towards the key's
+    /// row total; a history row that lands below the head is non-current from the moment it lands,
+    /// and when the head advances the previous head's own row becomes non-current — both lower the
+    /// oldest-non-current timestamp. Only ever moves a memo towards "eligible". Keys without a memo
+    /// are not tracked here: their next visit walks anyway.
+    /// </summary>
+    private void NotePruneMemoStoredRows(
+        Span<PersistenceRequestItem> span,
+        bool[] writeCurrent,
+        bool[] writeHistory,
+        Dictionary<string, StoredKeyValueOrdering> durableHeads)
+    {
+        lock (_pruneMemoLock)
+        {
+            if (pruneMemos.Count == 0)
+                return;
+
+            for (int i = 0; i < span.Length; i++)
+            {
+                if (!writeCurrent[i] && !writeHistory[i])
+                    continue;
+
+                ref readonly PersistenceRequestItem item = ref span[i];
+
+                if (!pruneMemos.TryGetValue(item.Key, out PruneMemo? memo))
+                    continue;
+
+                if (writeHistory[i])
+                {
+                    memo.HistoryRows++;
+
+                    if (!writeCurrent[i])
+                        LowerOldest(memo, item.LastModifiedPhysical);
+                }
+
+                if (writeCurrent[i] && durableHeads.TryGetValue(item.Key, out StoredKeyValueOrdering previousHead))
+                    LowerOldest(memo, previousHead.LastModifiedPhysical);
+            }
+        }
+    }
+
+    /// <summary>A row landing between walks is not yet classified against any floor, so it lowers both
+    /// oldest timestamps: conservative for whichever check runs next.</summary>
+    private static void LowerOldest(PruneMemo memo, long physical)
+    {
+        memo.OldestNonCurrentPhysical = Math.Min(memo.OldestNonCurrentPhysical, physical);
+        memo.OldestUnprotectedPhysical = Math.Min(memo.OldestUnprotectedPhysical, physical);
+    }
+
+    /// <summary>
+    /// O(1) eligibility check before a prune walk. True when the key's memo proves the walk would
+    /// delete nothing under the given policy: no more history rows than count retention keeps and no
+    /// non-current row older than the age cutoff. When the last walk was floor-blocked, the deletable
+    /// rows it found are known to be protected, so only a moved floor, history written since, or an
+    /// unprotected row aging past the cutoff can change the answer. False (walk) whenever the key has
+    /// no memo.
+    /// </summary>
+    private PruneMemoVerdict PruneMemoVerdictFor(string key, int retentionCount, TimeSpan retentionAge, long cutoffPhysical, HLCTimestamp floorTimestamp, out long ageFrontierPhysical)
+    {
+        lock (_pruneMemoLock)
+        {
+            if (!pruneMemos.TryGetValue(key, out PruneMemo? memo))
+            {
+                ageFrontierPhysical = long.MinValue;
+                return PruneMemoVerdict.Walk;
+            }
+
+            // The row whose age reopens this verdict: while floor-blocked, only rows below the floor
+            // boundary count; otherwise any non-current row does.
+            ageFrontierPhysical = memo.FloorBlocked ? memo.OldestUnprotectedPhysical : memo.OldestNonCurrentPhysical;
+
+            bool needAge = retentionAge > TimeSpan.Zero;
+
+            if (memo.FloorBlocked)
+            {
+                if (floorTimestamp != memo.FloorAtWalk || memo.HistoryRows != memo.HistoryRowsAtWalk)
+                    return PruneMemoVerdict.Walk;
+
+                return needAge && memo.OldestUnprotectedPhysical < cutoffPhysical
+                    ? PruneMemoVerdict.Walk
+                    : PruneMemoVerdict.SkipFloorBlocked;
+            }
+
+            bool countEligible = retentionCount > 0 && memo.HistoryRows > retentionCount;
+            bool ageEligible = needAge && memo.OldestNonCurrentPhysical < cutoffPhysical;
+
+            return countEligible || ageEligible ? PruneMemoVerdict.Walk : PruneMemoVerdict.SkipNotEligible;
+        }
+    }
+
+    /// <summary>What the memo says about a prune visit; the two skips are reported separately so an operator can
+    /// tell retention waiting on a snapshot hold from retention waiting on the clock or the row count.</summary>
+    private enum PruneMemoVerdict
+    {
+        Walk,
+        SkipNotEligible,
+        SkipFloorBlocked
+    }
+
+    /// <summary>
+    /// Records what a completed walk learned about a key (see the memo remarks above). A walk whose
+    /// snapshot predates a caller write (<paramref name="walkGeneration"/> is stale) may have missed a
+    /// row, so it drops the key's memo instead and the next visit walks again. With
+    /// <paramref name="admitWhenFull"/> false a full table gains no new memo and keeps the ones it has.
+    /// </summary>
+    private void RememberPruneWalk(string key, int historyRows, long oldestNonCurrentPhysical, long oldestUnprotectedPhysical, bool floorBlocked, HLCTimestamp floorTimestamp, long walkGeneration, bool admitWhenFull)
+    {
+        lock (_pruneMemoLock)
+        {
+            if (Volatile.Read(ref keyRowsGeneration) != walkGeneration)
+            {
+                pruneMemos.Remove(key);
+                return;
+            }
+
+            if (!pruneMemos.TryGetValue(key, out PruneMemo? memo))
+            {
+                if (pruneMemos.Count >= PruneMemoCapacity)
+                {
+                    if (!admitWhenFull)
+                        return;
+
+                    pruneMemos.Clear();
+                }
+
+                memo = new();
+                pruneMemos[key] = memo;
+            }
+
+            memo.HistoryRows = historyRows;
+            memo.OldestNonCurrentPhysical = oldestNonCurrentPhysical;
+            memo.OldestUnprotectedPhysical = oldestUnprotectedPhysical;
+            memo.FloorBlocked = floorBlocked;
+            memo.FloorAtWalk = floorTimestamp;
+            memo.HistoryRowsAtWalk = historyRows;
+        }
+    }
+
+    private void ForgetPruneMemo(string key)
+    {
+        lock (_pruneMemoLock)
+            pruneMemos.Remove(key);
+    }
+
+    private void ForgetPruneMemos(IReadOnlyList<string> keys)
+    {
+        lock (_pruneMemoLock)
+        {
+            if (pruneMemos.Count == 0)
+                return;
+
+            for (int i = 0; i < keys.Count; i++)
+                pruneMemos.Remove(keys[i]);
+        }
+    }
+
+    /// <summary>Drops every memo; the next visit of each key walks it. Used after a recovery reopen,
+    /// whose freshly opened store may differ from what the memos describe, and by tests.</summary>
+    internal void ClearPruneMemos()
+    {
+        lock (_pruneMemoLock)
+            pruneMemos.Clear();
+    }
+
+    /// <summary>Drops the sweep's proof of a clean store and marks the running cycle dirty, so the
+    /// next complete cycle walks every key. Used after a recovery reopen.</summary>
+    private void ResetSweepQuiescence()
+    {
+        sweepQuiescence = null;
+        sweepCycleClean = false;
+    }
+
+    /// <summary>True when the store has an idle, clean sweep cycle behind it (diagnostics/tests).</summary>
+    internal bool SweepIsQuiescent => sweepQuiescence is not null;
+
+    /// <summary>Number of memoized keys (diagnostics/tests).</summary>
+    internal int PruneMemoCount
+    {
+        get
+        {
+            lock (_pruneMemoLock)
+                return pruneMemos.Count;
+        }
+    }
+
+    /// <summary>Batch-candidate ordering for the current row: revision first, commit HLC tiebreak.</summary>
+    private static bool IsNewerCandidate(in PersistenceRequestItem a, in PersistenceRequestItem b) =>
+        a.Revision != b.Revision ? a.Revision > b.Revision : CompareLastModified(in a, in b) > 0;
+
+    /// <summary>Commit-HLC comparison between two batch items, in physical → counter → node order.</summary>
+    private static int CompareLastModified(in PersistenceRequestItem a, in PersistenceRequestItem b)
+    {
+        if (a.LastModifiedPhysical != b.LastModifiedPhysical)
+            return a.LastModifiedPhysical < b.LastModifiedPhysical ? -1 : 1;
+
+        if (a.LastModifiedCounter != b.LastModifiedCounter)
+            return a.LastModifiedCounter < b.LastModifiedCounter ? -1 : 1;
+
+        return a.LastModifiedNode.CompareTo(b.LastModifiedNode);
+    }
+
+    /// <summary>
+    /// Whether a candidate advances a stored row by (revision, commit HLC). Rows written before the
+    /// node component was persisted decode it as zero; the node is only the final tiebreak, so at
+    /// worst such a row is re-written once with identical logical content.
+    /// </summary>
+    private static bool IsNewerThanStored(in PersistenceRequestItem item, in StoredKeyValueOrdering stored) =>
+        item.Revision != stored.Revision
+            ? item.Revision > stored.Revision
+            : CompareLastModifiedToStored(in item, in stored) > 0;
+
+    /// <summary>Commit-HLC comparison between a batch item and a stored row, in physical → counter → node order.</summary>
+    private static int CompareLastModifiedToStored(in PersistenceRequestItem item, in StoredKeyValueOrdering stored)
+    {
+        if (item.LastModifiedPhysical != stored.LastModifiedPhysical)
+            return item.LastModifiedPhysical < stored.LastModifiedPhysical ? -1 : 1;
+
+        if (item.LastModifiedCounter != stored.LastModifiedCounter)
+            return item.LastModifiedCounter < stored.LastModifiedCounter ? -1 : 1;
+
+        return item.LastModifiedNode.CompareTo(stored.LastModifiedNode);
+    }
+
+    /// <summary>
+    /// Adds a registry row to <paramref name="batch"/> for the bucket prefix of every
+    /// tilde-containing key in the batch that is not registered yet, and publishes the new
+    /// prefixes to the in-memory snapshot BEFORE the batch commits. Publishing early is safe:
+    /// an extra registered prefix only suppresses the seek-skip optimization. Publishing late
+    /// would be unsound — an iterator opened after the commit could observe the new sibling
+    /// keys while a concurrent scan still believes their bucket is tilde-free. The registry
+    /// row rides the same atomic batch as the keys' own rows, so a crash can never persist a
+    /// tilde key without it. Re-putting an already-present registry row is harmless.
+    /// </summary>
+    private void RegisterTildeKeys(WriteBatch batch, Span<PersistenceRequestItem> span)
+    {
+        List<string>? additions = null;
+        string[] snapshot = tildePrefixes;
+
+        for (int i = 0; i < span.Length; i++)
+        {
+            string key = span[i].Key;
+            if (!key.Contains('~'))
+                continue;
+
+            int lastSlash = key.LastIndexOf('/');
+            string prefix = lastSlash < 0 ? "" : key[..(lastSlash + 1)];
+
+            if (Array.IndexOf(snapshot, prefix) >= 0 || (additions is not null && additions.Contains(prefix)))
+                continue;
+
+            (additions ??= []).Add(prefix);
+        }
+
+        if (additions is null)
+            return;
+
+        lock (_tildeRegistryLock)
+        {
+            string[] current = tildePrefixes;
+            List<string> merged = new(current.Length + additions.Count);
+            merged.AddRange(current);
+
+            foreach (string prefix in additions)
+            {
+                if (!merged.Contains(prefix))
+                    merged.Add(prefix);
+            }
+
+            if (merged.Count != current.Length)
+                tildePrefixes = merged.ToArray();
+        }
+
+        // One buffer serves every registry row; registration is rare (first tilde key of a
+        // bucket), so renting for the occasional oversized prefix is fine.
+        byte[]? rented = null;
+        Span<byte> rowKeyBuffer = stackalloc byte[KeyStackThreshold];
+
+        try
+        {
+            foreach (string prefix in additions)
+            {
+                int rowKeyLen = TildeRegistryRowPrefixUtf8.Length + Encoding.UTF8.GetByteCount(prefix);
+
+                Span<byte> rowKey = rowKeyBuffer;
+                if (rowKeyLen > rowKey.Length)
+                {
+                    if (rented is null || rented.Length < rowKeyLen)
+                    {
+                        if (rented is not null)
+                            ArrayPool<byte>.Shared.Return(rented);
+                        rented = ArrayPool<byte>.Shared.Rent(rowKeyLen);
+                    }
+
+                    rowKey = rented;
+                }
+
+                rowKey = rowKey[..rowKeyLen];
+                TildeRegistryRowPrefixUtf8.CopyTo(rowKey);
+                Encoding.UTF8.GetBytes(prefix, rowKey[TildeRegistryRowPrefixUtf8.Length..]);
+                batch.Put(rowKey, ReadOnlySpan<byte>.Empty, columnFamilyKeys);
+            }
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// True when a registered tilde prefix could cover a logical key that starts with
+    /// "<paramref name="blockKey"/>~" — a sibling key whose row block can sort between a
+    /// revision row of this block and the block's ~CURRENT row. When this returns false and
+    /// the registry is authoritative, no such sibling exists in the store, so a seek from a
+    /// revision row of the block straight to its ~CURRENT row cannot jump over any row of
+    /// another key. Prefix families overlap exactly when one string is a prefix of the other.
+    /// </summary>
+    private bool TildeRegistryBlocksSkip(string blockKey)
+    {
+        string[] snapshot = tildePrefixes;
+
+        for (int i = 0; i < snapshot.Length; i++)
+        {
+            string prefix = snapshot[i];
+
+            if (prefix.Length > blockKey.Length)
+            {
+                if (prefix.AsSpan(0, blockKey.Length).SequenceEqual(blockKey) && prefix[blockKey.Length] == '~')
+                    return true;
+            }
+            else if (blockKey.AsSpan(0, prefix.Length).SequenceEqual(prefix))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Attempts to seek <paramref name="iterator"/> from a non-current row of one logical
+    /// key's block directly to that block's ~CURRENT row, skipping the rest of its revision
+    /// rows in one move. This is what keeps a scan O(logical keys) instead of O(total
+    /// revisions ever written) on version-heavy stores. Returns true when the iterator moved —
+    /// the caller must re-read the landed key and must NOT call Next first. Returns false when
+    /// the row is not provably skippable: the registry is not authoritative for this store, a
+    /// registered sibling prefix could hide keys inside the skip window, the row is a ~NOREV
+    /// row (a single row — stepping is cheaper), the row has no '~', or the computed target
+    /// would not move the iterator strictly forward.
+    /// </summary>
+    private bool TrySeekPastRevisionRun(Iterator iterator, ReadOnlySpan<byte> rawKey)
+    {
+        if (!tildeRegistryAuthoritative)
+            return false;
+
+        if (rawKey.EndsWith(NoRevMarkerUtf8))
+            return false;
+
+        int lastTilde = rawKey.LastIndexOf((byte)'~');
+        if (lastTilde <= 0)
+            return false;
+
+        ReadOnlySpan<byte> blockKeyBytes = rawKey[..lastTilde];
+
+        if (TildeRegistryBlocksSkip(Encoding.UTF8.GetString(blockKeyBytes)))
+            return false;
+
+        int targetLen = lastTilde + CurrentMarkerUtf8.Length;
+
+        byte[]? rented = null;
+        Span<byte> target = targetLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rented = ArrayPool<byte>.Shared.Rent(targetLen));
+
+        try
+        {
+            target = target[..targetLen];
+            blockKeyBytes.CopyTo(target);
+            CurrentMarkerUtf8.CopyTo(target[lastTilde..]);
+
+            // The target must sort strictly after the current row or the scan could loop.
+            // Every row written below ~CURRENT satisfies this (revision suffixes are decimal,
+            // and '0'..'9' sort before 'C'); the guard makes any unforeseen suffix safe.
+            // rawKey is a span over the iterator's current key, so every read of it happens
+            // before the Seek below invalidates it.
+            if (target.SequenceCompareTo(rawKey) <= 0)
+                return false;
+
+            iterator.Seek(target);
+            PersistenceBackendMetrics.RecordRevisionRunSeek();
+            return true;
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// Reads the ordering fields of the current row for every key in <paramref name="keys"/>.
+    /// Keys with no current row are absent from the result. The lookups go to Solarium as MultiGets of
+    /// <see cref="HeadReadBatchSize"/> keys, which bounds the row keys and values one call holds.
+    /// </summary>
+    private Dictionary<string, StoredKeyValueOrdering> ReadCurrentHeads(IReadOnlyCollection<string> keys)
+    {
+        Dictionary<string, StoredKeyValueOrdering> heads = new(keys.Count, StringComparer.Ordinal);
+
+        if (keys.Count == 0)
+            return heads;
+
+        List<string> batchKeys = new(Math.Min(keys.Count, HeadReadBatchSize));
+        List<byte[]> rowKeys = new(batchKeys.Capacity);
+
+        foreach (string key in keys)
+        {
+            batchKeys.Add(key);
+            rowKeys.Add(BuildCurrentKey(key));
+
+            if (batchKeys.Count == HeadReadBatchSize)
+                ReadHeadBatch(batchKeys, rowKeys, heads);
+        }
+
+        if (batchKeys.Count > 0)
+            ReadHeadBatch(batchKeys, rowKeys, heads);
+
+        return heads;
+    }
+
+    // One MultiGet of current rows; records the ordering fields of each one found, and empties both lists.
+    private void ReadHeadBatch(List<string> batchKeys, List<byte[]> rowKeys, Dictionary<string, StoredKeyValueOrdering> heads)
+    {
+        byte[]?[] values = db.MultiGet(rowKeys, columnFamilyKeys);
+        for (int i = 0; i < values.Length; i++)
+            if (values[i] is { } value)
+                heads[batchKeys[i]] = DecodeKeyValueOrdering(value);
+
+        batchKeys.Clear();
+        rowKeys.Clear();
+    }
+
+    // Merges a no-revision write's HLC into the key's persisted (earliest, latest) provenance and
+    // queues the updated marker onto the batch.
+    private void RecordNoRevisionWrite(
+        WriteBatch batch, string key, HLCTimestamp writeHlc,
+        Dictionary<string, (HLCTimestamp Earliest, HLCTimestamp Latest)> pending)
+    {
+        if (pending.TryGetValue(key, out (HLCTimestamp Earliest, HLCTimestamp Latest) span))
+        {
+            // already have a merged value for this key in this batch
+        }
+        else
+        {
+            byte[] markerKey = BuildNoRevKey(key);
+            byte[]? existing = db.Get(markerKey, columnFamilyKeys);
+            span = TryUnpackNoRev(existing, out HLCTimestamp e, out HLCTimestamp l) ? (e, l) : (HLCTimestamp.Zero, HLCTimestamp.Zero);
+        }
+
+        HLCTimestamp earliest = span.Earliest == HLCTimestamp.Zero || writeHlc.CompareTo(span.Earliest) < 0 ? writeHlc : span.Earliest;
+        HLCTimestamp latest = writeHlc.CompareTo(span.Latest) > 0 ? writeHlc : span.Latest;
+        pending[key] = (earliest, latest);
+
+        batch.Put(BuildNoRevKey(key), PackNoRev(earliest, latest), columnFamilyKeys);
+    }
+
+    private static byte[] BuildNoRevKey(string logicalKey)
+    {
+        int keyLen = Encoding.UTF8.GetByteCount(logicalKey);
+        byte[] buffer = new byte[keyLen + NoRevMarkerUtf8.Length];
+        Encoding.UTF8.GetBytes(logicalKey, buffer);
+        NoRevMarkerUtf8.CopyTo(buffer.AsSpan(keyLen));
+        return buffer;
+    }
+
+    private static byte[] PackNoRev(HLCTimestamp earliest, HLCTimestamp latest)
+    {
+        byte[] buf = new byte[NoRevProvenanceSize];
+        Span<byte> s = buf;
+        BinaryPrimitives.WriteInt64LittleEndian(s[..8], earliest.N);
+        BinaryPrimitives.WriteInt64LittleEndian(s[8..16], earliest.L);
+        BinaryPrimitives.WriteInt64LittleEndian(s[16..24], earliest.C);
+        BinaryPrimitives.WriteInt64LittleEndian(s[24..32], latest.N);
+        BinaryPrimitives.WriteInt64LittleEndian(s[32..40], latest.L);
+        BinaryPrimitives.WriteInt64LittleEndian(s[40..48], latest.C);
+        return buf;
+    }
+
+    private static bool TryUnpackNoRev(byte[]? data, out HLCTimestamp earliest, out HLCTimestamp latest)
+    {
+        earliest = HLCTimestamp.Zero;
+        latest = HLCTimestamp.Zero;
+        
+        if (data is null || data.Length < NoRevProvenanceSize)
+            return false;
+
+        ReadOnlySpan<byte> s = data;
+        
+        earliest = new(
+            (int)BinaryPrimitives.ReadInt64LittleEndian(s[..8]),
+            BinaryPrimitives.ReadInt64LittleEndian(s[8..16]),
+            (uint)BinaryPrimitives.ReadInt64LittleEndian(s[16..24]));
+        
+        latest = new(
+            (int)BinaryPrimitives.ReadInt64LittleEndian(s[24..32]),
+            BinaryPrimitives.ReadInt64LittleEndian(s[32..40]),
+            (uint)BinaryPrimitives.ReadInt64LittleEndian(s[40..48]));
+        
+        return true;
+    }
+
+    /// <summary>
+    /// Serializes one key-value record and adds its requested physical rows to the WriteBatch:
+    /// the ~CURRENT marker row when the record won the batch's monotonic current-head advance,
+    /// and the ~&lt;revision&gt; history row when the record owns that retained revision. The
+    /// caller decides both flags; at least one must be set.
+    /// </summary>
+    /// <param name="batch">
+    /// The WriteBatch used to batch operations for writing into the database.
+    /// </param>
+    /// <param name="item">
+    /// The persistence request item containing the key and revision data used for creating the entry.
+    /// </param>
+    /// <param name="kvm">Caller-owned reusable message shell; fully reset and refilled per item.</param>
+    /// <param name="putCurrent">Whether to write the ~CURRENT marker row.</param>
+    /// <param name="putHistory">Whether to write the ~&lt;revision&gt; history row.</param>
+    /// <param name="columnFamily">
+    /// The column family where the key-value pair will be stored.
+    /// </param>
+    private static void PutStoreItems(WriteBatch batch, in PersistenceRequestItem item, RocksDbKeyValueMessage kvm, bool putCurrent, bool putHistory, ColumnFamily columnFamily)
+    {
+        // The shell arrives dirty from the previous item; the reset restores every field so a
+        // value-less record cannot inherit the prior record's payload.
+        ResetKeyValueMessage(kvm);
+
+        kvm.ExpiresNode = item.ExpiresNode;
+        kvm.ExpiresPhysical = item.ExpiresPhysical;
+        kvm.ExpiresCounter = item.ExpiresCounter;
+        kvm.LastUsedNode = item.LastUsedNode;
+        kvm.LastUsedPhysical = item.LastUsedPhysical;
+        kvm.LastUsedCounter = item.LastUsedCounter;
+        kvm.LastModifiedNode = item.LastModifiedNode;
+        kvm.LastModifiedPhysical = item.LastModifiedPhysical;
+        kvm.LastModifiedCounter = item.LastModifiedCounter;
+        kvm.Revision = item.Revision;
+        kvm.State = item.State;
+
+        if (item.Value is not null)
+            kvm.Value = UnsafeByteOperations.UnsafeWrap(item.Value);
+
+        int serializedSize = kvm.CalculateSize();
+        int keyLen = Encoding.UTF8.GetByteCount(item.Key);
+        // The ~<revision> key is the larger of the two indices; one bounded buffer serves both.
+        // 21 = '~'(1) + 20 digits (long.MinValue = -9223372036854775808 is 20 chars including '-').
+        int maxLen = keyLen + 21;
+
+        byte[]? rentedKey = null;
+        byte[] rentedSer = ArrayPool<byte>.Shared.Rent(serializedSize);
+
+        Span<byte> buffer = maxLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rentedKey = ArrayPool<byte>.Shared.Rent(maxLen));
+        try
+        {
+            using (CodedOutputStream cos = new(rentedSer))
+                kvm.WriteTo(cos);
+
+            ReadOnlySpan<byte> serialized = rentedSer.AsSpan(0, serializedSize);
+
+            Encoding.UTF8.GetBytes(item.Key, buffer);
+
+            // ~CURRENT key: encode key + CurrentMarker suffix without an intermediate string.
+            if (putCurrent)
+            {
+                System.Diagnostics.Debug.Assert(CurrentMarker.Length == CurrentMarkerUtf8.Length,
+                    "CurrentMarker string and CurrentMarkerUtf8 span have drifted — update the u8 literal");
+                CurrentMarkerUtf8.CopyTo(buffer[keyLen..]);
+                batch.Put(buffer[..(keyLen + CurrentMarkerUtf8.Length)], serialized, columnFamily);
+            }
+
+            // ~<revision> key: never written for no-revision writes — only the current value is kept.
+            if (putHistory)
+            {
+                System.Diagnostics.Debug.Assert(!item.NoRevision, "a no-revision write must not own a history row");
+                buffer[keyLen] = (byte)'~';
+                bool formatted = Utf8Formatter.TryFormat(item.Revision, buffer[(keyLen + 1)..], out int revLen);
+                System.Diagnostics.Debug.Assert(formatted, "Utf8Formatter.TryFormat failed for revision key");
+                batch.Put(buffer[..(keyLen + 1 + revLen)], serialized, columnFamily);
+            }
+        }
+        finally
+        {
+            if (rentedKey is not null)
+                ArrayPool<byte>.Shared.Return(rentedKey);
+            
+            ArrayPool<byte>.Shared.Return(rentedSer);
+        }
+    }
+
+    /// <summary>
+    /// Retrieves the lock context associated with the specified resource.
+    /// </summary>
+    /// <param name="resource">The unique identifier of the resource for which the lock context is being retrieved.</param>
+    /// <returns>
+    /// A <see cref="LockRow"/> instance containing details about the lock if it exists;
+    /// otherwise, null if no lock is associated with the specified resource.
+    /// </returns>
+    public LockRow? GetLock(string resource)
+    {
+        EnterDbFence();
+        try
+        {
+            return GetLockFenced(resource);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private LockRow? GetLockFenced(string resource)
+    {
+        int keyLen = Encoding.UTF8.GetByteCount(resource);
+        int totalLen = keyLen + CurrentMarkerUtf8.Length;
+
+        byte[]? rented = null;
+        
+        Span<byte> buffer = totalLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rented = ArrayPool<byte>.Shared.Rent(totalLen));
+        
+        try
+        {
+            buffer = buffer[..totalLen];
+            Encoding.UTF8.GetBytes(resource.AsSpan(), buffer);
+            CurrentMarkerUtf8.CopyTo(buffer[keyLen..]);
+
+            byte[]? value = db.Get(buffer, columnFamilyLocks);
+            if (value is null)
+                return null;
+
+            RocksDbLockMessage message = UnserializeLockMessageThreadCached(value);
+
+            byte[]? owner;
+
+            if (MemoryMarshal.TryGetArray(message.Owner.Memory, out ArraySegment<byte> segment))
+                owner = segment.Array;
+            else
+                owner = message.Owner.ToByteArray();
+
+            return new(
+                owner,
+                message.FencingToken,
+                new(message.ExpiresNode, message.ExpiresPhysical, message.ExpiresCounter),
+                new(message.LastUsedNode, message.LastUsedPhysical, message.LastUsedCounter),
+                new(message.LastModifiedNode, message.LastModifiedPhysical, message.LastModifiedCounter),
+                (LockState)message.State);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// Retrieves the key-value context associated with the specified key name. If the key does not exist,
+    /// the method returns null.
+    /// </summary>
+    /// <param name="keyName">The name of the key to retrieve the associated key-value context.</param>
+    /// <returns>
+    /// A <see cref="ReadOnlyKeyValueEntry"/> object containing the value, revision, expiration details, and other metadata
+    /// associated with the key, or null if the key does not exist.
+    /// </returns>
+    public ReadOnlyKeyValueEntry? GetKeyValue(string keyName)
+    {
+        EnterDbFence();
+        try
+        {
+            return GetKeyValueFenced(keyName);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private ReadOnlyKeyValueEntry? GetKeyValueFenced(string keyName)
+    {
+        int keyLen = Encoding.UTF8.GetByteCount(keyName);
+        int totalLen = keyLen + CurrentMarkerUtf8.Length;
+
+        byte[]? rented = null;
+        Span<byte> buffer = totalLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rented = ArrayPool<byte>.Shared.Rent(totalLen));
+        try
+        {
+            buffer = buffer[..totalLen];
+            Encoding.UTF8.GetBytes(keyName.AsSpan(), buffer);
+            CurrentMarkerUtf8.CopyTo(buffer[keyLen..]);
+
+            byte[]? value = db.Get(buffer, columnFamilyKeys);
+            if (value is null)
+                return null;
+
+            return DecodeCurrentKeyValue(value);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// Decodes a serialized current-marker row from the keys column family into a
+    /// <see cref="ReadOnlyKeyValueEntry"/>. Shared by <see cref="GetKeyValue"/> and
+    /// <see cref="GetKeyValues"/> so single and batched point reads cannot drift.
+    /// </summary>
+    private static ReadOnlyKeyValueEntry DecodeCurrentKeyValue(byte[] value)
+    {
+        RocksDbKeyValueMessage message = UnserializeKeyValueMessageThreadCached(value);
+
+        // The writer leaves the value field unset for a key that holds no value, so presence is what
+        // separates that from a key holding zero bytes. The SQLite backend keeps the two apart (it stores
+        // NULL), and a reopen must not be the step that quietly merges them.
+        byte[]? messageValue = ByteStringPayload.GetArrayOrNull(message.HasValue, message.Value);
+
+        return new(
+            messageValue,
+            message.Revision,
+            new(message.ExpiresNode, message.ExpiresPhysical, message.ExpiresCounter),
+            new(message.LastUsedNode, message.LastUsedPhysical, message.LastUsedCounter),
+            new(message.LastModifiedNode, message.LastModifiedPhysical, message.LastModifiedCounter),
+            (KeyValueState)message.State);
+    }
+
+    /// <summary>
+    /// Batched point lookup via a single <c>MultiGet</c>: one call resolves every
+    /// key in <paramref name="keyNames"/>, instead of N individual <c>Get</c>s. Results are index-aligned; a missing key
+    /// yields <c>null</c> at its slot.
+    /// </summary>
+    public ReadOnlyKeyValueEntry?[] GetKeyValues(string[] keyNames)
+    {
+        EnterDbFence();
+        try
+        {
+            return GetKeyValuesFenced(keyNames);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private ReadOnlyKeyValueEntry?[] GetKeyValuesFenced(string[] keyNames)
+    {
+        byte[][] keys = new byte[keyNames.Length][];
+
+        for (int i = 0; i < keyNames.Length; i++)
+        {
+            string keyName = keyNames[i];
+            int keyLen = Encoding.UTF8.GetByteCount(keyName);
+
+            byte[] key = new byte[keyLen + CurrentMarkerUtf8.Length];
+            Encoding.UTF8.GetBytes(keyName.AsSpan(), key);
+            CurrentMarkerUtf8.CopyTo(key.AsSpan(keyLen));
+
+            keys[i] = key;
+        }
+
+        // One value per key, in key order; null for a key that has no current row.
+        byte[]?[] values = db.MultiGet(keys, columnFamilyKeys);
+
+        ReadOnlyKeyValueEntry?[] results = new ReadOnlyKeyValueEntry?[keyNames.Length];
+
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (values[i] is { } value)
+                results[i] = DecodeCurrentKeyValue(value);
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Retrieves a key-value revision based on the specified key name and revision number.
+    /// </summary>
+    /// <param name="keyName">The name of the key to retrieve.</param>
+    /// <param name="revision">The specific revision number of the key to retrieve.</param>
+    /// <returns>
+    /// A <see cref="ReadOnlyKeyValueEntry"/> object containing the key-value pair metadata and value,
+    /// or <c>null</c> if the key or revision is not found.
+    /// </returns>
+    public ReadOnlyKeyValueEntry? GetKeyValueRevision(string keyName, long revision)
+    {
+        EnterDbFence();
+        try
+        {
+            return GetKeyValueRevisionFenced(keyName, revision);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private ReadOnlyKeyValueEntry? GetKeyValueRevisionFenced(string keyName, long revision)
+    {
+        int keyLen = Encoding.UTF8.GetByteCount(keyName);
+        int maxLen = keyLen + 21; // '~'(1) + up to 20 decimal digits
+
+        byte[]? rented = null;
+        Span<byte> buffer = maxLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rented = ArrayPool<byte>.Shared.Rent(maxLen));
+        try
+        {
+            Encoding.UTF8.GetBytes(keyName, buffer);
+            buffer[keyLen] = (byte)'~';
+            bool formatted = Utf8Formatter.TryFormat(revision, buffer[(keyLen + 1)..], out int revLen);
+            System.Diagnostics.Debug.Assert(formatted, "Utf8Formatter.TryFormat failed for revision lookup key");
+
+            byte[]? value = db.Get(buffer[..(keyLen + 1 + revLen)], columnFamilyKeys);
+            if (value is null)
+                return null;
+
+            return DecodeRevisionRow(value);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Decodes one <c>keyName~{revision}</c> row. Shared by the exact-revision read and the batched revision probe.</summary>
+    private static ReadOnlyKeyValueEntry DecodeRevisionRow(ReadOnlySpan<byte> value)
+    {
+        RocksDbKeyValueMessage message = UnserializeKeyValueMessageThreadCached(value);
+
+        byte[]? messageValue = ByteStringPayload.GetArrayOrNull(message.HasValue, message.Value);
+
+        return new(
+            messageValue,
+            message.Revision,
+            new(message.ExpiresNode, message.ExpiresPhysical, message.ExpiresCounter),
+            new(message.LastUsedNode, message.LastUsedPhysical, message.LastUsedCounter),
+            new(message.LastModifiedNode, message.LastModifiedPhysical, message.LastModifiedCounter),
+            (KeyValueState)message.State);
+    }
+
+    /// <summary>
+    /// Batched exact-revision lookup: one <c>MultiGet</c> over <c>keyName~{revision}</c> for every
+    /// number in <paramref name="revisions"/>, index-aligned, null where no such row exists. Exact
+    /// keys are what the whole-key Bloom filter answers, so an absent revision costs a filter probe
+    /// per table rather than a block read. Must run under the swap fence.
+    /// </summary>
+    private ReadOnlyKeyValueEntry?[] GetKeyValueRevisionsFenced(string keyName, ReadOnlySpan<long> revisions)
+    {
+        int keyLen = Encoding.UTF8.GetByteCount(keyName);
+        byte[][] keys = new byte[revisions.Length][];
+
+        Span<byte> digits = stackalloc byte[20];
+        for (int i = 0; i < revisions.Length; i++)
+        {
+            bool formatted = Utf8Formatter.TryFormat(revisions[i], digits, out int revLen);
+            System.Diagnostics.Debug.Assert(formatted, "Utf8Formatter.TryFormat failed for revision lookup key");
+
+            byte[] key = new byte[keyLen + 1 + revLen];
+            Encoding.UTF8.GetBytes(keyName.AsSpan(), key);
+            key[keyLen] = (byte)'~';
+            digits[..revLen].CopyTo(key.AsSpan(keyLen + 1));
+            keys[i] = key;
+        }
+
+        byte[]?[] values = db.MultiGet(keys, columnFamilyKeys);
+
+        ReadOnlyKeyValueEntry?[] results = new ReadOnlyKeyValueEntry?[revisions.Length];
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (values[i] is { } value)
+                results[i] = DecodeRevisionRow(value);
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Revisions probed per <c>MultiGet</c> by <see cref="GetKeyValueRevisionAtOrBeforeFenced"/>, and
+    /// how many such batches it issues before handing the remainder to the forward walk. 64 revisions
+    /// covers every snapshot a read-committed transaction can hold on a key written ~once a second for
+    /// a minute; an older snapshot pays the walk, which is the shape it always had.
+    /// </summary>
+    private const int RevisionProbeBatch = 16;
+    private const int RevisionProbeMaxBatches = 4;
+
+    /// <summary>
+    /// Head plus its newest <paramref name="recentRevisions"/> archived revisions in two storage calls:
+    /// the current row, then one <c>MultiGet</c> over the exact revision keys below it.
+    /// </summary>
+    public KeyValueHydration GetKeyValueWithRecentRevisions(string keyName, int recentRevisions)
+    {
+        EnterDbFence();
+        try
+        {
+            ReadOnlyKeyValueEntry? head = GetKeyValueFenced(keyName);
+            if (head is null || recentRevisions <= 0 || head.Revision <= 0)
+                return new KeyValueHydration(head, []);
+
+            int count = (int)Math.Min(recentRevisions, head.Revision);
+            long[] revisions = new long[count];
+            for (int i = 0; i < count; i++)
+                revisions[i] = head.Revision - 1 - i;
+
+            ReadOnlyKeyValueEntry?[] rows = GetKeyValueRevisionsFenced(keyName, revisions);
+
+            List<ReadOnlyKeyValueEntry> recent = new(count);
+            foreach (ReadOnlyKeyValueEntry? row in rows)
+                if (row is not null)
+                    recent.Add(row);
+
+            return new KeyValueHydration(head, recent);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    /// <summary>
+    /// Returns the entry with the highest revision of <paramref name="keyName"/> that satisfies both
+    /// <c>revision ≤ maxRevision</c> and <c>LastModified ≤ readTimestamp</c>, or <c>null</c> when no
+    /// qualifying retained revision exists. Probes exact revision keys downward from
+    /// <paramref name="maxRevision"/> first and walks the key's revision rows only past the probe window.
+    /// </summary>
+    public ReadOnlyKeyValueEntry? GetKeyValueRevisionAtOrBefore(string keyName, long maxRevision, HLCTimestamp readTimestamp)
+    {
+        KeyValueScanTally discarded = default;
+        return GetKeyValueRevisionAtOrBefore(keyName, maxRevision, readTimestamp, ref discarded);
+    }
+
+    /// <summary>
+    /// <see cref="GetKeyValueRevisionAtOrBefore(string, long, HLCTimestamp)"/> that also counts, into
+    /// <paramref name="tally"/>, every revision row of <paramref name="keyName"/> it read: the rows the probe
+    /// found and the rows the backstop walk stepped over.
+    /// </summary>
+    public ReadOnlyKeyValueEntry? GetKeyValueRevisionAtOrBefore(string keyName, long maxRevision, HLCTimestamp readTimestamp, ref KeyValueScanTally tally)
+    {
+        EnterDbFence();
+        try
+        {
+            return GetKeyValueRevisionAtOrBeforeFenced(keyName, maxRevision, readTimestamp, ref tally);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    //
+    // Two phases. The revision suffix is unpadded decimal, so the rows of one key are NOT in numeric
+    // order and a forward scan cannot stop early: it walks — and deserialises — every revision the key
+    // has ever had. Under a write-heavy load with revision pruning off that chain grows without bound,
+    // and this read sat on the key/value actor's mailbox thread (leader reads went
+    // from 1 ms to 40-50 ms). The answer, though, is almost always a few revisions below the head:
+    // a snapshot read lags the head by the writes that landed since the reader's timestamp. So probe
+    // exact revision keys downward from maxRevision in MultiGet batches — each an O(1) bloom-filtered
+    // point lookup — and return the first (highest) row whose LastModified is at-or-before the
+    // snapshot. Every revision number in (lowestProbed, maxRevision] has then been examined, so the
+    // walk, when still needed, runs with its ceiling lowered to lowestProbed - 1 and finds exactly what
+    // the unprobed version would have. A batch with no rows at all means the chain ended or has a hole
+    // (pruning, a head jump); the walk resolves both, so the probe stops there rather than guessing.
+    private ReadOnlyKeyValueEntry? GetKeyValueRevisionAtOrBeforeFenced(string keyName, long maxRevision, HLCTimestamp readTimestamp, ref KeyValueScanTally tally)
+    {
+        if (maxRevision < 0)
+            return null;
+
+        long walkCeiling = maxRevision;
+
+        // A caller asking from the top of the number space (no head to anchor on) gets the walk directly.
+        if (maxRevision < long.MaxValue - RevisionProbeBatch * RevisionProbeMaxBatches)
+        {
+            Span<long> probe = stackalloc long[RevisionProbeBatch];
+            long next = maxRevision;
+
+            for (int batch = 0; batch < RevisionProbeMaxBatches && next >= 0; batch++)
+            {
+                int count = 0;
+                while (count < RevisionProbeBatch && next >= 0)
+                    probe[count++] = next--;
+
+                ReadOnlyKeyValueEntry?[] rows = GetKeyValueRevisionsFenced(keyName, probe[..count]);
+
+                bool anyPresent = false;
+                for (int i = 0; i < count; i++)
+                {
+                    ReadOnlyKeyValueEntry? row = rows[i];
+                    if (row is null)
+                        continue;
+
+                    anyPresent = true;
+                    tally.RevisionRowsExamined++;
+                    if (row.LastModified.CompareTo(readTimestamp) <= 0)
+                        return row;
+                }
+
+                walkCeiling = probe[count - 1] - 1;
+
+                if (!anyPresent)
+                    break;
+            }
+
+            if (walkCeiling < 0)
+                return null;
+        }
+
+        return WalkRevisionAtOrBeforeFenced(keyName, walkCeiling, readTimestamp, ref tally);
+    }
+
+    // Forward scan over every revision row of keyName — the pre-probe algorithm, kept as the exact
+    // backstop for snapshots older than the probe window and for chains with holes. O(revisions).
+    private ReadOnlyKeyValueEntry? WalkRevisionAtOrBeforeFenced(string keyName, long maxRevision, HLCTimestamp readTimestamp, ref KeyValueScanTally tally)
+    {
+        int keyLen = Encoding.UTF8.GetByteCount(keyName);
+        int prefixLen = keyLen + 1; // keyName + '~'
+
+        byte[]? rented = null;
+        Span<byte> prefixBuffer = prefixLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rented = ArrayPool<byte>.Shared.Rent(prefixLen));
+
+        try
+        {
+            prefixBuffer = prefixBuffer[..prefixLen];
+            Encoding.UTF8.GetBytes(keyName, prefixBuffer);
+            prefixBuffer[keyLen] = (byte)'~';
+
+            using Iterator? iterator = db.NewIterator(columnFamilyKeys);
+            iterator.Seek(prefixBuffer);
+
+            ReadOnlyKeyValueEntry? best = null;
+            long bestRevision = -1;
+
+            // One parse shell serves every row of the scan; fields are copied out per row.
+            RocksDbKeyValueMessage shell = new();
+
+            while (iterator.Valid())
+            {
+                ReadOnlySpan<byte> rawKey = iterator.Key();
+
+                if (!rawKey.StartsWith(prefixBuffer))
+                    break;
+
+                ReadOnlySpan<byte> revSuffix = rawKey[prefixLen..];
+
+                // keyName's own current-marker row terminates the scan: all of keyName's revision rows
+                // are decimal-suffixed and sort before "CURRENT" ('0'..'9' < 'C'). Keys may contain '~',
+                // so sibling keys named "keyName~…" also share this prefix and contribute their own
+                // "~CURRENT"/revision rows; only keyName's *exact* "CURRENT" suffix is the terminator —
+                // a sibling's "~CURRENT" row must be skipped, not break the scan (it can sort before
+                // keyName's own revisions and would otherwise drop them).
+                if (revSuffix.SequenceEqual(CurrentMarkerUtf8[1..]))
+                    break;
+
+                // Only a suffix that is *entirely* a decimal number is one of keyName's own revision
+                // rows. A partial parse — e.g. "2024~5" from a sibling key "keyName~2024" — must be
+                // rejected, otherwise the sibling's row would be mis-attributed to keyName.
+                if (!Utf8Parser.TryParse(revSuffix, out long revision, out int consumed) || consumed != revSuffix.Length)
+                {
+                    iterator.Next();
+                    continue;
+                }
+
+                tally.RevisionRowsExamined++;
+
+                if (revision <= maxRevision)
+                {
+                    RocksDbKeyValueMessage message = UnserializeKeyValueMessage(iterator.Value(), shell);
+                    HLCTimestamp lastModified = new(message.LastModifiedNode, message.LastModifiedPhysical, message.LastModifiedCounter);
+
+                    if (lastModified.CompareTo(readTimestamp) <= 0 && revision > bestRevision)
+                    {
+                        byte[]? messageValue = ByteStringPayload.GetArrayOrNull(message.HasValue, message.Value);
+
+                        best = new(
+                            messageValue,
+                            message.Revision,
+                            new(message.ExpiresNode, message.ExpiresPhysical, message.ExpiresCounter),
+                            new(message.LastUsedNode, message.LastUsedPhysical, message.LastUsedCounter),
+                            lastModified,
+                            (KeyValueState)message.State);
+                        bestRevision = revision;
+                    }
+                }
+
+                iterator.Next();
+            }
+
+            return best;
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// Retrieves a list of key-value pairs that match the specified prefix key.
+    /// </summary>
+    /// <param name="prefixKeyName">The prefix string used to filter and retrieve matching key-value pairs.</param>
+    /// <returns>A list of tuples where each tuple contains a string key and a corresponding <see cref="ReadOnlyKeyValueEntry"/> value.</returns>
+    public List<(string, ReadOnlyKeyValueEntry)> GetKeyValueByPrefix(string prefixKeyName)
+    {
+        EnterDbFence();
+        try
+        {
+            return GetKeyValueByPrefixFenced(prefixKeyName);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private List<(string, ReadOnlyKeyValueEntry)> GetKeyValueByPrefixFenced(string prefixKeyName)
+    {
+        List<(string, ReadOnlyKeyValueEntry)> result = [];
+
+        int prefixLen = Encoding.UTF8.GetByteCount(prefixKeyName);
+        byte[]? rented = null;
+        Span<byte> prefixBytes = prefixLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rented = ArrayPool<byte>.Shared.Rent(prefixLen));
+        try
+        {
+            prefixBytes = prefixBytes[..prefixLen];
+            Encoding.UTF8.GetBytes(prefixKeyName, prefixBytes);
+
+            using Iterator? iterator = db.NewIterator(columnFamilyKeys);
+            iterator.Seek(prefixBytes);
+
+            // One parse shell serves every row of the scan; fields are copied out per row.
+            RocksDbKeyValueMessage shell = new();
+
+            int nonCurrentRun = 0;
+
+            while (iterator.Valid() && result.Count < KeyValueScanLimits.MaxPrefixScanResults)
+            {
+                // Key() returns a span over the iterator's current key — no byte[] copy.
+                // Valid only until the next iterator move; consumed entirely before Next().
+                ReadOnlySpan<byte> rawKey = iterator.Key();
+
+                if (!rawKey.StartsWith(prefixBytes))
+                    break;
+
+                if (!rawKey.EndsWith(CurrentMarkerUtf8))
+                {
+                    // Deep revision blocks are jumped rather than stepped — see
+                    // GetKeyValueByRangeFenced for the run/seek contract.
+                    if (++nonCurrentRun == RevisionRunSeekThreshold && TrySeekPastRevisionRun(iterator, rawKey))
+                    {
+                        nonCurrentRun = 0;
+                        continue;
+                    }
+
+                    iterator.Next();
+                    continue;
+                }
+
+                nonCurrentRun = 0;
+
+                // Decode only keys that pass both filters.
+                string keyWithoutMarker = Encoding.UTF8.GetString(rawKey[..^CurrentMarkerUtf8.Length]);
+
+                RocksDbKeyValueMessage message = UnserializeKeyValueMessage(iterator.Value(), shell);
+
+                result.Add((keyWithoutMarker, DecodeReadOnlyKeyValue(message)));
+
+                iterator.Next();
+            }
+
+            return result;
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// Single-pass snapshot prefix scan. Current-head rows and revision-history rows share one
+    /// physical key range in the keys column family, so the interface's default composition
+    /// (prefix scan, then one <see cref="GetKeyValueRevisionAtOrBefore"/> per stale key) re-reads
+    /// that range once per stale key — under deep revision chains the disk reads grow with
+    /// chain depth times key count per scan. This override walks the range exactly once and
+    /// resolves every key's as-of image from the rows of that same pass.
+    /// </summary>
+    public List<(string Key, ReadOnlyKeyValueEntry Current, ReadOnlyKeyValueEntry? Snapshot)> GetKeyValueByPrefixAtOrBefore(
+        string prefixKeyName, HLCTimestamp readTimestamp, Func<bool>? shouldAbort = null)
+    {
+        EnterDbFence();
+        try
+        {
+            return GetKeyValueByPrefixAtOrBeforeFenced(prefixKeyName, readTimestamp, shouldAbort);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private List<(string Key, ReadOnlyKeyValueEntry Current, ReadOnlyKeyValueEntry? Snapshot)> GetKeyValueByPrefixAtOrBeforeFenced(
+        string prefixKeyName, HLCTimestamp readTimestamp, Func<bool>? shouldAbort)
+    {
+        Dictionary<string, PrefixAsOfAccumulator> accumulators = new(StringComparer.Ordinal);
+
+        int prefixLen = Encoding.UTF8.GetByteCount(prefixKeyName);
+        byte[]? rented = null;
+        Span<byte> prefixBytes = prefixLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rented = ArrayPool<byte>.Shared.Rent(prefixLen));
+
+        long rowsExamined = 0;
+        bool aborted = false;
+
+        try
+        {
+            prefixBytes = prefixBytes[..prefixLen];
+            Encoding.UTF8.GetBytes(prefixKeyName, prefixBytes);
+
+            using Iterator? iterator = db.NewIterator(columnFamilyKeys);
+            iterator.Seek(prefixBytes);
+
+            // Rows of one logical key are usually adjacent, so cache the last decoded logical key
+            // and reuse the string while consecutive rows still belong to it.
+            byte[] lastLogicalKeyBytes = [];
+            string lastLogicalKey = "";
+            int currentRowsSeen = 0;
+
+            // One parse shell serves every row of the scan; fields are copied out per row.
+            RocksDbKeyValueMessage shell = new();
+
+            while (iterator.Valid())
+            {
+                if ((rowsExamined & 1023) == 0 && shouldAbort is not null && shouldAbort())
+                {
+                    aborted = true;
+                    break;
+                }
+
+                // Key() returns a span over the iterator's current key — no byte[] copy.
+                // Valid only until the next iterator move; consumed entirely before Next().
+                ReadOnlySpan<byte> rawKey = iterator.Key();
+
+                if (!rawKey.StartsWith(prefixBytes))
+                    break;
+
+                rowsExamined++;
+
+                if (rawKey.EndsWith(CurrentMarkerUtf8))
+                {
+                    ReadOnlySpan<byte> logicalKeyBytes = rawKey[..^CurrentMarkerUtf8.Length];
+                    PrefixAsOfAccumulator accumulator = ResolveAccumulator(
+                        accumulators, logicalKeyBytes, ref lastLogicalKeyBytes, ref lastLogicalKey);
+
+                    accumulator.Current = DecodeReadOnlyKeyValue(UnserializeKeyValueMessage(iterator.Value(), shell));
+
+                    // Result cap: the non-snapshot prefix scan returns the first
+                    // MaxPrefixScanResults heads in key order and truncates the rest; mirror that.
+                    if (++currentRowsSeen >= KeyValueScanLimits.MaxPrefixScanResults)
+                        break;
+
+                    iterator.Next();
+                    continue;
+                }
+
+                // A revision-history row is "<logicalKey>~<decimal>". The suffix after the LAST
+                // '~' must be entirely decimal: keys may themselves contain '~', and only the
+                // last separator splits the owning key from its revision. "~NOREV" provenance
+                // rows and any non-numeric suffix are skipped.
+                int lastTilde = rawKey.LastIndexOf((byte)'~');
+                if (lastTilde <= 0)
+                {
+                    iterator.Next();
+                    continue;
+                }
+
+                ReadOnlySpan<byte> revSuffix = rawKey[(lastTilde + 1)..];
+                if (!Utf8Parser.TryParse(revSuffix, out long revision, out int consumed) || consumed != revSuffix.Length)
+                {
+                    iterator.Next();
+                    continue;
+                }
+
+                PrefixAsOfAccumulator revisionAccumulator = ResolveAccumulator(
+                    accumulators, rawKey[..lastTilde], ref lastLogicalKeyBytes, ref lastLogicalKey);
+
+                // The as-of pick may need the runner-up: when the head reuses the best row's
+                // revision number (delete/extend reuse revisions) the best row is excluded by the
+                // strictly-below-head bound and the second-best is the answer. A row that cannot
+                // enter the top two by revision number can be skipped before deserialization.
+                if (revisionAccumulator.Best is not null && revision <= revisionAccumulator.SecondRevision)
+                {
+                    iterator.Next();
+                    continue;
+                }
+
+                RocksDbKeyValueMessage message = UnserializeKeyValueMessage(iterator.Value(), shell);
+                HLCTimestamp lastModified = new(message.LastModifiedNode, message.LastModifiedPhysical, message.LastModifiedCounter);
+
+                if (lastModified.CompareTo(readTimestamp) <= 0)
+                {
+                    if (revisionAccumulator.Best is null || revision > revisionAccumulator.BestRevision)
+                    {
+                        revisionAccumulator.Second = revisionAccumulator.Best;
+                        revisionAccumulator.SecondRevision = revisionAccumulator.BestRevision;
+                        revisionAccumulator.Best = DecodeReadOnlyKeyValue(message);
+                        revisionAccumulator.BestRevision = revision;
+                    }
+                    else if (revisionAccumulator.Second is null || revision > revisionAccumulator.SecondRevision)
+                    {
+                        revisionAccumulator.Second = DecodeReadOnlyKeyValue(message);
+                        revisionAccumulator.SecondRevision = revision;
+                    }
+                }
+
+                iterator.Next();
+            }
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+
+        List<(string, ReadOnlyKeyValueEntry, ReadOnlyKeyValueEntry?)> result = new(accumulators.Count);
+
+        foreach ((string key, PrefixAsOfAccumulator accumulator) in accumulators)
+        {
+            // History rows without a head row: either the pass was truncated before reaching the
+            // key's head, or the key's rows were physically removed mid-scan. The key is not part
+            // of the head page in either case, matching the non-snapshot scan's truncation.
+            if (accumulator.Current is null)
+                continue;
+
+            result.Add((key, accumulator.Current, ResolveSnapshot(accumulator, readTimestamp)));
+        }
+
+        result.Sort(static (a, b) => string.CompareOrdinal(a.Item1, b.Item1));
+
+        PersistenceBackendMetrics.RecordSnapshotPrefixScan(rowsExamined, result.Count, aborted);
+
+        // Loud amplification signal: a scan that examines far more physical rows than it returns
+        // is paying for revision history, and that cost grows with chain depth. Surfacing it here
+        // makes the condition diagnosable without host-level disk counters.
+        if (rowsExamined > 65_536 && rowsExamined > 16L * Math.Max(1, result.Count))
+            logger.LogWarning(
+                "Snapshot prefix scan over {Prefix} examined {Rows} physical rows to return {Results} entries; revision chains under this prefix are deep",
+                prefixKeyName, rowsExamined, result.Count);
+
+        return result;
+    }
+
+    /// <summary>
+    /// Per-logical-key state for the single-pass as-of prefix scan: the head row plus the two
+    /// highest-revision history rows at-or-before the read timestamp seen so far.
+    /// </summary>
+    private sealed class PrefixAsOfAccumulator
+    {
+        internal ReadOnlyKeyValueEntry? Current;
+        internal ReadOnlyKeyValueEntry? Best;
+        internal long BestRevision = -1;
+        internal ReadOnlyKeyValueEntry? Second;
+        internal long SecondRevision = -1;
+    }
+
+    /// <summary>
+    /// Returns the accumulator for the logical key encoded in <paramref name="logicalKeyBytes"/>,
+    /// reusing the previously decoded key string when consecutive rows belong to the same key.
+    /// </summary>
+    private static PrefixAsOfAccumulator ResolveAccumulator(
+        Dictionary<string, PrefixAsOfAccumulator> accumulators,
+        ReadOnlySpan<byte> logicalKeyBytes,
+        ref byte[] lastLogicalKeyBytes,
+        ref string lastLogicalKey)
+    {
+        if (!logicalKeyBytes.SequenceEqual(lastLogicalKeyBytes))
+        {
+            lastLogicalKeyBytes = logicalKeyBytes.ToArray();
+            lastLogicalKey = Encoding.UTF8.GetString(logicalKeyBytes);
+        }
+
+        if (accumulators.TryGetValue(lastLogicalKey, out PrefixAsOfAccumulator? accumulator))
+            return accumulator;
+
+        accumulator = new();
+        accumulators[lastLogicalKey] = accumulator;
+        return accumulator;
+    }
+
+    /// <summary>
+    /// Resolves a key's as-of image from its accumulated rows: the head itself when it is
+    /// at-or-before the timestamp, otherwise the highest qualifying history row strictly below
+    /// the head revision, or null when no committed version existed at the timestamp.
+    /// </summary>
+    private static ReadOnlyKeyValueEntry? ResolveSnapshot(PrefixAsOfAccumulator accumulator, HLCTimestamp readTimestamp)
+    {
+        ReadOnlyKeyValueEntry current = accumulator.Current!;
+
+        if (current.LastModified.CompareTo(readTimestamp) <= 0)
+            return current;
+
+        long maxRevision = current.Revision - 1;
+
+        ReadOnlyKeyValueEntry? snapshot = accumulator.BestRevision <= maxRevision
+            ? accumulator.Best
+            : (accumulator.SecondRevision <= maxRevision ? accumulator.Second : null);
+
+        if (snapshot is null || snapshot.State is KeyValueState.Undefined)
+            return null;
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Decodes a deserialized keys-column-family row into a <see cref="ReadOnlyKeyValueEntry"/>.
+    /// </summary>
+    private static ReadOnlyKeyValueEntry DecodeReadOnlyKeyValue(RocksDbKeyValueMessage message)
+    {
+        byte[]? messageValue = ByteStringPayload.GetArrayOrNull(message.HasValue, message.Value);
+
+        return new(
+            messageValue,
+            message.Revision,
+            new(message.ExpiresNode, message.ExpiresPhysical, message.ExpiresCounter),
+            new(message.LastUsedNode, message.LastUsedPhysical, message.LastUsedCounter),
+            new(message.LastModifiedNode, message.LastModifiedPhysical, message.LastModifiedCounter),
+            (KeyValueState)message.State);
+    }
+
+    /// <summary>
+    /// Retrieves a bounded, ordered page of key-value pairs whose keys start with <paramref name="prefix"/>,
+    /// beginning at <paramref name="startKey"/> (or the prefix start if null), up to <paramref name="limit"/> entries.
+    /// </summary>
+    public List<(string, ReadOnlyKeyValueEntry)> GetKeyValueByRange(string prefix, string? startKey, int limit)
+    {
+        KeyValueScanTally discarded = default;
+        return GetKeyValueByRange(prefix, startKey, limit, ref discarded);
+    }
+
+    /// <summary>
+    /// <see cref="GetKeyValueByRange(string, string?, int)"/> that also counts, into <paramref name="tally"/>,
+    /// the revision rows the walk stepped over (the ~NOREV provenance row is not a revision row) and the
+    /// seeks that jumped the rest of a key's revision block.
+    /// </summary>
+    public List<(string, ReadOnlyKeyValueEntry)> GetKeyValueByRange(string prefix, string? startKey, int limit, ref KeyValueScanTally tally)
+    {
+        EnterDbFence();
+        try
+        {
+            return GetKeyValueByRangeFenced(prefix, startKey, null, false, limit, ref tally);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    /// <summary>
+    /// Same page, ended at <paramref name="endKey"/>: the iterator stops at the first row of a key past the
+    /// bound, so a short bounded seek steps neither the heads nor the revision rows beyond it.
+    /// </summary>
+    public List<(string, ReadOnlyKeyValueEntry)> GetKeyValueByRange(
+        string prefix, string? startKey, string? endKey, bool endInclusive, int limit, ref KeyValueScanTally tally)
+    {
+        EnterDbFence();
+        try
+        {
+            return GetKeyValueByRangeFenced(prefix, startKey, endKey, endInclusive, limit, ref tally);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private List<(string, ReadOnlyKeyValueEntry)> GetKeyValueByRangeFenced(
+        string prefix, string? startKey, string? endKey, bool endInclusive, int limit, ref KeyValueScanTally tally)
+    {
+        List<(string, ReadOnlyKeyValueEntry)> result = [];
+
+        int prefixLen = Encoding.UTF8.GetByteCount(prefix);
+        string seekStr = startKey ?? prefix;
+        int seekLen = Encoding.UTF8.GetByteCount(seekStr);
+        int endLen = endKey is null ? 0 : Encoding.UTF8.GetByteCount(endKey);
+
+        byte[]? rentedPrefix = null;
+        Span<byte> prefixBytes = prefixLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rentedPrefix = ArrayPool<byte>.Shared.Rent(prefixLen));
+
+        byte[]? rentedSeek = null;
+        Span<byte> seekBytes = seekLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rentedSeek = ArrayPool<byte>.Shared.Rent(seekLen));
+
+        byte[]? rentedEnd = null;
+        Span<byte> endBytes = endLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rentedEnd = ArrayPool<byte>.Shared.Rent(endLen));
+
+        try
+        {
+            prefixBytes = prefixBytes[..prefixLen];
+            Encoding.UTF8.GetBytes(prefix, prefixBytes);
+
+            seekBytes = seekBytes[..seekLen];
+            Encoding.UTF8.GetBytes(seekStr, seekBytes);
+
+            // The end bound is compared in UTF-8 byte order, the order the seek above already uses for the
+            // start bound and the order the rows are stored in. Every row of a logical key is the key, '~'
+            // and a suffix, so under the row order a row sorts past an exclusive bound exactly when its key
+            // does, and past an inclusive bound when it neither belongs to the bound key (prefix "end~") nor
+            // sorts below it. A key with a '~' extension of the bound key ("end~x") shares that prefix and
+            // sorts above the bound: the per-head check below keeps it out without ending the walk.
+            endBytes = endBytes[..endLen];
+            if (endKey is not null)
+                Encoding.UTF8.GetBytes(endKey, endBytes);
+
+            using Iterator iterator = db.NewIterator(columnFamilyKeys);
+            iterator.Seek(seekBytes);
+
+            // One parse shell serves every row of the scan; fields are copied out per row.
+            RocksDbKeyValueMessage shell = new();
+
+            int nonCurrentRun = 0;
+            bool stoppedAtEndBound = false;
+
+            while (iterator.Valid() && result.Count < limit)
+            {
+                // Key() returns a span over the iterator's current key — no byte[] copy.
+                // Valid only until the next iterator move; consumed entirely before Next().
+                ReadOnlySpan<byte> rawKey = iterator.Key();
+
+                if (!rawKey.StartsWith(prefixBytes))
+                    break;
+
+                if (endKey is not null && RowIsPastEndBound(rawKey, endBytes, endInclusive))
+                {
+                    stoppedAtEndBound = true;
+                    break;
+                }
+
+                if (!rawKey.EndsWith(CurrentMarkerUtf8))
+                {
+                    if (!rawKey.EndsWith(NoRevMarkerUtf8))
+                        tally.RevisionRowsExamined++;
+
+                    // A long run of non-current rows is a deep revision block. Try once per run
+                    // to jump the rest of the block, so a blocked bucket pays one registry check
+                    // per run rather than one per row. On a successful seek the iterator already
+                    // moved: re-read the landed key without Next.
+                    if (++nonCurrentRun == RevisionRunSeekThreshold && TrySeekPastRevisionRun(iterator, rawKey))
+                    {
+                        tally.RevisionRunSeeks++;
+                        nonCurrentRun = 0;
+                        continue;
+                    }
+
+                    iterator.Next();
+                    continue;
+                }
+
+                nonCurrentRun = 0;
+
+                ReadOnlySpan<byte> keyBytes = rawKey[..^CurrentMarkerUtf8.Length];
+
+                // A '~' extension of an inclusive bound key shares the "end~" row prefix the bound keeps,
+                // but sorts above the bound: leave it out and keep walking to the bound key's own rows.
+                if (endInclusive && endKey is not null && keyBytes.SequenceCompareTo(endBytes) > 0)
+                {
+                    iterator.Next();
+                    continue;
+                }
+
+                // Decode only keys that pass every filter.
+                string keyWithoutMarker = Encoding.UTF8.GetString(keyBytes);
+
+                RocksDbKeyValueMessage message = UnserializeKeyValueMessage(iterator.Value(), shell);
+
+                result.Add((keyWithoutMarker, DecodeReadOnlyKeyValue(message)));
+
+                iterator.Next();
+            }
+
+            // A walk that ended at the prefix end (or the end of the family) visited every row inside the
+            // bound; one that ended at the bound or at the limit may have left such heads unvisited.
+            if (endKey is not null && limit > 0 && (stoppedAtEndBound || result.Count >= limit))
+                AddHeadsOfEndKeyPrefixesSortedPastTheBound(iterator, shell, prefixBytes, seekBytes, endBytes, result, limit);
+
+            return result;
+        }
+        finally
+        {
+            if (rentedPrefix is not null)
+                ArrayPool<byte>.Shared.Return(rentedPrefix);
+            if (rentedSeek is not null)
+                ArrayPool<byte>.Shared.Return(rentedSeek);
+            if (rentedEnd is not null)
+                ArrayPool<byte>.Shared.Return(rentedEnd);
+        }
+    }
+
+    /// <summary>
+    /// Whether a row of the key family lies past the scan's end bound, in the family's own byte order.
+    /// Rows of one logical key are the key followed by '~' and a suffix, so a row sorts at or above an
+    /// exclusive bound exactly when its key does. For an inclusive bound the rows of the bound key itself
+    /// start with "end~" and are kept; any other row above the bound is past it. The row order equals the
+    /// logical key order except where one key is a proper prefix of another whose next byte sorts below '~';
+    /// the pagination cursor and the page merge already rely on that equality, and this check does the same.
+    /// </summary>
+    private static bool RowIsPastEndBound(ReadOnlySpan<byte> rawKey, ReadOnlySpan<byte> endBytes, bool endInclusive)
+    {
+        int cmp = rawKey.SequenceCompareTo(endBytes);
+        if (cmp < 0)
+            return false;
+        if (!endInclusive)
+            return true;
+        return !(rawKey.Length > endBytes.Length && rawKey[endBytes.Length] == (byte)'~' && rawKey.StartsWith(endBytes));
+    }
+
+    /// <summary>
+    /// Adds the heads the bounded walk cannot reach: a key that is a proper prefix of the end key sorts
+    /// below it, but its rows sort past the bound position whenever the end key's next byte sorts below
+    /// '~' (a key "a" against the bound "a/"), so the walk stops at the bound before it meets them. Such
+    /// a key is looked up directly instead. The candidates are the proper prefixes of the end key that
+    /// are at or after the seek key and inside the prefix: a seek that is not a prefix of the end key
+    /// leaves only the prefixes longer than the two keys' common prefix, so a probe such as "idx/5/"
+    /// against "idx/50" leaves none and pays nothing. A head the walk did visit is found in the page
+    /// again and skipped. Found heads are inserted in ordinal order and the page is cut back to
+    /// <paramref name="limit"/>. Runs with the walk's iterator and parse shell, after the walk.
+    /// </summary>
+    private static void AddHeadsOfEndKeyPrefixesSortedPastTheBound(
+        Iterator iterator,
+        RocksDbKeyValueMessage shell,
+        ReadOnlySpan<byte> prefixBytes,
+        ReadOnlySpan<byte> seekBytes,
+        ReadOnlySpan<byte> endBytes,
+        List<(string, ReadOnlyKeyValueEntry)> result,
+        int limit)
+    {
+        if (!endBytes.StartsWith(prefixBytes))
+            return;
+
+        int common = seekBytes.CommonPrefixLength(endBytes);
+
+        // The end key is at or below the seek key: the bounded range is empty.
+        if (common == endBytes.Length || (common < seekBytes.Length && seekBytes[common] > endBytes[common]))
+            return;
+
+        // Shortest candidate: the seek key itself when it is a prefix of the end key, otherwise one byte
+        // past the common prefix (a shorter prefix of the end key is a prefix of the seek key, so below it).
+        int minLength = Math.Max(prefixBytes.Length, common == seekBytes.Length ? seekBytes.Length : common + 1);
+        int maxLength = endBytes.Length - 1;
+        if (maxLength < minLength)
+            return;
+
+        int targetCapacity = maxLength + CurrentMarkerUtf8.Length;
+        byte[]? rented = null;
+        Span<byte> target = targetCapacity <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rented = ArrayPool<byte>.Shared.Rent(targetCapacity));
+
+        try
+        {
+            for (int length = maxLength; length >= minLength; length--)
+            {
+                ReadOnlySpan<byte> candidate = endBytes[..length];
+                Span<byte> head = target[..(length + CurrentMarkerUtf8.Length)];
+                candidate.CopyTo(head);
+                CurrentMarkerUtf8.CopyTo(head[length..]);
+
+                iterator.Seek(head);
+                if (!iterator.Valid() || !iterator.Key().SequenceEqual(head))
+                    continue;
+
+                string key = Encoding.UTF8.GetString(candidate);
+                ReadOnlyKeyValueEntry entry = DecodeReadOnlyKeyValue(UnserializeKeyValueMessage(iterator.Value(), shell));
+
+                int lo = 0, hi = result.Count;
+                while (lo < hi)
+                {
+                    int mid = (lo + hi) >>> 1;
+                    if (string.CompareOrdinal(result[mid].Item1, key) < 0)
+                        lo = mid + 1;
+                    else
+                        hi = mid;
+                }
+
+                if (lo < result.Count && string.CompareOrdinal(result[lo].Item1, key) == 0)
+                    continue;
+
+                result.Insert(lo, (key, entry));
+                if (result.Count > limit)
+                    result.RemoveAt(result.Count - 1);
+            }
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+
+    /// <summary>
+    /// Whole-family paged scan of the current key-value rows: iterates the <c>kv</c> column family
+    /// keeping only <c>~CURRENT</c> rows (revision, no-revision-provenance and internal cursor rows
+    /// are skipped), returning keys strictly greater than the cursor — which is simply the last key
+    /// of the previous page — in ordinal order.
+    /// </summary>
+    public KeyValueScanPage ScanKeyValues(string? cursor, int limit)
+    {
+        EnterDbFence();
+        try
+        {
+            return ScanKeyValuesFenced(cursor, limit);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private KeyValueScanPage ScanKeyValuesFenced(string? cursor, int limit)
+    {
+        List<(string, ReadOnlyKeyValueEntry)> items = [];
+
+        using Iterator iterator = db.NewIterator(columnFamilyKeys);
+
+        if (cursor is null)
+            iterator.SeekToFirst();
+        else
+            iterator.Seek(Encoding.UTF8.GetBytes(cursor));
+
+        // One parse shell serves every row of the scan; fields are copied out per row.
+        RocksDbKeyValueMessage shell = new();
+
+        int nonCurrentRun = 0;
+
+        while (iterator.Valid() && items.Count < limit)
+        {
+            ReadOnlySpan<byte> rawKey = iterator.Key();
+
+            if (!rawKey.EndsWith(CurrentMarkerUtf8))
+            {
+                // Deep revision blocks are jumped rather than stepped — see
+                // GetKeyValueByRangeFenced for the run/seek contract.
+                if (++nonCurrentRun == RevisionRunSeekThreshold && TrySeekPastRevisionRun(iterator, rawKey))
+                {
+                    nonCurrentRun = 0;
+                    continue;
+                }
+
+                iterator.Next();
+                continue;
+            }
+
+            nonCurrentRun = 0;
+
+            string key = Encoding.UTF8.GetString(rawKey[..^CurrentMarkerUtf8.Length]);
+
+            // The seek lands inside the cursor key's row block (its revision rows sort before the
+            // marker row), so the cursor key itself comes back once more — skip it.
+            if (cursor is not null && string.CompareOrdinal(key, cursor) <= 0)
+            {
+                iterator.Next();
+                continue;
+            }
+
+            RocksDbKeyValueMessage message = UnserializeKeyValueMessage(iterator.Value(), shell);
+
+            items.Add((key, DecodeReadOnlyKeyValue(message)));
+
+            iterator.Next();
+        }
+
+        return new(items, items.Count == limit ? items[^1].Item1 : null);
+    }
+
+    /// <summary>
+    /// Whole-family paged scan of the lock rows: same marker filtering and cursor semantics as
+    /// <see cref="ScanKeyValues"/>, over the <c>locks</c> column family.
+    /// </summary>
+    public LockScanPage ScanLocks(string? cursor, int limit)
+    {
+        EnterDbFence();
+        try
+        {
+            return ScanLocksFenced(cursor, limit);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    // Must run under the swap fence (EnterDbFence).
+    private LockScanPage ScanLocksFenced(string? cursor, int limit)
+    {
+        List<(string, LockRow)> items = [];
+
+        using Iterator iterator = db.NewIterator(columnFamilyLocks);
+
+        if (cursor is null)
+            iterator.SeekToFirst();
+        else
+            iterator.Seek(Encoding.UTF8.GetBytes(cursor));
+
+        while (iterator.Valid() && items.Count < limit)
+        {
+            ReadOnlySpan<byte> rawKey = iterator.Key();
+
+            if (!rawKey.EndsWith(CurrentMarkerUtf8))
+            {
+                iterator.Next();
+                continue;
+            }
+
+            string resource = Encoding.UTF8.GetString(rawKey[..^CurrentMarkerUtf8.Length]);
+
+            if (cursor is not null && string.CompareOrdinal(resource, cursor) <= 0)
+            {
+                iterator.Next();
+                continue;
+            }
+
+            RocksDbLockMessage message = UnserializeLockMessageThreadCached(iterator.Value());
+
+            byte[]? owner;
+            if (MemoryMarshal.TryGetArray(message.Owner.Memory, out ArraySegment<byte> segment))
+                owner = segment.Array;
+            else
+                owner = message.Owner.ToByteArray();
+
+            items.Add((resource, new(
+                owner,
+                message.FencingToken,
+                new(message.ExpiresNode, message.ExpiresPhysical, message.ExpiresCounter),
+                new(message.LastUsedNode, message.LastUsedPhysical, message.LastUsedCounter),
+                new(message.LastModifiedNode, message.LastModifiedPhysical, message.LastModifiedCounter),
+                (LockState)message.State)));
+
+            iterator.Next();
+        }
+
+        return new(items, items.Count == limit ? items[^1].Item1 : null);
+    }
+
+    /// <summary>
+    /// Physically removes each key's rows — <c>~CURRENT</c>, every <c>~&lt;revision&gt;</c> history
+    /// row and the <c>~NOREV</c> provenance marker all share the <c>key~</c> raw prefix, so one
+    /// bounded prefix walk per key collects them all — in a single write batch.
+    /// </summary>
+    public bool DeleteKeyValues(IReadOnlyList<string> keys)
+    {
+        // The column-family handle is read under the fence: read outside, it could be a stale
+        // handle from before a recovery swap.
+        EnterDbFence();
+        try
+        {
+            return DeleteFamilyRows(keys, columnFamilyKeys);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    /// <summary>Physically removes each lock resource's rows (same layout as the kv family).</summary>
+    public bool DeleteLocks(IReadOnlyList<string> resources)
+    {
+        EnterDbFence();
+        try
+        {
+            return DeleteFamilyRows(resources, columnFamilyLocks);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    private bool DeleteFamilyRows(IReadOnlyList<string> keys, ColumnFamily columnFamily)
+    {
+        WriteBatch batch = new();
+        using Iterator iterator = db.NewIterator(columnFamily);
+
+        foreach (string key in keys)
+        {
+            byte[] prefix = Encoding.UTF8.GetBytes(key + "~");
+
+            iterator.Seek(prefix);
+
+            while (iterator.Valid())
+            {
+                ReadOnlySpan<byte> rawKey = iterator.Key();
+
+                if (!rawKey.StartsWith(prefix))
+                    break;
+
+                // Copy the key out of the iterator: it must outlive the next step for batch.Delete.
+                batch.Delete(rawKey.ToArray(), columnFamily);
+                iterator.Next();
+            }
+        }
+
+        db.Write(batch, DefaultWriteOptions);
+
+        if (columnFamily == columnFamilyKeys)
+        {
+            Interlocked.Increment(ref keyRowsGeneration);
+            ForgetPruneMemos(keys);
+        }
+
+        return true;
+    }
+
+    /// <summary>Shell reused by <see cref="UnserializeKeyValueMessageThreadCached"/> on this thread.</summary>
+    [ThreadStatic]
+    private static RocksDbKeyValueMessage? threadCachedKeyValueMessage;
+
+    /// <summary>Shell reused by <see cref="UnserializeLockMessageThreadCached"/> on this thread.</summary>
+    [ThreadStatic]
+    private static RocksDbLockMessage? threadCachedLockMessage;
+
+    /// <summary>
+    /// Parses a key-value row into a thread-cached shell, for single-row point reads. The result
+    /// is only valid until the next parse on the same thread: the caller must copy every field it
+    /// needs out before then and must not retain the instance. Extracted byte payloads are safe to
+    /// keep — each parse creates a fresh ByteString; only the shell is reused.
+    /// </summary>
+    private static RocksDbKeyValueMessage UnserializeKeyValueMessageThreadCached(ReadOnlySpan<byte> serializedData) =>
+        UnserializeKeyValueMessage(serializedData, threadCachedKeyValueMessage ??= new());
+
+    /// <summary>Lock-row equivalent of <see cref="UnserializeKeyValueMessageThreadCached"/>; same contract.</summary>
+    private static RocksDbLockMessage UnserializeLockMessageThreadCached(ReadOnlySpan<byte> serializedData)
+    {
+        RocksDbLockMessage shell = threadCachedLockMessage ??= new();
+
+        ResetLockMessage(shell);
+        shell.MergeFrom(serializedData);
+
+        return shell;
+    }
+
+    private static RocksDbKeyValueMessage UnserializeKeyValueMessage(ReadOnlySpan<byte> serializedData) =>
+        RocksDbKeyValueMessage.Parser.ParseFrom(serializedData);
+
+    /// <summary>
+    /// Parses a key-value row into a caller-owned reusable message instead of a fresh allocation,
+    /// for per-row scan loops. The result is only valid until the next parse into the same shell:
+    /// the caller must copy every field it needs out before then and must not retain the instance.
+    /// Byte payloads extracted from it are safe to keep — each parse creates a fresh ByteString;
+    /// only the shell is reused.
+    /// </summary>
+    private static RocksDbKeyValueMessage UnserializeKeyValueMessage(ReadOnlySpan<byte> serializedData, RocksDbKeyValueMessage shell)
+    {
+        ResetKeyValueMessage(shell);
+        shell.MergeFrom(serializedData);
+        return shell;
+    }
+
+    /// <summary>
+    /// Restores every field of a reused <see cref="RocksDbKeyValueMessage"/> to its default before
+    /// a merge or a refill. The reset must be complete: proto3 omits default-valued fields from the
+    /// wire and <c>MergeFrom</c> leaves omitted fields untouched, so any field missed here would
+    /// leak the previous row's value into the next one. A new proto field must be added here too —
+    /// the reset-completeness unit test fails when one is missed.
+    /// </summary>
+    internal static void ResetKeyValueMessage(RocksDbKeyValueMessage message)
+    {
+        message.Key = string.Empty;
+        message.ClearValue();
+        message.ExpiresNode = 0;
+        message.ExpiresPhysical = 0;
+        message.ExpiresCounter = 0;
+        message.LastUsedNode = 0;
+        message.LastUsedPhysical = 0;
+        message.LastUsedCounter = 0;
+        message.LastModifiedNode = 0;
+        message.LastModifiedPhysical = 0;
+        message.LastModifiedCounter = 0;
+        message.Revision = 0;
+        message.State = 0;
+    }
+
+    /// <summary>
+    /// Restores every field of a reused <see cref="RocksDbLockMessage"/> to its default. The same
+    /// completeness rule as <see cref="ResetKeyValueMessage"/> applies.
+    /// </summary>
+    internal static void ResetLockMessage(RocksDbLockMessage message)
+    {
+        message.Resource = string.Empty;
+        message.ClearOwner();
+        message.ExpiresNode = 0;
+        message.ExpiresPhysical = 0;
+        message.ExpiresCounter = 0;
+        message.LastUsedNode = 0;
+        message.LastUsedPhysical = 0;
+        message.LastUsedCounter = 0;
+        message.LastModifiedNode = 0;
+        message.LastModifiedPhysical = 0;
+        message.LastModifiedCounter = 0;
+        message.FencingToken = 0;
+        message.State = 0;
+    }
+
+    /// <summary>
+    /// The ordering fields of a stored key-value row: the revision plus the commit HLC.
+    /// Rows are compared on these fields alone in the head-advance and prune paths.
+    /// </summary>
+    internal readonly struct StoredKeyValueOrdering
+    {
+        public long Revision { get; init; }
+        public int LastModifiedNode { get; init; }
+        public long LastModifiedPhysical { get; init; }
+        public uint LastModifiedCounter { get; init; }
+    }
+
+    /// <summary>
+    /// Decodes only the ordering fields of a serialized key-value row. The full protobuf parse
+    /// copies the value payload into a fresh array plus a ByteString plus a message object; the
+    /// compare paths throw all three away. This walk skips the payload bytes without a copy.
+    /// Falls back to the full parser on any wire shape it does not handle, so malformed data
+    /// surfaces the same exception as before.
+    /// </summary>
+    internal static StoredKeyValueOrdering DecodeKeyValueOrdering(ReadOnlySpan<byte> serializedData)
+    {
+        if (TryDecodeKeyValueOrdering(serializedData, out StoredKeyValueOrdering ordering))
+            return ordering;
+
+        RocksDbKeyValueMessage message = UnserializeKeyValueMessage(serializedData);
+        return new()
+        {
+            Revision = message.Revision,
+            LastModifiedNode = message.LastModifiedNode,
+            LastModifiedPhysical = message.LastModifiedPhysical,
+            LastModifiedCounter = message.LastModifiedCounter,
+        };
+    }
+
+    /// <summary>
+    /// Allocation-free wire-format walk over a serialized <see cref="RocksDbKeyValueMessage"/>.
+    /// Extracts fields 9–12 (commit HLC and revision) and skips every other field, including the
+    /// value payload. Returns false on any malformed or unsupported wire shape; the caller then
+    /// falls back to the full parser. A later field occurrence overrides an earlier one, which
+    /// matches protobuf merge semantics.
+    /// </summary>
+    internal static bool TryDecodeKeyValueOrdering(ReadOnlySpan<byte> data, out StoredKeyValueOrdering ordering)
+    {
+        long revision = 0;
+        int lastModifiedNode = 0;
+        long lastModifiedPhysical = 0;
+        uint lastModifiedCounter = 0;
+
+        int pos = 0;
+
+        while (pos < data.Length)
+        {
+            if (!TryReadVarint(data, ref pos, out ulong tag) || tag >> 3 == 0)
+            {
+                ordering = default;
+                return false;
+            }
+
+            int fieldNumber = (int)(tag >> 3);
+
+            switch ((int)(tag & 7))
+            {
+                case 0: // varint
+                    if (!TryReadVarint(data, ref pos, out ulong value))
+                    {
+                        ordering = default;
+                        return false;
+                    }
+
+                    switch (fieldNumber)
+                    {
+                        case 9:
+                            lastModifiedNode = (int)(long)value;
+                            break;
+                        case 10:
+                            lastModifiedPhysical = (long)value;
+                            break;
+                        case 11:
+                            lastModifiedCounter = (uint)value;
+                            break;
+                        case 12:
+                            revision = (long)value;
+                            break;
+                    }
+                    break;
+
+                case 1: // fixed64
+                    if (data.Length - pos < 8)
+                    {
+                        ordering = default;
+                        return false;
+                    }
+                    pos += 8;
+                    break;
+
+                case 2: // length-delimited: skip the bytes without materializing them
+                    if (!TryReadVarint(data, ref pos, out ulong length) || (ulong)(data.Length - pos) < length)
+                    {
+                        ordering = default;
+                        return false;
+                    }
+                    pos += (int)length;
+                    break;
+
+                case 5: // fixed32
+                    if (data.Length - pos < 4)
+                    {
+                        ordering = default;
+                        return false;
+                    }
+                    pos += 4;
+                    break;
+
+                default: // groups and reserved wire types: let the full parser decide
+                    ordering = default;
+                    return false;
+            }
+        }
+
+        ordering = new()
+        {
+            Revision = revision,
+            LastModifiedNode = lastModifiedNode,
+            LastModifiedPhysical = lastModifiedPhysical,
+            LastModifiedCounter = lastModifiedCounter,
+        };
+        return true;
+    }
+
+    /// <summary>
+    /// Reads one base-128 varint. Accepts at most 10 bytes — the protobuf maximum for a 64-bit
+    /// value — and, like the protobuf reader, discards bits shifted beyond 64.
+    /// </summary>
+    private static bool TryReadVarint(ReadOnlySpan<byte> data, ref int pos, out ulong value)
+    {
+        value = 0;
+
+        for (int shift = 0; shift < 70; shift += 7)
+        {
+            if (pos >= data.Length)
+                return false;
+
+            byte b = data[pos++];
+
+            if (shift < 64)
+                value |= (ulong)(b & 0x7F) << shift;
+
+            if ((b & 0x80) == 0)
+                return true;
+        }
+
+        // Continuation bit still set after 10 bytes: malformed.
+        return false;
+    }
+
+    public bool PruneKeyValueRevisions(
+        IReadOnlyCollection<string>? keys,
+        int retentionCount,
+        TimeSpan retentionAge,
+        int batchSize,
+        HLCTimestamp floorTimestamp,
+        out RevisionPruneResult result) =>
+        PruneKeyValueRevisions(keys, retentionCount, retentionAge, batchSize, floorTimestamp, Timeout.InfiniteTimeSpan, out result);
+
+    public bool PruneKeyValueRevisions(
+        IReadOnlyCollection<string>? keys,
+        int retentionCount,
+        TimeSpan retentionAge,
+        int batchSize,
+        HLCTimestamp floorTimestamp,
+        TimeSpan timeBudget,
+        out RevisionPruneResult result)
+    {
+        EnterDbFence();
+        try
+        {
+            return PruneKeyValueRevisionsFenced(keys, retentionCount, retentionAge, batchSize, floorTimestamp, timeBudget, out result);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    /// <summary>
+    /// Rows a backend-wide sweep steps between checks of its time budget. Rows between two keys'
+    /// ~CURRENT markers are the previous key's revision history; a key with a deep block (or a run
+    /// of them) can put millions of rows between consecutive keys, so the budget is checked on row
+    /// progress as well as on key progress.
+    /// </summary>
+    private const int SweepBudgetCheckRows = 1024;
+
+    // Must run under the swap fence (EnterDbFence).
+    private bool PruneKeyValueRevisionsFenced(
+        IReadOnlyCollection<string>? keys,
+        int retentionCount,
+        TimeSpan retentionAge,
+        int batchSize,
+        HLCTimestamp floorTimestamp,
+        TimeSpan timeBudget,
+        out RevisionPruneResult result)
+    {
+        int keysVisited = 0;
+        int keysSkipped = 0;
+        int keysFloorBlocked = 0;
+        int deleted = 0;
+        int floorViolations = 0;
+        bool batchLimitReached = false;
+        bool timeBudgetExhausted = false;
+        List<string>? remaining = null;
+
+        // The budget bounds the whole pass — walks, memo checks and sweep row stepping alike — from
+        // the moment the caller handed it over. It is consulted before every key after the first
+        // (one key always makes progress, so a caller that arrives with a spent budget still moves
+        // forward) and, in a sweep, every SweepBudgetCheckRows stepped rows.
+        bool budgeted = timeBudget != Timeout.InfiniteTimeSpan && timeBudget != TimeSpan.MaxValue;
+        long budgetStart = Stopwatch.GetTimestamp();
+
+        bool BudgetExhausted() => budgeted && Stopwatch.GetElapsedTime(budgetStart) >= timeBudget;
+
+        using PruneWalkCursor walk = new(this);
+
+        if (keys is not null)
+        {
+            IList<string> keyList = keys as IList<string> ?? keys.ToList();
+
+            for (int i = 0; i < keyList.Count; i++)
+            {
+                bool deleteBudgetSpent = deleted >= batchSize;
+
+                if (deleteBudgetSpent || (i > 0 && BudgetExhausted()))
+                {
+                    // Stopped before reaching this key — everything from here on still needs work.
+                    batchLimitReached = true;
+                    timeBudgetExhausted = !deleteBudgetSpent;
+                    for (int j = i; j < keyList.Count; j++)
+                        (remaining ??= []).Add(keyList[j]);
+                    break;
+                }
+
+                string key = keyList[i];
+                PruneRevisionsForKey(key, retentionCount, retentionAge, batchSize, floorTimestamp, walk, fromSweep: false, ref deleted, ref floorViolations, ref keysSkipped, ref keysFloorBlocked, out bool keyLimitReached, out _);
+                keysVisited++;
+
+                if (keyLimitReached)
+                {
+                    // This key was only partially pruned, and the batch is now full.
+                    batchLimitReached = true;
+                    (remaining ??= []).Add(key);
+                    for (int j = i + 1; j < keyList.Count; j++)
+                        (remaining ??= []).Add(keyList[j]);
+                    break;
+                }
+            }
+        }
+        else
+        {
+            // Backend-wide sweep: visit each logical key via its ~CURRENT entry, resuming from the
+            // cursor left by the previous pass so each pass covers only a bounded slice — at most
+            // batchSize keys or batchSize deletes, and no longer than the time budget — instead of
+            // the whole column family.
+            //
+            // The rows between one key's ~CURRENT marker and the next key's are the next key's
+            // revision history, which the sweep does not need to see: PruneRevisionsForKey walks a
+            // block itself when the key needs pruning, and the memo answers most keys without a
+            // walk at all. Stepping those rows made the sweep O(total history rows) — seconds per
+            // pass on a hot store, taken from the flush every cleanup interval. Deep runs are
+            // jumped instead, with the same registry-gated seek the range scans use, so the sweep
+            // costs O(logical keys) plus the walks that actually prune.
+            if (sweepCursor is null)
+            {
+                if (SweepStillQuiescent(retentionCount, retentionAge, floorTimestamp))
+                {
+                    result = new(0, 0, false, SweepIdle: true);
+                    return true;
+                }
+
+                // A new cycle. The generation is sampled before any of its iterators exist, so a write
+                // the cycle's snapshots cannot see still moves it before the cycle ends.
+                sweepQuiescence = null;
+                sweepCycleClean = true;
+                sweepCycleGeneration = Volatile.Read(ref keyRowsGeneration);
+                sweepCycleFloor = floorTimestamp;
+                sweepCycleRetentionCount = retentionCount;
+                sweepCycleRetentionAge = retentionAge;
+                sweepCycleAgeFrontier = long.MaxValue;
+            }
+            else if (floorTimestamp != sweepCycleFloor
+                     || retentionCount != sweepCycleRetentionCount
+                     || retentionAge != sweepCycleRetentionAge)
+            {
+                // Keys visited earlier in this cycle were judged under other inputs.
+                sweepCycleClean = false;
+            }
+
+            int keyBudget = batchSize;
+            bool paused = false;
+            int nonCurrentRun = 0;
+            int rowsSinceBudgetCheck = 0;
+
+            using Iterator iterator = db.NewIterator(columnFamilyKeys);
+
+            if (sweepCursor is null)
+                iterator.SeekToFirst();
+            else
+                iterator.Seek(sweepCursor);
+
+            while (iterator.Valid())
+            {
+                if (deleted >= batchSize || keysVisited >= keyBudget)
+                {
+                    // Pause here; resume from the current (unprocessed) entry next pass.
+                    sweepCursor = iterator.Key().ToArray();
+                    batchLimitReached = true;
+                    paused = true;
+                    break;
+                }
+
+                // Time budget on row progress: a run of deep blocks can put millions of rows between
+                // two keys. The cursor lands on the current (unprocessed) row, so nothing is skipped.
+                if (rowsSinceBudgetCheck >= SweepBudgetCheckRows)
+                {
+                    rowsSinceBudgetCheck = 0;
+
+                    if (BudgetExhausted())
+                    {
+                        sweepCursor = iterator.Key().ToArray();
+                        batchLimitReached = true;
+                        timeBudgetExhausted = true;
+                        paused = true;
+                        break;
+                    }
+                }
+
+                // Only ~CURRENT rows map to a logical key to prune. Test the suffix on the key span
+                // and decode just the logical key for those — revision rows skip the decode.
+                ReadOnlySpan<byte> rawKeySpan = iterator.Key();
+
+                if (rawKeySpan.EndsWith(CurrentMarkerUtf8))
+                {
+                    nonCurrentRun = 0;
+
+                    // Time budget on key progress; the first key of a pass always runs.
+                    if (keysVisited > 0 && BudgetExhausted())
+                    {
+                        sweepCursor = rawKeySpan.ToArray();
+                        batchLimitReached = true;
+                        timeBudgetExhausted = true;
+                        paused = true;
+                        break;
+                    }
+
+                    string logicalKey = Encoding.UTF8.GetString(rawKeySpan[..^CurrentMarkerUtf8.Length]);
+                    PruneRevisionsForKey(logicalKey, retentionCount, retentionAge, batchSize, floorTimestamp, walk, fromSweep: true, ref deleted, ref floorViolations, ref keysSkipped, ref keysFloorBlocked, out bool keyLimitReached, out long keyAgeFrontier);
+                    keysVisited++;
+
+                    if (keyAgeFrontier < sweepCycleAgeFrontier)
+                        sweepCycleAgeFrontier = keyAgeFrontier;
+
+                    if (keyLimitReached)
+                    {
+                        sweepCycleClean = false;
+                        // Key only partially pruned — resume at this same key next pass.
+                        sweepCursor = rawKeySpan.ToArray(); // ToArray only on pause path
+                        batchLimitReached = true;
+                        paused = true;
+                        break;
+                    }
+                }
+                else if (++nonCurrentRun == RevisionRunSeekThreshold && TrySeekPastRevisionRun(iterator, rawKeySpan))
+                {
+                    // Jumped over the rest of this key's revision rows to its ~CURRENT row (or, if the
+                    // key has none, to whatever sorts next). Re-read the landed row without a Next.
+                    nonCurrentRun = 0;
+                    rowsSinceBudgetCheck++;
+                    continue;
+                }
+
+                rowsSinceBudgetCheck++;
+                iterator.Next();
+            }
+
+            // Reached the end of the column family without pausing: full scan complete, wrap around.
+            if (!paused)
+            {
+                sweepCursor = null;
+
+                if (sweepCycleClean && Volatile.Read(ref keyRowsGeneration) == sweepCycleGeneration)
+                    sweepQuiescence = new(sweepCycleGeneration, sweepCycleFloor, sweepCycleRetentionCount, sweepCycleRetentionAge, sweepCycleAgeFrontier);
+            }
+        }
+
+        result = new(keysVisited, deleted, batchLimitReached, remaining, floorViolations, keysSkipped, timeBudgetExhausted, keysFloorBlocked);
+        return true;
+    }
+
+    /// <summary>
+    /// True when the last complete sweep cycle left the store clean and nothing that could make a key
+    /// prunable has happened since: no caller write, the same floor and retention settings, and age
+    /// retention has not yet reached the oldest row it could delete (a key is age-eligible once that
+    /// row is strictly older than the cutoff).
+    /// </summary>
+    private bool SweepStillQuiescent(int retentionCount, TimeSpan retentionAge, HLCTimestamp floorTimestamp)
+    {
+        SweepQuiescence? quiescence = sweepQuiescence;
+        if (quiescence is null)
+            return false;
+
+        if (quiescence.Generation != Volatile.Read(ref keyRowsGeneration)
+            || quiescence.Floor != floorTimestamp
+            || quiescence.RetentionCount != retentionCount
+            || quiescence.RetentionAge != retentionAge)
+            return false;
+
+        if (retentionAge <= TimeSpan.Zero)
+            return true;
+
+        long cutoffPhysical = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)retentionAge.TotalMilliseconds;
+        return cutoffPhysical <= quiescence.AgeFrontierPhysical;
+    }
+
+    /// <summary>
+    /// Prunes old revision records for a single logical key, keeping the current revision
+    /// and any revisions within the configured count/age retention window.
+    /// When <paramref name="floorTimestamp"/> is non-zero the floor-boundary revision
+    /// (the highest revision whose LastModified ≤ floorTimestamp) and everything newer
+    /// are also protected from deletion.
+    /// <para>
+    /// <paramref name="ageFrontierPhysical"/> receives the commit time at which the key's memo verdict
+    /// turns back to "walk" once age retention reaches it — the oldest non-current row, or, when the
+    /// floor blocked the walk, the oldest row below the floor boundary — or <see cref="long.MaxValue"/>
+    /// when there is none. It is meaningless when <paramref name="batchLimitReached"/> is set.
+    /// </para>
+    /// </summary>
+    private void PruneRevisionsForKey(
+        string key,
+        int retentionCount,
+        TimeSpan retentionAge,
+        int batchSize,
+        HLCTimestamp floorTimestamp,
+        PruneWalkCursor walk,
+        bool fromSweep,
+        ref int deleted,
+        ref int floorViolations,
+        ref int keysSkipped,
+        ref int keysFloorBlocked,
+        out bool batchLimitReached,
+        out long ageFrontierPhysical)
+    {
+        batchLimitReached = false;
+        ageFrontierPhysical = long.MaxValue;
+
+        bool needAge = retentionAge > TimeSpan.Zero;
+        bool needFloor = floorTimestamp != HLCTimestamp.Zero;
+        long cutoffPhysical = needAge
+            ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)retentionAge.TotalMilliseconds
+            : long.MinValue;
+
+        // The memo answers most visits of a hot key without touching the store: nothing to delete
+        // yet, so nothing to walk. See the memo remarks for why this is exact-or-conservative.
+        PruneMemoVerdict verdict = PruneMemoVerdictFor(key, retentionCount, retentionAge, cutoffPhysical, floorTimestamp, out long memoAgeFrontier);
+        if (verdict != PruneMemoVerdict.Walk)
+        {
+            keysSkipped++;
+            if (verdict == PruneMemoVerdict.SkipFloorBlocked)
+                keysFloorBlocked++;
+            ageFrontierPhysical = memoAgeFrontier;
+            return;
+        }
+
+        int keyLen = Encoding.UTF8.GetByteCount(key);
+        int maxLen = keyLen + 1;
+
+        byte[]? rentedKey = null;
+        Span<byte> keyBuffer = maxLen <= KeyStackThreshold
+            ? stackalloc byte[KeyStackThreshold]
+            : (rentedKey = ArrayPool<byte>.Shared.Rent(maxLen));
+        try
+        {
+            Encoding.UTF8.GetBytes(key.AsSpan(), keyBuffer);
+            keyBuffer[keyLen] = (byte)'~';
+            ReadOnlySpan<byte> prefixBytes = keyBuffer[..(keyLen + 1)];
+
+            // "<key>~CURRENT" sorts inside the "<key>~" range, so the walk reads the current revision
+            // from the same snapshot as the history rows instead of paying a separate point lookup.
+            int currentKeyLength = keyLen + CurrentMarkerUtf8.Length;
+            bool hasCurrent = false;
+            StoredKeyValueOrdering currentOrdering = default;
+
+            List<(long Revision, long LastModifiedPhysical, HLCTimestamp LastModified, byte[] RawKeyBytes)> revisions = [];
+
+            Iterator iterator = walk.Iterator;
+            iterator.Seek(prefixBytes);
+
+            while (iterator.Valid())
+            {
+                // Filter on the key span — no per-row string decode. Only rows we keep are
+                // materialised (their key bytes are retained below for the later batch.Delete).
+                ReadOnlySpan<byte> entryKey = iterator.Key();
+
+                if (!entryKey.StartsWith(prefixBytes))
+                    break;
+
+                // Skip the ~CURRENT sentinel — never a candidate for deletion. Only this key's own
+                // marker carries its current revision; a longer one belongs to another key that
+                // shares the prefix.
+                if (entryKey.EndsWith(CurrentMarkerUtf8))
+                {
+                    if (entryKey.Length == currentKeyLength)
+                    {
+                        currentOrdering = DecodeKeyValueOrdering(iterator.Value());
+                        hasCurrent = true;
+                    }
+
+                    iterator.Next();
+                    continue;
+                }
+
+                // The suffix after "<key>~" must be a numeric revision; reject any trailing junk
+                // so "<key>~123abc" is ignored exactly as long.TryParse would.
+                ReadOnlySpan<byte> suffix = entryKey[prefixBytes.Length..];
+                if (!Utf8Parser.TryParse(suffix, out long revisionNum, out int consumed) || consumed != suffix.Length)
+                {
+                    iterator.Next();
+                    continue;
+                }
+
+                // Decode LastModified for every revision (not just when age/floor need it): the
+                // pruned-history floor is derived from the oldest surviving revision's timestamp,
+                // which must be known even for count-only retention.
+                StoredKeyValueOrdering rowOrdering = DecodeKeyValueOrdering(iterator.Value());
+                long lastModifiedPhysical = rowOrdering.LastModifiedPhysical;
+                HLCTimestamp lastModified = new(rowOrdering.LastModifiedNode, rowOrdering.LastModifiedPhysical, rowOrdering.LastModifiedCounter);
+
+                // Copy the key out of the iterator: it must outlive the next step for batch.Delete.
+                revisions.Add((revisionNum, lastModifiedPhysical, lastModified, entryKey.ToArray()));
+                iterator.Next();
+            }
+
+            // No current row: the key is gone (or not yet written), and its history is not ours to prune.
+            if (!hasCurrent)
+                return;
+
+            long currentRevision = currentOrdering.Revision;
+
+            if (revisions.Count == 0)
+            {
+                // No history rows at all (a no-revision key): nothing to prune until one is written.
+                RememberPruneWalk(key, 0, long.MaxValue, long.MaxValue, floorBlocked: false, floorTimestamp, walk.Generation, admitWhenFull: !fromSweep);
+                return;
+            }
+
+            // Sort descending so index 0 is the newest revision.
+            revisions.Sort(static (a, b) => b.Revision.CompareTo(a.Revision));
+
+            // Compute the floor revision: the highest revision whose LastModified ≤ floorTimestamp.
+            // Revisions >= floorRevision are protected from deletion.
+            long floorRevision = -1;
+            if (needFloor)
+            {
+                foreach ((long rev, _, HLCTimestamp lm, _) in revisions)
+                {
+                    if (lm <= floorTimestamp && rev > floorRevision)
+                        floorRevision = rev;
+                }
+            }
+
+            WriteBatch batch = new();
+            int deletedInBatch = 0;
+            int floorBlockedCandidates = 0;
+            HashSet<long>? deletedRevNums = null;
+
+            for (int i = 0; i < revisions.Count; i++)
+            {
+                (long revNum, long lastModifiedPhysical, _, byte[] rawKeyBytes) = revisions[i];
+
+                // Always protect the current revision's historical record.
+                if (revNum == currentRevision)
+                    continue;
+
+                bool deleteByCount = retentionCount > 0 && i >= retentionCount;
+                bool deleteByAge = needAge && lastModifiedPhysical < cutoffPhysical;
+
+                if (!deleteByCount && !deleteByAge)
+                    continue;
+
+                // Floor protection: when a floor is active, protect the boundary revision and
+                // everything newer.  When no revision exists at-or-before the floor (floorRevision
+                // < 0), the key was created entirely after the floor — all its revisions are
+                // protected by skipping this key entirely. Counted so the memo knows this key holds
+                // deletable rows that only a moved floor (or new history) can release.
+                if (needFloor && (floorRevision < 0 || revNum >= floorRevision))
+                {
+                    floorBlockedCandidates++;
+                    continue;
+                }
+
+                if (deleted + deletedInBatch >= batchSize)
+                {
+                    batchLimitReached = true;
+                    break;
+                }
+
+                // Independent floor-protection audit: the floor clamp above (the `continue` guarding
+                // revNum >= floorRevision / floorRevision < 0) must prevent any floor-protected
+                // revision from reaching this delete. Re-deriving the protected condition here, at
+                // the delete site, catches a regression in that clamp — a correct clamp keeps this
+                // at 0; observing one means a protected revision is being deleted.
+                if (needFloor && (floorRevision < 0 || revNum >= floorRevision))
+                    floorViolations++;
+
+                batch.Delete(rawKeyBytes, columnFamilyKeys);
+                deletedInBatch++;
+                (deletedRevNums ??= []).Add(revNum);
+            }
+
+            // This key lost history: raise the durable pruned-history floor to its oldest surviving
+            // revision (or the current no-revision row's HLC when none survives), staging the floor
+            // Put into the SAME batch as the deletes so a crash cannot leave the floor trailing the
+            // deleted history. As-of reads at a cut below it can no longer find the key's boundary.
+            HLCTimestamp stagedFloor = HLCTimestamp.Zero;
+            if (deletedRevNums is not null)
+            {
+                HLCTimestamp oldestSurviving = HLCTimestamp.Zero;
+                foreach ((long revNum, _, HLCTimestamp lastModified, _) in revisions)
+                {
+                    if (deletedRevNums.Contains(revNum))
+                        continue;
+                    if (oldestSurviving == HLCTimestamp.Zero || lastModified.CompareTo(oldestSurviving) < 0)
+                        oldestSurviving = lastModified;
+                }
+
+                // No revision row survives — the current value is a SetNoRevision write with no history
+                // row of its own, so a cut below its timestamp cannot reconstruct the deleted boundary.
+                if (oldestSurviving == HLCTimestamp.Zero)
+                    oldestSurviving = new HLCTimestamp(
+                        currentOrdering.LastModifiedNode, currentOrdering.LastModifiedPhysical, currentOrdering.LastModifiedCounter);
+
+                stagedFloor = StagePrunedFloor(batch, oldestSurviving);
+            }
+
+            if (deletedInBatch > 0 || stagedFloor != HLCTimestamp.Zero)
+                db.Write(batch, DefaultWriteOptions);
+
+            // Commit the floor to the in-memory cache only after it is durably written with its deletes.
+            if (stagedFloor != HLCTimestamp.Zero)
+                CommitPrunedFloor(stagedFloor);
+
+            deleted += deletedInBatch;
+
+            if (batchLimitReached)
+            {
+                // Deletable rows remain: no memo, so the next visit walks again.
+                ForgetPruneMemo(key);
+            }
+            else
+            {
+                long oldestNonCurrent = long.MaxValue;
+                long oldestUnprotected = long.MaxValue;
+                foreach ((long revNum, long lastModifiedPhysical, _, _) in revisions)
+                {
+                    if (revNum == currentRevision || (deletedRevNums is not null && deletedRevNums.Contains(revNum)))
+                        continue;
+                    if (lastModifiedPhysical < oldestNonCurrent)
+                        oldestNonCurrent = lastModifiedPhysical;
+                    bool protectedByFloor = needFloor && (floorRevision < 0 || revNum >= floorRevision);
+                    if (!protectedByFloor && lastModifiedPhysical < oldestUnprotected)
+                        oldestUnprotected = lastModifiedPhysical;
+                }
+
+                RememberPruneWalk(key, revisions.Count - deletedInBatch, oldestNonCurrent, oldestUnprotected, floorBlockedCandidates > 0, floorTimestamp, walk.Generation, admitWhenFull: !fromSweep);
+                ageFrontierPhysical = floorBlockedCandidates > 0 ? oldestUnprotected : oldestNonCurrent;
+            }
+        }
+        finally
+        {
+            if (rentedKey is not null) ArrayPool<byte>.Shared.Return(rentedKey);
+        }
+    }
+
+    public bool SupportsExactAsOfCheckpoint => true;
+
+    public CheckpointResult CreateCheckpoint(string destinationPath, long appliedIndex, HLCTimestamp appliedTime)
+        => CreateCheckpointCore(destinationPath, appliedIndex, appliedTime, cut: null);
+
+    /// <summary>
+    /// Exact as-of-<paramref name="cut"/> checkpoint: takes a Solarium checkpoint, then trims the copy
+    /// so each key is left at its newest revision with <c>LastModified ≤ cut</c> (or removed if its
+    /// whole history is newer). The live database is never modified — only the checkpoint copy.
+    /// </summary>
+    public CheckpointResult CreateCheckpointAsOf(
+        string destinationPath, long appliedIndex, HLCTimestamp cut, CancellationToken ct = default)
+        => CreateCheckpointCore(destinationPath, appliedIndex, cut, cut: cut, retainKey: null, ct: ct);
+
+    /// <summary>
+    /// The exact as-of image restricted to the keys <paramref name="retainKey"/> accepts: the trim pass that
+    /// rolls each key back to the cut also deletes every row of a refused key, and every durability floor.
+    /// </summary>
+    public CheckpointResult CreateCheckpointAsOf(
+        string destinationPath, long appliedIndex, HLCTimestamp cut, Func<string, bool> retainKey, CancellationToken ct = default)
+        => CreateCheckpointCore(destinationPath, appliedIndex, cut, cut: cut, retainKey: retainKey, ct: ct);
+
+    public bool SupportsFilteredCheckpoint => true;
+
+    private CheckpointResult CreateCheckpointCore(
+        string destinationPath, long appliedIndex, HLCTimestamp appliedTime, HLCTimestamp? cut,
+        Func<string, bool>? retainKey = null, CancellationToken ct = default)
+    {
+        // The whole checkpoint runs under the swap fence: a recovery swap must never dispose the
+        // database while a checkpoint is walking it. A long as-of trim delays a pending
+        // recovery by its own duration; the writer keeps retaining batches meanwhile.
+        EnterDbFence();
+        try
+        {
+            return CreateCheckpointFenced(destinationPath, appliedIndex, appliedTime, cut, retainKey, ct);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    private CheckpointResult CreateCheckpointFenced(
+        string destinationPath, long appliedIndex, HLCTimestamp appliedTime, HLCTimestamp? cut,
+        Func<string, bool>? retainKey, CancellationToken ct)
+    {
+        // CreateCheckpoint requires the directory to NOT exist — it creates it itself. Use a temp
+        // sibling so a failure before the rename can never leave a partial checkpoint at
+        // destinationPath.
+        string? parent = Path.GetDirectoryName(destinationPath);
+        if (parent is not null)
+            Directory.CreateDirectory(parent);
+
+        string tmpPath = destinationPath + ".tmp_" + Guid.NewGuid().ToString("N")[..8];
+
+        try
+        {
+            // A copy of every family as of one sequence number, holding no WAL: what the memtables
+            // hold goes to tables of the copy, and the live store is not flushed.
+            db.CreateCheckpoint(tmpPath);
+
+            if (cut.HasValue)
+                TrimCheckpointAsOf(tmpPath, cut.Value, retainKey, environment, ct);
+
+            CheckpointManifest manifest = CheckpointManifest.From(appliedIndex, appliedTime);
+            manifest.WriteTo(tmpPath);
+
+            Directory.Move(tmpPath, destinationPath);
+
+            return new(destinationPath, manifest);
+        }
+        catch
+        {
+            if (Directory.Exists(tmpPath))
+                Directory.Delete(tmpPath, recursive: true);
+            throw;
+        }
+    }
+
+    private sealed class KeyTrimState
+    {
+        public long BestRevision = -1;
+        public byte[]? BestValue;
+        public HLCTimestamp BestLastModified;
+        public bool HasAnyRevision;
+        public byte[]? CurrentKey;
+        public HLCTimestamp CurrentLastModified;
+        public readonly List<byte[]> FutureRevisionKeys = [];
+
+        // No-revision provenance for this key (earliest/latest SetNoRevision write), and the marker
+        // row itself, which is dropped from the as-of image.
+        public HLCTimestamp NoRevEarliest;
+        public HLCTimestamp NoRevLatest;
+        public byte[]? NoRevKey;
+    }
+
+    // Flush the write batch to the copy after this many buffered operations, so neither the batch
+    // nor managed state grows with the store size.
+    private const int TrimBatchFlushThreshold = 4096;
+
+    /// <summary>
+    /// Opens the checkpoint copy at <paramref name="checkpointPath"/> and removes all state newer than
+    /// <paramref name="cut"/> from the <c>kv</c> column family: future revision rows are deleted, each
+    /// key's <c>~CURRENT</c> row is reset to its newest surviving revision (or deleted if none survive),
+    /// historyless keys newer than the cut fail closed, and the <c>locks</c> family is emptied. A final
+    /// flush and full compaction physically rewrite the tables so no post-cut payload remains in the artifact.
+    /// <para>Streams one logical key's rows at a time (they are contiguous in sorted order) and flushes
+    /// bounded write batches, so peak memory and batch size are independent of the store size.</para>
+    /// <para>With <paramref name="retainKey"/>, every row of a logical key it refuses is deleted before any
+    /// boundary check runs for that key, and the per-partition durability floors are deleted too. Internal
+    /// '\0' rows (the pruned-history floor, the tilde-key registry) stay: they describe the image, and a
+    /// registry row for a key that left only suppresses a scan optimization.</para>
+    /// <para>The trim's I/O is not rate limited: Solarium has no rate limiter, so
+    /// <c>BackupCaptureThrottleBytesPerSec</c> does not reach it.</para>
+    /// </summary>
+    private static void TrimCheckpointAsOf(
+        string checkpointPath, HLCTimestamp cut, Func<string, bool>? retainKey, IStorageEnvironment environment, CancellationToken ct)
+    {
+        using SolariumDb copy = OpenCheckpointCopy(checkpointPath, environment);
+        ColumnFamily kv = copy.GetColumnFamily("kv");
+        ColumnFamily locksCf = copy.GetColumnFamily("locks");
+
+        WriteBatch batch = new();
+        int batchOps = 0;
+
+        void FlushIfLarge()
+        {
+            if (batchOps < TrimBatchFlushThreshold)
+                return;
+            copy.Write(batch);
+            batch = new WriteBatch();
+            batchOps = 0;
+        }
+
+        {
+            string? currentLogical = null;
+            bool currentRefused = false;
+            KeyTrimState st = new();
+
+            void FlushGroup()
+            {
+                if (currentLogical is null || currentRefused)
+                    return;
+
+                // Drop the internal provenance marker from the as-of image.
+                if (st.NoRevKey is not null) { batch.Delete(st.NoRevKey, kv); batchOps++; }
+
+                if (st.CurrentLastModified.CompareTo(cut) <= 0)
+                {
+                    // The current value is at or before the cut, so it is the exact as-of state
+                    // regardless of how it was written — keep it, never reset to an older revision.
+                    // (This is the revisioned→no-revision fix.)
+                }
+                else
+                {
+                    // The current value is after the cut. Fail closed when a no-revision write in the
+                    // boundary window (earliest ≤ cut, latest newer than the surviving revision
+                    // boundary) was overwritten and cannot be reconstructed. (no-revision→revisioned fix.)
+                    HLCTimestamp boundaryHlc = st.BestRevision >= 0 ? st.BestLastModified : HLCTimestamp.Zero;
+                    if (st.NoRevEarliest != HLCTimestamp.Zero
+                        && st.NoRevEarliest.CompareTo(cut) <= 0
+                        && st.NoRevLatest.CompareTo(boundaryHlc) > 0)
+                        throw new ExactCheckpointUnavailableException(
+                            $"Key '{currentLogical}' has a SetNoRevision write in its as-of-{cut} boundary " +
+                            "window whose value was overwritten and cannot be reconstructed; the cut cannot be produced exactly.");
+
+                    if (st.BestRevision >= 0)
+                    {
+                        // Roll the current row back to the newest surviving revision (its boundary).
+                        batch.Put(st.CurrentKey ?? BuildCurrentKey(currentLogical), st.BestValue!, kv);
+                        batchOps++;
+                    }
+                    else if (st.CurrentKey is not null)
+                    {
+                        // No revision at/before the cut and no lost no-revision boundary → the key did
+                        // not exist at the cut. Omit it.
+                        batch.Delete(st.CurrentKey, kv);
+                        batchOps++;
+                    }
+                }
+
+                foreach (byte[] futureRev in st.FutureRevisionKeys) { batch.Delete(futureRev, kv); batchOps++; }
+            }
+
+            using (Iterator it = copy.NewIterator(kv))
+            {
+                it.SeekToFirst();
+                while (it.Valid())
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    ReadOnlySpan<byte> rawKey = it.Key();
+                    int lastTilde = rawKey.LastIndexOf((byte)'~');
+                    if (lastTilde < 0)
+                    {
+                        if (retainKey is not null && rawKey.StartsWith(DurabilityFloorKeyPrefixUtf8))
+                        {
+                            batch.Delete(rawKey.ToArray(), kv);
+                            batchOps++;
+                            FlushIfLarge();
+                        }
+
+                        it.Next();
+                        continue;
+                    }
+
+                    ReadOnlySpan<byte> suffix = rawKey[(lastTilde + 1)..];
+                    string logicalKey = Encoding.UTF8.GetString(rawKey[..lastTilde]);
+
+                    // All rows of one logical key are contiguous in sorted order — a change of logical
+                    // key closes the previous group and starts a new one, keeping memory bounded.
+                    if (logicalKey != currentLogical)
+                    {
+                        FlushGroup();
+                        FlushIfLarge();
+                        currentLogical = logicalKey;
+                        currentRefused = retainKey is not null && rawKey[0] != 0 && !retainKey(logicalKey);
+                        st = new KeyTrimState();
+                    }
+
+                    if (currentRefused)
+                    {
+                        batch.Delete(rawKey.ToArray(), kv);
+                        batchOps++;
+                        FlushIfLarge();
+                        it.Next();
+                        continue;
+                    }
+
+                    // The provenance marker's value is a packed HLC span, not a protobuf message —
+                    // handle it before any attempt to deserialize a RocksDbKeyValueMessage.
+                    if (suffix.SequenceEqual(NoRevMarkerUtf8[1..]))
+                    {
+                        if (TryUnpackNoRev(it.Value().ToArray(), out HLCTimestamp e, out HLCTimestamp l))
+                        {
+                            st.NoRevEarliest = e;
+                            st.NoRevLatest = l;
+                        }
+                        st.NoRevKey = rawKey.ToArray();
+                        it.Next();
+                        continue;
+                    }
+
+                    StoredKeyValueOrdering rowOrdering = DecodeKeyValueOrdering(it.Value());
+                    HLCTimestamp lm = new(rowOrdering.LastModifiedNode, rowOrdering.LastModifiedPhysical, rowOrdering.LastModifiedCounter);
+
+                    if (suffix.SequenceEqual(CurrentMarkerUtf8[1..]))
+                    {
+                        st.CurrentKey = rawKey.ToArray();
+                        st.CurrentLastModified = lm;
+                    }
+                    else if (Utf8Parser.TryParse(suffix, out long revision, out int consumed) && consumed == suffix.Length)
+                    {
+                        st.HasAnyRevision = true;
+                        if (lm.CompareTo(cut) > 0)
+                            st.FutureRevisionKeys.Add(rawKey.ToArray()); // committed after the cut → drop
+                        else if (revision > st.BestRevision)
+                        {
+                            st.BestRevision = revision;
+                            st.BestValue = it.Value().ToArray();
+                            st.BestLastModified = lm;
+                        }
+                    }
+
+                    it.Next();
+                }
+            }
+
+            FlushGroup();
+
+            // Exclude locks from the as-of image — volatile lease state re-established at runtime.
+            using (Iterator lockIt = copy.NewIterator(locksCf))
+            {
+                lockIt.SeekToFirst();
+                while (lockIt.Valid())
+                {
+                    ct.ThrowIfCancellationRequested();
+                    batch.Delete(lockIt.Key().ToArray(), locksCf);
+                    batchOps++;
+                    FlushIfLarge();
+                    lockIt.Next();
+                }
+            }
+
+            copy.Write(batch);
+        }
+
+        // Physically purge: a full compaction rewrites the tables, dropping the deleted/overwritten
+        // post-cut values so no artifact byte discloses state newer than the cut. Solarium's
+        // CompactRange does not flush the memtables first, so the trim's deletes are flushed before.
+        PurgeFamily(copy, kv);
+        PurgeFamily(copy, locksCf);
+    }
+
+    // Writes the family's memtables to tables, then rewrites every table of it into one sorted level.
+    private static void PurgeFamily(SolariumDb db, ColumnFamily family)
+    {
+        db.Flush(family, wait: true);
+        db.CompactRange(null, null, family);
+    }
+
+    // Opens a checkpoint (or a merge target or source) that must exist, with its two families.
+    private static SolariumDb OpenCheckpointCopy(string checkpointPath, IStorageEnvironment environment) =>
+        SolariumDb.Open(checkpointPath, new DbOptions { Environment = environment, CreateIfMissing = false, ColumnFamilyOptions = FamilyOptions }, ["kv", "locks"]);
+
+    /// <summary>
+    /// Copies every key-value row of the checkpoint at <paramref name="sourcePath"/> into the checkpoint at
+    /// <paramref name="targetPath"/>, both of them key-filtered as-of images whose key sets do not overlap
+    /// (each holds the partitions one node captured for the same cut). The rows are copied raw, so each key
+    /// keeps its revision history exactly as its own image holds it.
+    /// <para>Internal rows are combined rather than copied. The pruned-history floor becomes the higher of
+    /// the two (history below either may be gone, so a later cut must clear both). The tilde-key registry
+    /// rows are a union; the registry sentinel survives only when the source has one too or holds no user
+    /// row, because a source store that never registered its tilde keys would otherwise make the merged
+    /// registry claim an authority it does not have. Durability floors are not copied.</para>
+    /// <para>A final flush and compaction rewrite the target's tables so the merged image is self-contained.</para>
+    /// </summary>
+    internal static void MergeCheckpointInto(string targetPath, string sourcePath, IStorageEnvironment environment, CancellationToken ct)
+    {
+        using SolariumDb target = OpenCheckpointCopy(targetPath, environment);
+        using SolariumDb source = OpenCheckpointCopy(sourcePath, environment);
+        ColumnFamily targetKv = target.GetColumnFamily("kv");
+        ColumnFamily sourceKv = source.GetColumnFamily("kv");
+
+        HLCTimestamp prunedFloor = HigherPrunedFloor(ReadPrunedFloor(target, targetKv), ReadPrunedFloor(source, sourceKv));
+
+        bool sourceHasSentinel = false;
+        bool sourceHasUserRows = false;
+
+        WriteBatch batch = new();
+        int batchOps = 0;
+
+        {
+            using (Iterator it = source.NewIterator(sourceKv))
+            {
+                it.SeekToFirst();
+                while (it.Valid())
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    ReadOnlySpan<byte> rawKey = it.Key();
+
+                    if (rawKey.SequenceEqual(TildeRegistrySentinelKeyUtf8))
+                        sourceHasSentinel = true;
+                    else if (rawKey.SequenceEqual(PrunedFloorKeyUtf8) || rawKey.SequenceEqual(LegacyPrunedFloorKeyUtf8)
+                             || rawKey.StartsWith(DurabilityFloorKeyPrefixUtf8))
+                    {
+                        // Combined (the floor) or dropped (durability floors) below.
+                    }
+                    else
+                    {
+                        if (rawKey.Length == 0 || rawKey[0] != 0)
+                            sourceHasUserRows = true;
+
+                        batch.Put(rawKey.ToArray(), it.Value().ToArray(), targetKv);
+                        batchOps++;
+
+                        if (batchOps >= TrimBatchFlushThreshold)
+                        {
+                            target.Write(batch);
+                            batch = new WriteBatch();
+                            batchOps = 0;
+                        }
+                    }
+
+                    it.Next();
+                }
+            }
+
+            if (prunedFloor != HLCTimestamp.Zero)
+                batch.Put(PrunedFloorKeyUtf8.ToArray(), PackPrunedFloor(prunedFloor), targetKv);
+
+            if (!sourceHasSentinel && sourceHasUserRows)
+                batch.Delete(TildeRegistrySentinelKeyUtf8.ToArray(), targetKv);
+
+            target.Write(batch);
+        }
+
+        PurgeFamily(target, targetKv);
+    }
+
+    // The pruned-history floor an image declares: the current key, else the legacy key. A value of the wrong
+    // size refuses the merge, as it refuses every cut on a live store.
+    private static HLCTimestamp ReadPrunedFloor(SolariumDb db, ColumnFamily kv)
+    {
+        byte[]? data = db.Get(PrunedFloorKeyUtf8.ToArray(), kv) ?? db.Get(LegacyPrunedFloorKeyUtf8.ToArray(), kv);
+        if (data is null)
+            return HLCTimestamp.Zero;
+
+        if (data.Length != PrunedFloorSize)
+            throw new ExactCheckpointUnavailableException(
+                "A checkpoint being merged has an unreadable pruned-history floor; the merged image cannot prove its cut.");
+
+        return UnpackPrunedFloor(data);
+    }
+
+    private static HLCTimestamp HigherPrunedFloor(HLCTimestamp a, HLCTimestamp b) => a.CompareTo(b) >= 0 ? a : b;
+
+    private static byte[] BuildCurrentKey(string logicalKey)
+    {
+        int keyLen = Encoding.UTF8.GetByteCount(logicalKey);
+        byte[] buffer = new byte[keyLen + CurrentMarkerUtf8.Length];
+        Encoding.UTF8.GetBytes(logicalKey, buffer);
+        CurrentMarkerUtf8.CopyTo(buffer.AsSpan(keyLen));
+        return buffer;
+    }
+
+    public void Dispose()
+    {
+        GC.SuppressFinalize(this);
+
+        // The write side of the fence waits for in-flight operations, so the database is
+        // never disposed under an active reader. A straggler that arrives later gets the managed
+        // IOException from EnterDbFence instead of an ObjectDisposedException.
+        swapFence.EnterWriteLock();
+        try
+        {
+            if (disposed)
+                return;
+
+            disposed = true;
+
+            if (!storageUnavailable)
+            {
+                // Marked first: a close that reports a failed WAL flush has still released the files.
+                storageUnavailable = true;
+                db.Dispose();
+            }
+        }
+        finally
+        {
+            swapFence.ExitWriteLock();
+        }
+
+        // The fence itself is deliberately not disposed: a late caller must reach the managed
+        // "store is closed" refusal in EnterDbFence, not a disposed-lock exception, and the
+        // backend instance lives for the process lifetime anyway.
+    }
+}

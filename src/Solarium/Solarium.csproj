@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- LibraryImport (directory fsync) generates unsafe marshalling code. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>true</IsPackable>
+    <PackageId>SolariumDb</PackageId>
+    <Description>An embedded key-value store for .NET with RocksDB's API and semantics: column families, atomic batches, range deletes, flushes and compaction.</Description>
+    <PackageTags>key-value;storage;rocksdb;lsm;embedded</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
+    <PackageReference Include="System.IO.Hashing" Version="10.0.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Solarium.Tests" />
+    <InternalsVisibleTo Include="Solarium.Benchmarks" />
+    <InternalsVisibleTo Include="Solarium.Kommander.Tests" />
+    <InternalsVisibleTo Include="Solarium.Kommander.Benchmarks" />
+  </ItemGroup>
+
+</Project>

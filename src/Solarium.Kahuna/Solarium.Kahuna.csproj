@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>SolariumDb.Kahuna</PackageId>
+    <Description>A Kahuna storage engine on Solarium, an embedded key-value store for .NET with RocksDB's API: the persistence backend and the Raft WAL, loaded with --extension-assembly.</Description>
+    <PackageTags>kahuna;storage;solarium;key-value</PackageTags>
+    <!-- Kahuna loads an extension with its dependencies from one directory: publish copies them there. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Kahuna.Core" Version="1.14.4" />
+  </ItemGroup>
+
+  <!-- The Kahuna server that loads this extension has Kahuna.Core, Kommander and every package they use,
+       with their native libraries (RocksDB, SQLite), and its loader always takes the server's copy of an
+       assembly the server has. The published folder therefore holds only what the server lacks: the
+       Solarium assemblies, ioxide (the io_uring runtime) and K4os.Compression.LZ4 (the tables' LZ4). A
+       package Solarium adds that the server lacks must be kept here, or the server fails to load it at its
+       first use. -->
+  <Target Name="PublishOnlyWhatTheServerLacks" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="'%(ResolvedFileToPublish.NuGetPackageId)' != ''
+                                        and '%(ResolvedFileToPublish.NuGetPackageId)' != 'ioxide'
+                                        and '%(ResolvedFileToPublish.NuGetPackageId)' != 'K4os.Compression.LZ4'" />
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Solarium\Solarium.csproj" />
+    <ProjectReference Include="..\Solarium.Kommander\Solarium.Kommander.csproj" />
+    <ProjectReference Include="..\Solarium.IoUring\Solarium.IoUring.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Solarium.Kahuna.Tests" />
+  </ItemGroup>
+
+</Project>

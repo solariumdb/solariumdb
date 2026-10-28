@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Its own project: Kommander 1.12.0 brings Kommander.RocksDB 11.8.1.9003, and Solarium.Benchmarks
+       pins 11.8.1.9002 for its RocksDB comparisons. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <ServerGarbageCollector>true</ServerGarbageCollector>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Solarium.Kommander\Solarium.Kommander.csproj" />
+    <ProjectReference Include="..\..\src\Solarium.IoUring\Solarium.IoUring.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # Linux, so the io_uring storage environment runs next to the default one.
+    runs-on: ubuntu-latest
+    # The suite takes about a minute; a hang must not hold the runner for six hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Show the kernel
+        run: |
+          uname -srm
+          ulimit -l
+
+      - name: Build
+        run: dotnet build -c Release
+
+      - name: Test
+        # A test that hangs is stopped after 5 minutes, and the log names it.
+        run: dotnet test -c Release --no-build --logger trx --results-directory TestResults --blame-hang-timeout 5m --blame-hang-dump-type none
+
+      # The packages are built on every run and kept as an artifact; publishing them is a manual step.
+      - name: Pack
+        run: dotnet pack -c Release --no-build -o packages
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: packages/*.nupkg
+
+      # Fails the job when io_uring did not run: without it the suite is still green.
+      - name: Summarize
+        if: ${{ !cancelled() }}
+        run: python3 .github/scripts/test-summary.py TestResults

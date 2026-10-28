@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Solarium\Solarium.csproj" />
+    <ProjectReference Include="..\..\src\Solarium.IoUring\Solarium.IoUring.csproj" />
+  </ItemGroup>
+
+</Project>

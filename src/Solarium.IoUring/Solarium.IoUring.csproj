@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>true</IsPackable>
+    <PackageId>SolariumDb.IoUring</PackageId>
+    <Description>An io_uring storage environment for Solarium on Linux 6.1 or later, on the ioxide reactor.</Description>
+    <PackageTags>key-value;storage;io_uring;linux;solarium</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ioxide" Version="0.21.412" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Solarium.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Solarium\Solarium.csproj" />
+  </ItemGroup>
+
+</Project>

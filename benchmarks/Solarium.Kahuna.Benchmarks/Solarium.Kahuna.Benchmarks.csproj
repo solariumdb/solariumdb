@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Its own project: it compares Kahuna's backends through Kahuna.Core, which brings its own RocksDB
+       (through Kommander), and Solarium.Benchmarks pins another RocksDB build for its comparisons. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <!-- Kahuna's server runs the server GC, and the GC sets how much a managed memtable costs. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Solarium.Kahuna\Solarium.Kahuna.csproj" />
+  </ItemGroup>
+
+</Project>

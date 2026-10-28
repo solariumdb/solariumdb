@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- xunit v3, as Kommander's tests use: the copied conformance suite reads TestContext.Current. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageReference Include="xunit.v3" Version="2.0.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Solarium.Kommander\Solarium.Kommander.csproj" />
+    <ProjectReference Include="..\..\src\Solarium.IoUring\Solarium.IoUring.csproj" />
+  </ItemGroup>
+
+  <!-- The storage environments and failure hooks of Solarium's own tests, shared rather than copied. -->
+  <ItemGroup>
+    <Compile Include="..\Solarium.Tests\Environments.cs" Link="Support\Environments.cs" />
+    <Compile Include="..\Solarium.Tests\EnvironmentScope.cs" Link="Support\EnvironmentScope.cs" />
+    <Compile Include="..\Solarium.Tests\HookedEnvironment.cs" Link="Support\HookedEnvironment.cs" />
+    <Compile Include="..\Solarium.Tests\PowerLossEnvironment.cs" Link="Support\PowerLossEnvironment.cs" />
+    <Compile Include="..\Solarium.Tests\TempDirectory.cs" Link="Support\TempDirectory.cs" />
+  </ItemGroup>
+
+</Project>

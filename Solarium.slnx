@@ -1,0 +1,19 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Solarium.Benchmarks/Solarium.Benchmarks.csproj" />
+    <Project Path="benchmarks/Solarium.Kommander.Benchmarks/Solarium.Kommander.Benchmarks.csproj" />
+    <Project Path="benchmarks/Solarium.Kahuna.Benchmarks/Solarium.Kahuna.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Solarium.IoUring/Solarium.IoUring.csproj" />
+    <Project Path="src/Solarium.Kahuna/Solarium.Kahuna.csproj" />
+    <Project Path="src/Solarium.Kommander/Solarium.Kommander.csproj" />
+    <Project Path="src/Solarium/Solarium.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Solarium.CrashWorker/Solarium.CrashWorker.csproj" />
+    <Project Path="tests/Solarium.Kahuna.Tests/Solarium.Kahuna.Tests.csproj" />
+    <Project Path="tests/Solarium.Kommander.Tests/Solarium.Kommander.Tests.csproj" />
+    <Project Path="tests/Solarium.Tests/Solarium.Tests.csproj" />
+  </Folder>
+</Solution>
