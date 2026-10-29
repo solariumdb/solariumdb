@@ -10,9 +10,12 @@ namespace Solarium;
 /// only ever flushes its own memtables, so the memory of one that takes no writes stays until it does.
 /// </summary>
 /// <remarks>
-/// <para>Memory counts as each database's <c>rocksdb.cur-size-all-mem-tables</c> counts it: the keys and
-/// values, 32 bytes per entry, and the fragments of range tombstones. RocksDB counts the arena blocks
-/// its memtables allocate.</para>
+/// <para>Memory counts as each database's <c>rocksdb.cur-size-all-mem-tables</c> counts it: the nodes
+/// of the memtables in their native arenas, keys, values and links included, and the range tombstones
+/// with their fragments. RocksDB counts the arena blocks its memtables allocate. The arenas take their
+/// 64 KiB chunks from a pool of the manager's, which keeps the chunks of flushed memtables for the next
+/// ones while the chunks held stay within the cap, so the memtables never take more native memory than
+/// the cap while they stay under it.</para>
 /// <para>Unlike RocksDB's, the manager never stalls writes (<c>allow_stall</c>): going over the cap only
 /// makes the writing database flush.</para>
 /// <para>With a <see cref="Solarium.Cache"/>, the manager charges the memtable memory to it as well, as
@@ -49,6 +52,7 @@ public sealed class WriteBufferManager
         _bufferSize = bufferSize;
         _cache = cache;
         _cacheOwner = Cache.NewOwner();
+        ChunkPool = new ArenaChunkPool(bufferSize);
     }
 
     /// <summary>The cache the manager charges the memtable memory to, or null.</summary>
@@ -75,7 +79,14 @@ public sealed class WriteBufferManager
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(bufferSize, 1);
         Volatile.Write(ref _bufferSize, bufferSize);
+        ChunkPool.RetainLimit = bufferSize;
     }
+
+    /// <summary>
+    /// The native chunks of the arenas of every memtable that the databases sharing the manager hold, which it keeps
+    /// after a flush for the next memtables while they stay within the cap.
+    /// </summary>
+    internal ArenaChunkPool ChunkPool { get; }
 
     /// <summary>
     /// True when the writing database should flush, as RocksDB's <c>ShouldFlush</c>: the active memtables

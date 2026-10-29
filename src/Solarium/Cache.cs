@@ -140,11 +140,37 @@ public sealed class Cache
     /// <summary>A number no other database or memtable budget of the process has, to key its entries by.</summary>
     internal static long NewOwner() => Interlocked.Increment(ref s_lastOwner);
 
-    /// <summary>The value cached under <paramref name="key"/>, now the most recently used, in the high-priority pool; false on a miss.</summary>
+    /// <summary>
+    /// The value cached under <paramref name="key"/>, now the most recently used, in the high-priority pool; false on a
+    /// miss. A <see cref="NativeBlock"/> comes with a reference that the caller releases.
+    /// </summary>
     internal bool TryGet(CacheKey key, [NotNullWhen(true)] out object? value) => Shard(key).TryGet(key, out value);
 
     /// <summary>Caches <paramref name="value"/>, or returns the value already cached under <paramref name="key"/>; see <see cref="CacheShard.Insert"/>.</summary>
     internal object Insert(CacheKey key, object value, long charge, bool highPriority = false) => Shard(key).Insert(key, value, charge, highPriority);
+
+    /// <summary>
+    /// A native copy of a data block's <paramref name="entries"/> to cache under <paramref name="key"/> with
+    /// <see cref="Insert"/>, from the memory of the key's shard, with one reference, the caller's.
+    /// </summary>
+    internal NativeBlock NewBlock(CacheKey key, ReadOnlySpan<byte> entries) => Shard(key).Memory.Allocate(entries);
+
+    /// <summary>The native blocks not freed yet, cached or held by readers, and their bytes; for tests.</summary>
+    internal (long Count, long Bytes) NativeBlocks
+    {
+        get
+        {
+            long count = 0;
+            long bytes = 0;
+            foreach (CacheShard shard in _shards)
+            {
+                count += shard.Memory.Count;
+                bytes += shard.Memory.Bytes;
+            }
+
+            return (count, bytes);
+        }
+    }
 
     /// <summary>Caches and pins <paramref name="value"/>, or pins the entry already cached; see <see cref="CacheShard.InsertPinned"/>.</summary>
     internal CacheEntry InsertPinned(CacheKey key, object value, long charge, bool highPriority = false) => Shard(key).InsertPinned(key, value, charge, highPriority);

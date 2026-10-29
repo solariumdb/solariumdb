@@ -60,8 +60,8 @@ public sealed class MemTableTests
                     long sequence = 1 + (((long)version * keys + k) * threads) + t;
                     byte[] key = B($"key{k:D4}");
                     byte[] value = B($"{sequence}");
-                    table.AddConcurrently(key, sequence, OperationKind.Put, value);
-                    table.AddCounts(MemTable.EntryBytes(key, value), 1, sequence, sequence);
+                    table.AddConcurrently(key, sequence, OperationKind.Put, value, out long bytes);
+                    table.AddCounts(bytes, 1, sequence, sequence);
                 }
             }
         }, TaskCreationOptions.LongRunning))];
@@ -110,7 +110,7 @@ public sealed class MemTableTests
                 byte[] begin = B($"b{sequence:D6}");
                 byte[] end = B($"e{sequence:D6}");
                 table.AddRangeTombstoneConcurrently(begin, end, sequence);
-                table.AddCounts(MemTable.EntryBytes(begin, end), 0, sequence, sequence);
+                table.AddCounts(MemTable.TombstoneBytes(begin, end), 0, sequence, sequence);
             }
         }, TaskCreationOptions.LongRunning))];
 
@@ -209,7 +209,7 @@ public sealed class MemTableTests
             byte[] begin = Key(2 * i);
             byte[] end = Key((2 * i) + 1);
             table.AddRangeTombstone(begin, end, i + 1);
-            tombstoneBytes += MemTable.EntryBytes(begin, end);
+            tombstoneBytes += MemTable.TombstoneBytes(begin, end);
         }
 
         // 64 ranges that do not overlap: one run of 64 fragments, each two key references, an offset and a sequence number.

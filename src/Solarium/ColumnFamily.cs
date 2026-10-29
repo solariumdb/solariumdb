@@ -64,6 +64,7 @@ public sealed class ColumnFamily
     /// The current version, with this reader counted in it; the caller passes <paramref name="slot"/>
     /// to <see cref="FamilyVersion.Leave"/> when it is done. Takes no lock.
     /// </summary>
+    /// <exception cref="ObjectDisposedException">The database closed: its last versions are retired, and their memtables may be freed.</exception>
     internal FamilyVersion EnterVersion(out int slot)
     {
         while (true)
@@ -75,7 +76,13 @@ public sealed class ColumnFamily
             // current here, Install has not replaced it yet, and Retire, after Install, sees the
             // count. Otherwise the version may be closed already, so read the new one.
             if (ReferenceEquals(version, Volatile.Read(ref _version)))
-                return version;
+            {
+                if (!version.IsClosed)
+                    return version;
+
+                version.Leave(slot);
+                throw new ObjectDisposedException(nameof(SolariumDb));
+            }
 
             version.Leave(slot);
         }
@@ -87,6 +94,18 @@ public sealed class ColumnFamily
         // The exchange is a full fence: a reader that counted itself in after it is sent to the new
         // version by its check in EnterVersion, and Retire sees every reader counted in before it.
         Interlocked.Exchange(ref _version, version).Retire();
+    }
+
+    /// <summary>
+    /// Retire the current version for good, at the close or a failed open of the database, after its tables are closed:
+    /// its memtables are freed once the readers still in it, iterators that are not disposed, leave, and a reader that
+    /// comes later is turned away. Only the first call retires anything.
+    /// </summary>
+    internal void Close()
+    {
+        FamilyVersion current = Interlocked.Exchange(ref _version, FamilyVersion.Closed);
+        if (!current.IsClosed)
+            current.Retire();
     }
 
     /// <summary>The family name.</summary>

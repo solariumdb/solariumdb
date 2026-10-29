@@ -24,8 +24,13 @@ public sealed class Iterator : IDisposable
     private readonly long _snapshot;
     private readonly byte[]? _upperBound;
     private readonly bool _fillCache;
-    private byte[]? _key;
-    private byte[]? _value;
+    // The current key and value, copied into buffers of the iterator's own that it reuses, so a step allocates
+    // nothing and a span that Key or Value returned never points into a source's memory.
+    private byte[] _key = new byte[64];
+    private byte[] _value = new byte[256];
+    private int _keyLength;
+    private int _valueLength;
+    private bool _valid;
 
     // False after a backward move: the cursors no longer sit at the current key.
     private bool _cursorsAtKey;
@@ -52,13 +57,21 @@ public sealed class Iterator : IDisposable
     }
 
     /// <summary>True when the iterator is positioned on a key.</summary>
-    public bool Valid() => _key is not null;
+    public bool Valid() => _valid;
 
-    /// <summary>The current key. Throws <see cref="InvalidOperationException"/> when the iterator is not <see cref="Valid"/>.</summary>
-    public ReadOnlySpan<byte> Key() => _key ?? throw NotPositioned();
+    /// <summary>
+    /// The current key, valid until the iterator moves. Throws <see cref="InvalidOperationException"/> when the
+    /// iterator is not <see cref="Valid"/>.
+    /// </summary>
+    public ReadOnlySpan<byte> Key() => _valid ? CurrentKey : throw NotPositioned();
 
-    /// <summary>The current value. Throws <see cref="InvalidOperationException"/> when the iterator is not <see cref="Valid"/>.</summary>
-    public ReadOnlySpan<byte> Value() => _key is not null ? _value : throw NotPositioned();
+    /// <summary>
+    /// The current value, valid until the iterator moves. Throws <see cref="InvalidOperationException"/> when the
+    /// iterator is not <see cref="Valid"/>.
+    /// </summary>
+    public ReadOnlySpan<byte> Value() => _valid ? _value.AsSpan(0, _valueLength) : throw NotPositioned();
+
+    private ReadOnlySpan<byte> CurrentKey => _key.AsSpan(0, _keyLength);
 
     /// <summary>Move to the first key, or become invalid when there is none. Throws <see cref="ObjectDisposedException"/> after <see cref="Dispose"/>.</summary>
     public void SeekToFirst()
@@ -92,21 +105,23 @@ public sealed class Iterator : IDisposable
     /// <summary>Move to the next key. Throws <see cref="InvalidOperationException"/> when the iterator is not <see cref="Valid"/>.</summary>
     public void Next()
     {
-        byte[] key = _key ?? throw NotPositioned();
+        if (!_valid)
+            throw NotPositioned();
+
         if (!_cursorsAtKey)
         {
             foreach (IEntryCursor cursor in _cursors)
-                cursor.Seek(key);
+                cursor.Seek(CurrentKey);
 
             _cursorsAtKey = true;
         }
 
-        SkipPast(key);
+        SkipPast(CurrentKey);
         FindForward();
     }
 
     /// <summary>Move to the previous key. Throws <see cref="InvalidOperationException"/> when the iterator is not <see cref="Valid"/>.</summary>
-    public void Prev() => FindBackward(_key ?? throw NotPositioned());
+    public void Prev() => FindBackward(_valid ? CurrentKey.ToArray() : throw NotPositioned());
 
     /// <summary>Invalidate the iterator and release its snapshot's SSTables. Later calls do nothing.</summary>
     public void Dispose()
@@ -115,41 +130,47 @@ public sealed class Iterator : IDisposable
             return;
 
         _disposed = true;
-        _key = null;
+        _valid = false;
         _version.Leave(_slot);
     }
 
-    // The first visible key at or after the cursors.
+    // The first visible key at or after the cursors. Keys, sequence numbers and values are read in place; only the
+    // key and the value of the position are copied, into the iterator's buffers.
     private void FindForward()
     {
         while (true)
         {
-            byte[]? key = null;
+            IEntryCursor? smallest = null;
             foreach (IEntryCursor cursor in _cursors)
-                if (cursor.Valid && (key is null || cursor.Current.Key.AsSpan().SequenceCompareTo(key) < 0))
-                    key = cursor.Current.Key;
+                if (cursor.Valid && (smallest is null || cursor.CurrentKey.SequenceCompareTo(smallest.CurrentKey) < 0))
+                    smallest = cursor;
 
-            if (key is null || (_upperBound is not null && key.AsSpan().SequenceCompareTo(_upperBound) >= 0))
+            if (smallest is null || (_upperBound is not null && smallest.CurrentKey.SequenceCompareTo(_upperBound) >= 0))
             {
-                _key = null;
+                _valid = false;
+                GC.KeepAlive(this);
                 return;
             }
 
+            Copy(smallest.CurrentKey, ref _key, out _keyLength);
+            ReadOnlySpan<byte> key = CurrentKey;
+
             // The newest version in the snapshot, from the newest source that has one.
-            Entry? newest = null;
+            IEntryCursor? newest = null;
             foreach (IEntryCursor cursor in _cursors)
             {
-                while (cursor.Valid && cursor.Current.Sequence > _snapshot && cursor.Current.Key.AsSpan().SequenceEqual(key))
+                while (cursor.Valid && cursor.CurrentSequence > _snapshot && cursor.CurrentKey.SequenceEqual(key))
                     cursor.Next();
 
-                if (newest is null && cursor.Valid && cursor.Current.Key.AsSpan().SequenceEqual(key))
-                    newest = cursor.Current;
+                if (newest is null && cursor.Valid && cursor.CurrentKey.SequenceEqual(key))
+                    newest = cursor;
             }
 
-            if (newest is { Kind: OperationKind.Put } entry && ReadPath.CoveringTombstone(_sources, key, _snapshot) < entry.Sequence)
+            if (newest is { CurrentKind: OperationKind.Put } && ReadPath.CoveringTombstone(_sources, key, _snapshot) < newest.CurrentSequence)
             {
-                _key = key;
-                _value = entry.Value;
+                Copy(newest.CurrentValue, ref _value, out _valueLength);
+                _valid = true;
+                GC.KeepAlive(this);
                 return;
             }
 
@@ -173,14 +194,15 @@ public sealed class Iterator : IDisposable
 
             if (key is null)
             {
-                _key = null;
+                _valid = false;
                 return;
             }
 
             if (ReadPath.TryGet(_sources, key, _snapshot, _fillCache, out byte[]? value))
             {
-                _key = key;
-                _value = value;
+                Copy(key, ref _key, out _keyLength);
+                Copy(value, ref _value, out _valueLength);
+                _valid = true;
                 return;
             }
 
@@ -188,13 +210,26 @@ public sealed class Iterator : IDisposable
         }
     }
 
-    private void SkipPast(byte[] key)
+    private void SkipPast(ReadOnlySpan<byte> key)
     {
         foreach (IEntryCursor cursor in _cursors)
         {
-            while (cursor.Valid && cursor.Current.Key.AsSpan().SequenceEqual(key))
+            while (cursor.Valid && cursor.CurrentKey.SequenceEqual(key))
                 cursor.Next();
         }
+
+        // The cursors' keys are read in place: a memtable's stay valid only while the iterator keeps its version.
+        GC.KeepAlive(this);
+    }
+
+    // Copies bytes into one of the iterator's buffers, which grows to fit them.
+    private static void Copy(ReadOnlySpan<byte> bytes, ref byte[] buffer, out int length)
+    {
+        if (buffer.Length < bytes.Length)
+            buffer = new byte[Math.Max(bytes.Length, 2 * buffer.Length)];
+
+        bytes.CopyTo(buffer);
+        length = bytes.Length;
     }
 
     private static InvalidOperationException NotPositioned() => new("The iterator is not positioned on a key.");

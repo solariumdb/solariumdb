@@ -58,6 +58,13 @@ Two settings give the WAL and the store of a node memory to share; both provider
 Both are 0 by default. A solarium WAL beside another store, or a solarium store beside another WAL, uses them
 alone.
 
+Neither budget is on the managed heap, as with RocksDB: the memtables' entries are in native arenas, and the
+cache's data blocks (`CacheDataBlocks`) in native memory, so a node sized for RocksDB needs no larger GC heap limit
+(`DOTNET_GCHeapHardLimit*`) for Solarium, and the GC does not copy or mark them. What stays on the heap is the index
+and filter partitions in the cache, about 2% of the table bytes (4% with LZ4), and their managed handles. The arenas'
+chunks are reused from one memtable to the next while they stay within the memtable budget, so the process holds at
+most the budget for memtables, plus up to one partly used 64 KiB chunk per processor and memtable.
+
 An embedded Kahuna node registers the providers in code instead:
 
 ```csharp

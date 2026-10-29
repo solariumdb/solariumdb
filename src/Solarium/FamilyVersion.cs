@@ -14,7 +14,10 @@ namespace Solarium;
 /// do not contend; a reader leaves through the count it entered, from whatever CPU it is on.</para>
 /// <para>A version replaced by a newer one is retired. It closes once it is retired and its counts
 /// are all 0, and the first to see that, the installer or the last reader, closes it. Closing
-/// releases the version's reference on each of its tables.</para>
+/// releases the version's reference on each of its tables and memtables; a memtable's last release frees
+/// its native memory, so no reader may touch a memtable of a version it is not counted in.</para>
+/// <para>A database that closes installs <see cref="Closed"/> in each family, which retires the last
+/// versions, and a reader that enters it is turned away.</para>
 /// </remarks>
 internal sealed class FamilyVersion
 {
@@ -57,7 +60,30 @@ internal sealed class FamilyVersion
 
         foreach (TableReader table in Tables)
             table.AddReference();
+
+        active.AddReference();
+        foreach (MemTable memTable in immutables)
+            memTable.AddReference();
     }
+
+    // The version of a closed database's families: no table, and one empty memtable that it never releases.
+    private FamilyVersion()
+    {
+        Active = new MemTable();
+        Active.AddReference();
+        Immutables = [];
+        Level0 = [];
+        Levels = [.. Enumerable.Repeat(SortedLevel.Empty, Manifest.LevelCount)];
+        Sources = [];
+        _unused = static _ => { };
+        IsClosed = true;
+    }
+
+    /// <summary>The version that a closed database installs in each family; see <see cref="ColumnFamily.EnterVersion"/>.</summary>
+    public static FamilyVersion Closed { get; } = new();
+
+    /// <summary>True for <see cref="Closed"/>.</summary>
+    public bool IsClosed { get; }
 
     /// <summary>The memtable that accepts writes.</summary>
     public MemTable Active { get; }
@@ -137,5 +163,9 @@ internal sealed class FamilyVersion
         foreach (TableReader table in Tables)
             if (table.Release())
                 _unused(table);
+
+        Active.Release();
+        foreach (MemTable memTable in Immutables)
+            memTable.Release();
     }
 }

@@ -8,7 +8,7 @@ It exists to be a durable log store for [Kommander](https://github.com/kahunakv/
 
 | Package | What it is |
 | --- | --- |
-| `SolariumDb` | The store. Pure managed code, on every platform .NET 10 runs on. |
+| `SolariumDb` | The store. Managed code, on every platform .NET 10 runs on; its memtables and cached data blocks are native memory, outside the GC heap, as RocksDB's. |
 | `SolariumDb.IoUring` | A storage environment for Linux 6.1 or later that does its file writes through io_uring, on the [ioxide](https://github.com/MDA2AV/ioxide) runtime. |
 | `SolariumDb.Kommander` | `SolariumWAL`, a Kommander `IWAL` on Solarium, with the on-disk layout of Kommander's `RocksDbWAL`. |
 | `SolariumDb.Kahuna` | A Kahuna storage engine: the persistence backend and the Raft WAL on Solarium, which a Kahuna server loads with `--extension-assembly`. |

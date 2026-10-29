@@ -194,16 +194,8 @@ internal sealed class TableReader : IEntrySource, IDisposable
             return false;
 
         // Only the value is copied out of the block; the entry's key is the key looked up.
-        byte[] buffer = DataBlock(handle, fillCache, out int length, out bool pooled);
-        try
-        {
-            return TryGetFromEntries(buffer.AsSpan(0, length), handle, key, snapshot, out entry);
-        }
-        finally
-        {
-            if (pooled)
-                ArrayPool<byte>.Shared.Return(buffer);
-        }
+        using BlockBuffer block = DataBlock(handle, fillCache);
+        return TryGetFromEntries(block.Entries, handle, key, snapshot, out entry);
     }
 
     /// <summary>
@@ -241,14 +233,15 @@ internal sealed class TableReader : IEntrySource, IDisposable
     /// <summary>
     /// The entries of the data block <paramref name="handle"/> names, verified and decompressed, when the table's
     /// cache holds them; the block becomes the most recently used. False when the table does not cache data blocks,
-    /// or on a miss. The array is
-    /// the cache's and is never changed: the caller only reads it, and may keep it after an eviction.
+    /// or on a miss. The block is the cache's and never changes; it comes with a reference that the caller releases
+    /// (<see cref="NativeBlock.Release"/>) in a <c>finally</c>, and its bytes stay valid until then, after an
+    /// eviction too.
     /// </summary>
-    public bool TryGetCachedBlock(DataBlockHandle handle, [NotNullWhen(true)] out byte[]? entries)
+    public bool TryGetCachedBlock(DataBlockHandle handle, [NotNullWhen(true)] out NativeBlock? entries)
     {
         if (_blockCache is not null && _blockCache.TryGet(BlockKey(handle.Offset), out object? cached))
         {
-            entries = (byte[])cached;
+            entries = (NativeBlock)cached;
             return true;
         }
 
@@ -257,17 +250,30 @@ internal sealed class TableReader : IEntrySource, IDisposable
     }
 
     /// <summary>
-    /// Caches a copy of the data block's <paramref name="entries"/>, which <see cref="DecodeReadBlock"/> verified and
-    /// decompressed, as a read that fills the cache does, and returns the cached array: the copy, or the one a
-    /// reader cached first. Null, and nothing copied, when the table does not cache data blocks.
+    /// Caches a native copy of the data block's <paramref name="entries"/>, which <see cref="DecodeReadBlock"/>
+    /// verified and decompressed, as a read that fills the cache does. Nothing when the table does not cache data
+    /// blocks, or when a reader cached the block first.
     /// </summary>
-    public byte[]? CacheBlock(DataBlockHandle handle, ReadOnlySpan<byte> entries)
+    public void CacheBlock(DataBlockHandle handle, ReadOnlySpan<byte> entries) => CacheBlockAndKeep(handle, entries)?.Release();
+
+    // The block cached for entries, the copy or the one a reader cached first, with a reference that the caller
+    // releases; null, and nothing copied, when the table does not cache data blocks.
+    private NativeBlock? CacheBlockAndKeep(DataBlockHandle handle, ReadOnlySpan<byte> entries)
     {
         if (_blockCache is null)
             return null;
 
-        byte[] copy = entries.ToArray();
-        return (byte[])_blockCache.Insert(BlockKey(handle.Offset), copy, copy.Length);
+        CacheKey key = BlockKey(handle.Offset);
+        NativeBlock copy = _blockCache.NewBlock(key, entries);
+        try
+        {
+            return (NativeBlock)_blockCache.Insert(key, copy, copy.Length);
+        }
+        finally
+        {
+            // The cache took its own reference on the copy, or kept the block it had.
+            copy.Release();
+        }
     }
 
     /// <summary>
@@ -336,10 +342,10 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
         TableIndex index = Partition(partition, fillCache).Index;
         int low = index.FindBlockAtOrAfter(limit);
-        byte[] buffer = DataBlock(new DataBlockHandle(low, index.Offset(low), index.Size(low)), fillCache, out int blockLength, out bool pooled);
+        BlockBuffer block = DataBlock(new DataBlockHandle(low, index.Offset(low), index.Size(low)), fillCache);
         try
         {
-            SpanReader reader = new(buffer.AsSpan(0, blockLength));
+            SpanReader reader = new(block.Entries);
             ReadOnlySpan<byte> last = default;
             bool found = false;
             while (!reader.AtEnd)
@@ -370,8 +376,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
         }
         finally
         {
-            if (pooled)
-                ArrayPool<byte>.Shared.Return(buffer);
+            block.Dispose();
         }
     }
 
@@ -479,39 +484,41 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
     private CacheKey BlockKey(long offset) => new(_cacheOwner, Number, offset);
 
-    // A data block's entries, its first length bytes: the cache's copy, or read from the file and verified, and
-    // cached when fillCache is set and the table caches data blocks. pooled says that the buffer was rented from
-    // ArrayPool<byte>.Shared and the caller returns it; a cached array is never returned or changed.
-    private byte[] DataBlock(DataBlockHandle handle, bool fillCache, out int length, out bool pooled)
+    // A data block's entries: the cache's block, or read from the file and verified, and cached when fillCache is
+    // set and the table caches data blocks. The caller disposes the buffer, which releases the cached block or
+    // returns the pooled array.
+    private BlockBuffer DataBlock(DataBlockHandle handle, bool fillCache)
     {
-        if (TryGetCachedBlock(handle, out byte[]? cached))
-        {
-            length = cached.Length;
-            pooled = false;
-            return cached;
-        }
+        if (TryGetCachedBlock(handle, out NativeBlock? cached))
+            return new BlockBuffer(cached);
 
-        byte[] buffer = RentDataBlock(handle, out length);
-        if (fillCache && CacheBlock(handle, buffer.AsSpan(0, length)) is byte[] inserted)
+        byte[] buffer = RentDataBlock(handle, out int length);
+        NativeBlock? inserted;
+        try
+        {
+            inserted = fillCache ? CacheBlockAndKeep(handle, buffer.AsSpan(0, length)) : null;
+        }
+        catch
         {
             ArrayPool<byte>.Shared.Return(buffer);
-            length = inserted.Length;
-            pooled = false;
-            return inserted;
+            throw;
         }
 
-        pooled = true;
-        return buffer;
+        if (inserted is null)
+            return new BlockBuffer(buffer, length);
+
+        ArrayPool<byte>.Shared.Return(buffer);
+        return new BlockBuffer(inserted);
     }
 
     // Decode every entry of a block into entries (cleared first). Keys and values are copied out.
     private void DecodeDataBlock(TableIndex index, int block, bool fillCache, List<Entry> entries)
     {
         entries.Clear();
-        byte[] buffer = DataBlock(new DataBlockHandle(block, index.Offset(block), index.Size(block)), fillCache, out int length, out bool pooled);
+        BlockBuffer buffer = DataBlock(new DataBlockHandle(block, index.Offset(block), index.Size(block)), fillCache);
         try
         {
-            SpanReader reader = new(buffer.AsSpan(0, length));
+            SpanReader reader = new(buffer.Entries);
             while (!reader.AtEnd)
             {
                 byte[] key = reader.Bytes();
@@ -527,8 +534,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
         }
         finally
         {
-            if (pooled)
-                ArrayPool<byte>.Shared.Return(buffer);
+            buffer.Dispose();
         }
     }
 
@@ -825,6 +831,14 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
         public Entry Current => _entries[_index];
 
+        public ReadOnlySpan<byte> CurrentKey => _entries[_index].Key;
+
+        public long CurrentSequence => _entries[_index].Sequence;
+
+        public OperationKind CurrentKind => _entries[_index].Kind;
+
+        public ReadOnlySpan<byte> CurrentValue => _entries[_index].Value;
+
         public void SeekToFirst() => Load(0, 0);
 
         public void Seek(ReadOnlySpan<byte> key)
@@ -882,6 +896,39 @@ internal sealed class TableReader : IEntrySource, IDisposable
             _partition = partition;
             _block = 0;
             _entries.Clear();
+        }
+    }
+
+    // A data block's entries for one read: a cached native block that the read holds a reference on, or a buffer
+    // rented from ArrayPool<byte>.Shared. Dispose releases the one or returns the other, once.
+    private struct BlockBuffer : IDisposable
+    {
+        private NativeBlock? _cached;
+        private byte[]? _pooled;
+        private readonly int _length;
+
+        public BlockBuffer(NativeBlock cached)
+        {
+            _cached = cached;
+            _length = cached.Length;
+        }
+
+        public BlockBuffer(byte[] pooled, int length)
+        {
+            _pooled = pooled;
+            _length = length;
+        }
+
+        public readonly ReadOnlySpan<byte> Entries => _cached is not null ? _cached.Span : _pooled.AsSpan(0, _length);
+
+        public void Dispose()
+        {
+            _cached?.Release();
+            _cached = null;
+            if (_pooled is not null)
+                ArrayPool<byte>.Shared.Return(_pooled);
+
+            _pooled = null;
         }
     }
 

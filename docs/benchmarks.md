@@ -55,7 +55,7 @@ The workloads:
 
 Each case runs on 1 to 64 writer threads, synced or not, with 128-byte to 4-KiB payloads. A run opens a new WAL in a new directory, warms up for 2 seconds, measures for 8, and checks that the log holds what the writers were told was written. The engines of a case take turns, in an order that rotates with the case and the repeat, and the summary takes the median of three repeats. Before each run, `--settle` runs `sync` and waits, so a run does not pay for the writeback that the run before it left. Latency is that of one operation: one `Write` for an append or a batch, the append and its commit together for the other two. It is kept in a histogram with 1.6% precision.
 
-The allocated bytes per entry are not comparable between the engines: RocksDB's memtable is native memory, which .NET's allocation counter does not see, and Solarium's is on the managed heap, so its copy of every entry counts. In the mixed workload, the CPU and the allocations per entry include the readers'.
+The allocated bytes per entry are not comparable between the engines: RocksDB's memtable is native memory, which .NET's allocation counter does not see, and Solarium's was on the managed heap when these results were taken, so its copy of every entry counted. Solarium's memtable is native memory now too (see "Memtables and cached blocks in native memory"). In the mixed workload, the CPU and the allocations per entry include the readers'.
 
 Unsynced writes are measured on tmpfs (`--dir /dev/shm`). On a disk, a run of them writes 100 to 200 MB/s of WAL and flushes for 10 seconds, the kernel throttles every writer while that writeback is due, and the result is the disk's: on the NVMe drive below, repeats of the same case differed up to ten times, and some runs wrote nothing for their 8 seconds. On tmpfs, the unsynced cases measure the CPU cost of each engine, its flushes included.
 
@@ -105,7 +105,7 @@ On a 13th Gen Intel Core i7-13620H (16 CPUs), Linux 6.1, ext4 on a Samsung NVMe 
 
 Each run also prints the longest operation, the time the GC paused the process and its gen 2 collections over the measured seconds, and for Solarium the memtable switches that waited for a flush (none, except a few in the unsynced batch case). `--rate` paces each writer to a number of operations per second.
 
-Solarium's memtables are on the managed heap, so its GC works in proportion to what is written. Four unsynced writers of 1 KiB entries on tmpfs, 20 seconds measured:
+Solarium's memtables were on the managed heap when these results were taken, so its GC worked in proportion to what was written; see "Memtables and cached blocks in native memory" for the change that moved them out. Four unsynced writers of 1 KiB entries on tmpfs, 20 seconds measured:
 
 | Ingest | GC pause, Solarium | p99.9, RocksDB / Solarium | Longest write, RocksDB / Solarium |
 | --- | ---: | --- | --- |
@@ -116,6 +116,47 @@ Solarium's memtables are on the managed heap, so its GC works in proportion to w
 At the rates of a busy Raft node, Solarium's tail matches RocksDB's. Past about 100 MB/s per node, gen 2 collections pause the process for up to about 90 ms, where RocksDB's longest write stays near 15 ms. Unpaced, many short collections stop every writer at once, and the p99.9 becomes their length. A larger gen 0 budget (`DOTNET_GCgen0size=0x10000000`) brought the unpaced 4-writer p99.9 from 2 ms to 20 µs, but not the total pause, which comes from the gen 2 collections.
 
 The mixed workload's readers read as fast as they can, and every read returns new `RaftLog` objects and payloads, so the readers' garbage pauses the writers too. Solarium's readers make about 45% more reads than RocksDB's, and its process paused 3.5 s of 8 against RocksDB's 1.6 s; that is what separated the synced mixed results. With five repeats, synced mixed writes came out at 1.00 times RocksDB's; without readers, at 0.97, with 40% less CPU per entry; without compaction passes, at 0.92. A fair comparison of the mixed workload paces its readers.
+
+### Memtables and cached blocks in native memory
+
+The memtables and the cached data blocks moved out of the managed heap (2026-10-29): a memtable is an inline skip list in a native arena of 64 KiB chunks that a pool reuses within the memtable budget, and a cached data block is native memory with a reference count (see [design.md](design.md)). On the 13th Gen Intel Core i7-13620H (16 CPUs), Linux 6.12, server GC, the commit before the change against the change, the same machine and session.
+
+`UnsyncedPutBenchmarks`, default environment, time per `Put`:
+
+| Case | Before | After | After ÷ before |
+| --- | ---: | ---: | ---: |
+| flushes, 1 thread | 930.9 ns | 766.8 ns | 0.82 |
+| flushes, 4 threads | 817.9 ns | 752.4 ns | 0.92 |
+| flushes, 16 threads | 705.8 ns | 640.9 ns | 0.91 |
+| no flush, 1 thread | 963.1 ns | 795.3 ns | 0.83 |
+| no flush, 4 threads | 797.2 ns | 760.3 ns | 0.95 |
+| no flush, 16 threads | 682.8 ns | 689.5 ns | 1.01 (within the error, ±50 ns) |
+
+`MemTableReadBenchmarks`, per `Get` or step, on a memtable of 921,600 entries:
+
+| | Before | After |
+| --- | ---: | ---: |
+| `Get` | 1,521 ns, 152 B | 691 to 696 ns, 208 B |
+| `IteratorNext` | 20.3 ns, 0 B | 19.0 ns, 0 B |
+| `IteratorPrev` | 270.6 ns, 152 B | 296.0 ns, 320 B |
+
+`Get` is 2.2 times as fast: a node and its key are one allocation, so each step of the search reads one place, where the managed node, its links and its key were three objects. `Prev` is 9% slower: each step copies the keys that the memtable's sources return, as the SSTables' did already. The iterator copies each position's key and value into buffers of its own that it reuses, so `Next` allocates nothing, and `Key()` and `Value()` are valid until the iterator moves, as in RocksDB.
+
+A long-lived database as a Kahuna node holds one: a `WriteBufferManager` of 256 MiB charged into a cache of 768 MiB, index and filter blocks in the cache, LZ4, 64 MiB memtables, 4 unsynced writers of 6 million `Put`s of 200-byte values in all, and 2 readers that `Get` keys already written. GC memory sampled every 20 ms; two runs each without data blocks in the cache, one with:
+
+| | Before | After |
+| --- | ---: | ---: |
+| GC committed, mean of the samples | 512 to 571 MiB | 81 to 94 MiB |
+| GC committed, peak | 726 to 837 MiB | 196 to 204 MiB |
+| GC pause time | 0.89 to 1.07 s (13% to 16% of the run) | 0.23 to 0.29 s (4%) |
+| Gen 2 collections | 11 to 19 | 17 to 18 |
+| Process working set at the end | 704 to 915 MiB | 279 to 382 MiB |
+| `Put`s per second | 875,000 to 892,000 | 916,000 to 945,000 |
+| `Get`s per second (2 readers) | 677,000 to 736,000 | 844,000 to 847,000 |
+| With `CacheDataBlocks`: GC committed mean, peak | 1,355, 2,384 MiB | 192, 351 MiB |
+| With `CacheDataBlocks`: GC pause time | 1.37 s (20%) | 0.53 s (8%) |
+
+The heap no longer holds the budgets: what the GC commits is the garbage of the requests and the index and filter partitions. More gen 0 collections ran after the change (500 to 1,100 against 70 to 150), because the server GC sizes gen 0 by the heap, which is now small; each is short, and the pause time is a quarter to a third of what it was.
 
 ## Kahuna's persistence backend against RocksDB
 

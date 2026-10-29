@@ -133,6 +133,14 @@ internal sealed class SortedLevel : IEntrySource
 
         public Entry Current => _current!.Current;
 
+        public ReadOnlySpan<byte> CurrentKey => _current!.CurrentKey;
+
+        public long CurrentSequence => _current!.CurrentSequence;
+
+        public OperationKind CurrentKind => _current!.CurrentKind;
+
+        public ReadOnlySpan<byte> CurrentValue => _current!.CurrentValue;
+
         public void SeekToFirst()
         {
             Open(0);

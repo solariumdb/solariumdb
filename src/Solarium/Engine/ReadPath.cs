@@ -31,9 +31,8 @@ internal static class ReadPath
             {
                 if (entry.Kind == OperationKind.Put && covering < entry.Sequence)
                 {
-                    // A memtable hands out the array it stores, which the caller must not be able to
-                    // change; an SSTable decodes a new array for each lookup.
-                    value = source is MemTable ? entry.Value!.ToArray() : entry.Value;
+                    // Every source copies the value into a new array: the caller's to keep and change.
+                    value = entry.Value;
                     return true;
                 }
 
@@ -157,15 +156,26 @@ internal static class ReadPath
                 if (!table.TryLocate(key, snapshot, fillCache, out handle))
                     continue;
 
-                if (!table.TryGetCachedBlock(handle, out byte[]? cached))
+                if (!table.TryGetCachedBlock(handle, out NativeBlock? cached))
                 {
                     next++;
                     return true;
                 }
 
-                if (table.TryGetFromEntries(cached, handle, key, snapshot, out Entry found))
+                bool found;
+                Entry entry;
+                try
                 {
-                    value = Value(found, covering, copy: false);
+                    found = table.TryGetFromEntries(cached.Span, handle, key, snapshot, out entry);
+                }
+                finally
+                {
+                    cached.Release();
+                }
+
+                if (found)
+                {
+                    value = Value(entry, covering);
                     table = null;
                     return false;
                 }
@@ -174,9 +184,9 @@ internal static class ReadPath
             }
 
             // A sorted level with no file for the key has no version of it; a memtable answers at once.
-            if (source is not SortedLevel && source.TryGetNewest(key, snapshot, fillCache, out Entry entry))
+            if (source is not SortedLevel && source.TryGetNewest(key, snapshot, fillCache, out Entry newest))
             {
-                value = Value(entry, covering, copy: source is MemTable);
+                value = Value(newest, covering);
                 return false;
             }
         }
@@ -216,7 +226,7 @@ internal static class ReadPath
                 int k = waiting[w];
                 int b = blockOf[w];
                 if (blocks[b].Table.TryGetFromEntries(entries[b].AsSpan(0, lengths[b]), blocks[b].Handle, keys[k], snapshot, out Entry entry))
-                    values[k] = Value(entry, covering[k], copy: false);
+                    values[k] = Value(entry, covering[k]);
                 else
                     pending.Add(k);
             }
@@ -234,13 +244,8 @@ internal static class ReadPath
         }
     }
 
-    // The value a version gives, as TryGet decides it: a Put that no newer range tombstone covers.
-    private static byte[]? Value(Entry entry, long covering, bool copy)
-    {
-        if (entry.Kind != OperationKind.Put || covering >= entry.Sequence)
-            return null;
-
-        // A memtable hands out the array it stores, which the caller must not be able to change.
-        return copy ? entry.Value!.ToArray() : entry.Value;
-    }
+    // The value a version gives, as TryGet decides it: a Put that no newer range tombstone covers. Every source
+    // copies the value into a new array.
+    private static byte[]? Value(Entry entry, long covering) =>
+        entry.Kind != OperationKind.Put || covering >= entry.Sequence ? null : entry.Value;
 }

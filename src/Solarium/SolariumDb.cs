@@ -138,6 +138,13 @@ public sealed class SolariumDb : IDisposable
     // published, and released when their flush installs; null: no cap across column families.
     private readonly WriteBufferManager? _writeBufferManager;
 
+    // The native chunks of the memtables' arenas: the WriteBufferManager's, shared with the databases that share it
+    // and disposed at the close when the manager is this database's own (DbWriteBufferSize), or the pool of the
+    // databases without one, whose limit this database raises by _sharedPoolBytes while it is open.
+    private readonly ArenaChunkPool _chunkPool;
+    private readonly bool _ownsChunkPool;
+    private readonly long _sharedPoolBytes;
+
     // The owner that keys this database's tables in a block cache it shares with other databases.
     private readonly long _cacheOwner = Cache.NewOwner();
     private readonly List<Cache> _blockCaches = [];   // under _tablesLock: every block cache a table of this database used
@@ -232,6 +239,13 @@ public sealed class SolariumDb : IDisposable
         _flushPacing = new TablePacing(options.RateLimiter, High: true, bytesPerSync);
         _compactionPacing = new TablePacing(options.RateLimiter, High: false, bytesPerSync);
         _writeBufferManager = options.WriteBufferManager ?? (options.DbWriteBufferSize > 0 ? new WriteBufferManager(options.DbWriteBufferSize) : null);
+        _ownsChunkPool = options.WriteBufferManager is null && _writeBufferManager is not null;
+        _chunkPool = _writeBufferManager?.ChunkPool ?? ArenaChunkPool.Shared;
+        if (_writeBufferManager is null)
+        {
+            _sharedPoolBytes = MemTableBytes(manifest, options);
+            _chunkPool.AddToRetainLimit(_sharedPoolBytes);
+        }
         _beforeMemTableInsert = options.BeforeMemTableInsert;
         _afterReadVersion = options.AfterReadVersion;
         _afterManifestSave = options.AfterManifestSave;
@@ -253,7 +267,7 @@ public sealed class SolariumDb : IDisposable
                 familyOptions.Validate(record.Name);
 
                 (TableReader[] level0, SortedLevel[] levels) = OpenTables(record, familyOptions);
-                ColumnFamily family = new(this, record, familyOptions, new FamilyVersion(new MemTable(), [], level0, levels, _tableUnused));
+                ColumnFamily family = new(this, record, familyOptions, new FamilyVersion(new MemTable(_chunkPool), [], level0, levels, _tableUnused));
                 _byId[record.Id] = family;
                 _byName[record.Name] = family;
                 _lastSequence = Math.Max(_lastSequence, record.FlushedSequence);
@@ -276,6 +290,7 @@ public sealed class SolariumDb : IDisposable
         {
             ReleaseMemTables();
             CloseFiles();
+            CloseVersions();
             throw;
         }
 
@@ -587,6 +602,9 @@ public sealed class SolariumDb : IDisposable
     /// key on to an older table.
     /// </summary>
     internal long MultiGetRounds => Interlocked.Read(ref _multiGetRounds);
+
+    /// <summary>The pool the arenas of this database's memtables take their native chunks from; for tests.</summary>
+    internal ArenaChunkPool ChunkPool => _chunkPool;
 
     /// <summary>
     /// The memtable switches since open that waited for a flush because their family held
@@ -2035,13 +2053,15 @@ public sealed class SolariumDb : IDisposable
         {
             FamilyVersion current = family.Version;
             full = current.Active;
-            family.Install(new FamilyVersion(new MemTable(), [full, .. current.Immutables], current.Level0, current.Levels, _tableUnused));
+            family.Install(new FamilyVersion(new MemTable(_chunkPool), [full, .. current.Immutables], current.Level0, current.Levels, _tableUnused));
 
             // Under the memtable lock, so the last stage that wrote it has charged it.
             if (_writeBufferManager is not null)
                 full.ChargeImmutable(_writeBufferManager);
         }
 
+        // The flush holds its own reference, so the memtable it writes stays whatever versions come and go.
+        full.AddReference();
         _flushQueue.Enqueue((family, full));
         _rotateWal = true;
         Monitor.PulseAll(_stateLock);
@@ -2160,12 +2180,15 @@ public sealed class SolariumDb : IDisposable
                     entries = 0;
                 }
 
-                bytes += MemTable.EntryBytes(operation.Key, operation.Value);
                 if (operation.Kind == OperationKind.DeleteRange)
+                {
                     memTable.AddRangeTombstoneConcurrently(operation.Key, operation.Value!, sequence);
+                    bytes += MemTable.TombstoneBytes(operation.Key, operation.Value!);
+                }
                 else
                 {
-                    retries += memTable.AddConcurrently(operation.Key, sequence, operation.Kind, operation.Value);
+                    retries += memTable.AddConcurrently(operation.Key, sequence, operation.Kind, operation.Value, out long nodeBytes);
+                    bytes += nodeBytes;
                     entries++;
                 }
 
@@ -2347,6 +2370,7 @@ public sealed class SolariumDb : IDisposable
                 memTable.ReleaseCharge(_writeBufferManager);
 
             _flushQueue.Dequeue();
+            memTable.Release();
             _flushRunning = false;
             _flushCount++;
             family.FlushCount++;
@@ -2769,7 +2793,7 @@ public sealed class SolariumDb : IDisposable
             _openTables.Add(table);
 
         FamilyVersion current = family.Version;
-        family.Install(new FamilyVersion(new MemTable(), current.Immutables, [table, .. current.Level0], current.Levels, _tableUnused));
+        family.Install(new FamilyVersion(new MemTable(_chunkPool), current.Immutables, [table, .. current.Level0], current.Levels, _tableUnused));
         if (_writeBufferManager is not null)
             memTable.ReleaseCharge(_writeBufferManager);
 
@@ -2987,15 +3011,20 @@ public sealed class SolariumDb : IDisposable
 
         ReleaseMemTables();
         CloseFiles();
+        CloseVersions();
         _lock.Dispose();
         if (walFlush is not null)
             throw new SolariumException($"The flush of the WAL at the close of '{_directory}' failed; the writes since the last synced one may not survive a power loss.", walFlush);
     }
 
     // At the close or a failed open, with no writer and no flush left: the memtables that the database
-    // still holds leave the WriteBufferManager, so a closed database keeps nothing charged on a shared one.
+    // still holds leave the WriteBufferManager, so a closed database keeps nothing charged on a shared one,
+    // and the flushes that will not run drop their references.
     private void ReleaseMemTables()
     {
+        while (_flushQueue.TryDequeue(out (ColumnFamily Family, MemTable MemTable) job))
+            job.MemTable.Release();
+
         if (_writeBufferManager is null)
             return;
 
@@ -3006,6 +3035,37 @@ public sealed class SolariumDb : IDisposable
             foreach (MemTable memTable in version.Immutables)
                 memTable.ReleaseCharge(_writeBufferManager);
         }
+    }
+
+    // After CloseFiles, so a table that a retired version releases is not deleted: each family's last version
+    // retires, and its memtables are freed now, or when the last iterator still in it is disposed. A reader
+    // that enters later is turned away. The pool keeps less, or nothing when it was this database's own.
+    private void CloseVersions()
+    {
+        foreach (ColumnFamily family in _byName.Values)
+            family.Close();
+
+        if (_ownsChunkPool)
+            _chunkPool.Dispose();
+        else if (_sharedPoolBytes > 0)
+            _chunkPool.AddToRetainLimit(-_sharedPoolBytes);
+    }
+
+    // The memtable bytes the families of a database without a WriteBufferManager may hold at once, what it adds to
+    // the limit of the shared chunk pool: each family's write buffer, as many times as it may have memtables.
+    private static long MemTableBytes(Manifest manifest, DbOptions options)
+    {
+        long bytes = 0;
+        foreach (ManifestFamily record in manifest.ColumnFamilies)
+        {
+            ColumnFamilyOptions family = options.OptionsFor(record.Name);
+            long most = family.WriteBufferSize > long.MaxValue / Math.Max(1, family.MaxWriteBufferNumber)
+                ? long.MaxValue
+                : family.WriteBufferSize * Math.Max(1, family.MaxWriteBufferNumber);
+            bytes = most > long.MaxValue - bytes ? long.MaxValue : bytes + most;
+        }
+
+        return bytes;
     }
 
     private void CloseFiles()

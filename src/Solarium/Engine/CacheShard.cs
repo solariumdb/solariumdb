@@ -17,6 +17,9 @@ namespace Solarium.Engine;
 /// of the low-priority pool first. Entries read once, such as the blocks of a long scan, therefore pass through
 /// the low-priority pool without evicting the entries that are used again. With a share of 0, every entry is in
 /// the low-priority pool: one plain LRU list.
+/// <para>A value that is a <see cref="NativeBlock"/> is counted: the shard holds a reference while the entry is
+/// cached and releases it when the entry leaves, and a lookup or an insert that returns the block takes one for
+/// its caller, under the lock, which the caller releases.</para>
 /// </remarks>
 internal sealed class CacheShard
 {
@@ -40,10 +43,14 @@ internal sealed class CacheShard
     /// </summary>
     public CacheShard(long capacity, double highPoolRatio)
     {
+        Memory = new BlockMemory();
         _highPoolRatio = highPoolRatio;
         _capacity = capacity;
         _highPoolCapacity = HighPoolCapacity(capacity);
     }
+
+    /// <summary>The native blocks of the shard's entries, and those that readers still hold after their eviction.</summary>
+    public BlockMemory Memory { get; }
 
     /// <summary>The shard's capacity in bytes.</summary>
     public long Capacity
@@ -109,7 +116,7 @@ internal sealed class CacheShard
 
     /// <summary>
     /// The value of <paramref name="key"/>, which becomes the most recently used entry, in the high-priority pool;
-    /// false when it is not cached.
+    /// false when it is not cached. A <see cref="NativeBlock"/> comes with a reference that the caller releases.
     /// </summary>
     public bool TryGet(CacheKey key, [NotNullWhen(true)] out object? value)
     {
@@ -122,7 +129,7 @@ internal sealed class CacheShard
             }
 
             Touch(entry);
-            value = entry.Value;
+            value = Acquire(entry.Value);
             return true;
         }
     }
@@ -132,6 +139,8 @@ internal sealed class CacheShard
     /// evict the new entry itself when it is larger than the room left. When the key is cached already, as
     /// when two readers missed at once, the cached value stays, counts as looked up, and is returned; otherwise
     /// <paramref name="value"/> is. <paramref name="highPriority"/> puts the new entry in the high-priority pool.
+    /// A <see cref="NativeBlock"/> returned comes with a reference that the caller releases; the caller keeps its own
+    /// reference on <paramref name="value"/> too, and the cache takes one of its own when it caches it.
     /// </summary>
     public object Insert(CacheKey key, object value, long charge, bool highPriority)
     {
@@ -140,9 +149,12 @@ internal sealed class CacheShard
             if (_entries.TryGetValue(key, out CacheEntry? existing))
             {
                 Touch(existing);
-                return existing.Value;
+                return Acquire(existing.Value);
             }
 
+            // The cache's reference, and the one returned with the value.
+            Acquire(value);
+            Acquire(value);
             CacheEntry entry = new(key, value, charge, highPriority);
             _entries.Add(key, entry);
             _usage += charge;
@@ -164,6 +176,7 @@ internal sealed class CacheShard
         {
             if (!_entries.TryGetValue(key, out CacheEntry? entry))
             {
+                Acquire(value);
                 entry = new CacheEntry(key, value, charge, highPriority);
                 _entries.Add(key, entry);
                 _usage += charge;
@@ -213,6 +226,8 @@ internal sealed class CacheShard
                 _pinnedUsage -= entry.Charge;
             else
                 Unlink(entry);
+
+            Left(entry);
         }
     }
 
@@ -238,6 +253,8 @@ internal sealed class CacheShard
                     _pinnedUsage -= entry.Charge;
                 else
                     Unlink(entry);
+
+                Left(entry);
             }
         }
     }
@@ -264,8 +281,21 @@ internal sealed class CacheShard
             _entries.Remove(victim.Key);
             victim.InCache = false;
             _usage -= victim.Charge;
+            Left(victim);
         }
     }
+
+    // The reference that a lookup or an insert hands its caller with a native block, under the lock, while the
+    // cache's own reference holds the block.
+    private static object Acquire(object value)
+    {
+        (value as NativeBlock)?.AddReference();
+        return value;
+    }
+
+    // An entry that left the cache drops the cache's reference on its native block; a reader that holds the block
+    // keeps it until its own release.
+    private static void Left(CacheEntry entry) => (entry.Value as NativeBlock)?.Release();
 
     // Moves the oldest entries of the high-priority pool to the newest end of the low-priority pool until the
     // pool is within its share.

@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 namespace Solarium.Engine;
 
 /// <summary>
-/// The in-memory table of one column family: a multi-version skip list in internal key order.
+/// The in-memory table of one column family: a multi-version skip list in internal key order, in native memory.
 /// </summary>
 /// <remarks>
 /// <para>Any number of lock-free readers, and either one writer at a time (<see cref="Add"/>, the
@@ -11,21 +11,40 @@ namespace Solarium.Engine;
 /// <c>InlineSkipList::InsertConcurrently</c>), never both at once. A node is fully built before a
 /// release-store or a compare-and-swap links it in, and nodes are never removed, so a reader can walk
 /// the list while writers insert.</para>
+/// <para>Each node is one allocation in the memtable's <see cref="Arena"/>, as RocksDB's <c>InlineSkipList</c>
+/// lays it out: the sequence number, the lengths, the kind and the height, then the links, then the key and the
+/// value. The links are addresses, which never change, since the arena never moves or frees a node while the
+/// memtable lives. The garbage collector sees none of it: an entry is no object, so no collection copies or marks
+/// it, and its bytes count against no heap limit. The key and the value are copied in from the caller's arrays,
+/// and a read copies them out into new arrays (<see cref="Entry"/>), as a read of an SSTable does.</para>
+/// <para>The arena is freed when no reader can reach the memtable: each <see cref="FamilyVersion"/> that lists it
+/// counts a reference (<see cref="AddReference"/>, <see cref="Release"/>), and a reader is counted in a version for
+/// as long as it reads, so the last reference goes after the last reader leaves.</para>
 /// <para>A reader sees a consistent state through sequence numbers, not through the list: the
 /// database publishes a group's last sequence number only after every entry of the group is in,
 /// and readers skip entries newer than the snapshot they read.</para>
 /// <para>Range tombstones sit in a separate array that only grows, and each range delete publishes a
 /// new <see cref="TombstoneSet"/> over a longer prefix of it, so the set a reader holds never changes.
-/// The writer indexes them as runs of <see cref="FragmentedTombstones"/> whose sizes count in binary,
+/// They stay managed objects: a memtable holds few. The writer indexes them as runs of
+/// <see cref="FragmentedTombstones"/> whose sizes count in binary,
 /// in units of <see cref="LinearTombstoneLimit"/>: a lookup searches each run and scans the few
 /// tombstones past the last one, and no reader builds anything. A tombstone takes part in one build
 /// each time the count of tombstones doubles, and the largest build, of all of them, comes once per
 /// doubling. RocksDB instead caches the fragments of all of a memtable's tombstones until the next
 /// range delete, and the first read after it fragments all of them again.</para>
 /// </remarks>
-internal sealed class MemTable : IEntrySource
+internal sealed unsafe class MemTable : IEntrySource
 {
     private const int MaxHeight = 12;
+
+    // A node: the sequence number (8 bytes), the key's length (4), the value's length (4, -1 for none), the kind
+    // (1) and the height (1), padding to 24, then one link of 8 bytes for each level, then the key and the value.
+    private const int SequenceOffset = 0;
+    private const int KeyLengthOffset = 8;
+    private const int ValueLengthOffset = 12;
+    private const int KindOffset = 16;
+    private const int HeightOffset = 17;
+    private const int LinksOffset = 24;
 
     /// <summary>
     /// The size of the smallest run of fragments: fewer range tombstones than this past the last
@@ -34,9 +53,10 @@ internal sealed class MemTable : IEntrySource
     /// </summary>
     internal const int LinearTombstoneLimit = 8;
 
-    private readonly Node _head = new([], 0, OperationKind.Put, null, MaxHeight);
+    private readonly Arena _arena;
+    private readonly byte* _head;   // a node of MaxHeight levels with no key, never compared
     private readonly Random _random = new(0x5eed);   // the single writer only
-    private readonly Node?[] _splice = new Node?[MaxHeight];   // the single writer only
+    private readonly nint[] _splice = new nint[MaxHeight];   // the single writer only
     private readonly object _tombstoneLock = new();   // concurrent writers of range tombstones
     private int _height = 1;
     private TombstoneSet _tombstones = TombstoneSet.Empty;
@@ -44,11 +64,35 @@ internal sealed class MemTable : IEntrySource
     private long _entryCount;
     private long _minSequence;
     private long _maxSequence;
+    private int _references;          // Interlocked: the versions that list the memtable and are not closed
     private long _charged;            // the bytes reserved on the database's WriteBufferManager
     private bool _chargeImmutable;    // the charge left the manager's active memory
 
-    /// <summary>Key and value bytes held, for the flush threshold.</summary>
+    /// <summary>An empty memtable whose arena takes its chunks from <see cref="ArenaChunkPool.Shared"/>.</summary>
+    public MemTable()
+        : this(ArenaChunkPool.Shared)
+    {
+    }
+
+    /// <summary>An empty memtable whose arena takes its chunks from <paramref name="pool"/>.</summary>
+    public MemTable(ArenaChunkPool pool)
+    {
+        _arena = new Arena(pool);
+        int size = NodeSize(MaxHeight, 0, 0);
+        _head = _arena.Allocate(size);
+        new Span<byte>(_head, size).Clear();
+        _head[HeightOffset] = MaxHeight;
+    }
+
+    /// <summary>
+    /// The bytes the memtable holds, for the flush threshold and the <see cref="WriteBufferManager"/>: its nodes in
+    /// the arena, keys, values and links included, and its range tombstones with their fragments. The arena's
+    /// chunks hold up to one partly filled chunk per writer's processor besides (<see cref="ArenaBytes"/>).
+    /// </summary>
     public long ApproximateBytes => Volatile.Read(ref _approximateBytes);
+
+    /// <summary>The native memory the memtable's arena holds: its chunks, used or not, and its large blocks.</summary>
+    public long ArenaBytes => _arena.AllocatedBytes;
 
     /// <summary>Point entries held (puts and deletes); <c>rocksdb.num-entries-active-mem-table</c> adds the range tombstones.</summary>
     public long EntryCount => Volatile.Read(ref _entryCount);
@@ -67,6 +111,44 @@ internal sealed class MemTable : IEntrySource
 
     /// <summary>Set once the memtable's data is durable in an SSTable listed by the manifest.</summary>
     public bool Flushed { get; set; }
+
+    /// <summary>True once the arena is freed: no reader may read the memtable's entries any more.</summary>
+    internal bool IsFreed => _arena.IsFreed;
+
+    // ── References ───────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>Count one more holder: a version that lists the memtable, or a flush that waits to write it.</summary>
+    /// <exception cref="InvalidOperationException">The arena is freed already.</exception>
+    public void AddReference()
+    {
+        // A holder takes its reference from a version that holds one, so the count is never 0 here, except for a
+        // new memtable's first version.
+        if (Interlocked.Increment(ref _references) <= 1 && _arena.IsFreed)
+            throw new InvalidOperationException("A memtable whose memory was freed was referenced again.");
+    }
+
+    /// <summary>Drop a holder's reference. The last one frees the arena: no reader can reach the memtable any more.</summary>
+    public void Release()
+    {
+        int left = Interlocked.Decrement(ref _references);
+        if (left == 0)
+            _arena.Free();
+        else if (left < 0)
+            throw new InvalidOperationException("A memtable was released more times than it was referenced.");
+    }
+
+    /// <summary>
+    /// Frees the arena of a memtable that no version ever listed, as a test does with one it built alone; the
+    /// database frees its memtables through <see cref="Release"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">A holder still references the memtable.</exception>
+    internal void FreeUnreferenced()
+    {
+        if (Volatile.Read(ref _references) != 0)
+            throw new InvalidOperationException("The memtable is still referenced.");
+
+        _arena.Free();
+    }
 
     // ── WriteBufferManager charge ────────────────────────────────────────────────────────────────
     // Each call comes from the thread that holds the lock that keeps a memtable switch out (the memtable
@@ -109,23 +191,30 @@ internal sealed class MemTable : IEntrySource
 
     // ── Writer side: one writer ──────────────────────────────────────────────────────────────────
 
-    /// <summary>The bytes that one entry or range tombstone adds to <see cref="ApproximateBytes"/>.</summary>
-    public static long EntryBytes(byte[] key, byte[]? value) => key.Length + (value?.Length ?? 0) + 32;
+    /// <summary>
+    /// The bytes of the node of an entry of <paramref name="keyLength"/> and <paramref name="valueLength"/> bytes at
+    /// <paramref name="height"/> levels, as the arena gives them: a multiple of 8, so every node's links are aligned.
+    /// </summary>
+    public static int NodeSize(int height, int keyLength, int valueLength) =>
+        checked((LinksOffset + (height * sizeof(long)) + keyLength + valueLength + 7) & ~7);
 
-    /// <summary>Insert one version of <paramref name="key"/>. One writer at a time, with no concurrent writer; the memtable keeps the arrays it is given.</summary>
+    /// <summary>The bytes that one range tombstone adds to <see cref="ApproximateBytes"/>, its fragments aside.</summary>
+    public static long TombstoneBytes(byte[] begin, byte[] end) => begin.Length + end.Length + 32;
+
+    /// <summary>Insert one version of <paramref name="key"/>. One writer at a time, with no concurrent writer; the memtable copies the bytes.</summary>
     public void Add(byte[] key, long sequence, OperationKind kind, byte[]? value)
     {
-        Node x = _head;
+        byte* x = _head;
         for (int level = Volatile.Read(ref _height) - 1; level >= 0; level--)
         {
-            Node? next = x.Next[level];
+            byte* next = (byte*)Link(x, level);
             while (next is not null && Compare(next, key, sequence) < 0)
             {
                 x = next;
-                next = x.Next[level];
+                next = (byte*)Link(x, level);
             }
 
-            _splice[level] = x;
+            _splice[level] = (nint)x;
         }
 
         int height = RandomHeight();
@@ -133,23 +222,26 @@ internal sealed class MemTable : IEntrySource
         if (height > current)
         {
             for (int level = current; level < height; level++)
-                _splice[level] = _head;
+                _splice[level] = (nint)_head;
 
             // Published before the links: a reader that sees the new height finds null at the
             // new levels of the head and drops down.
             Volatile.Write(ref _height, height);
         }
 
-        Node node = new(key, sequence, kind, value, height);
+        int size = NodeSize(height, key.Length, value?.Length ?? 0);
+        byte* node = Build(_arena.Allocate(size), height, key, sequence, kind, value);
         for (int level = 0; level < height; level++)
         {
-            node.Next[level] = _splice[level]!.Next[level];
-            Volatile.Write(ref _splice[level]!.Next[level], node);
+            // The node's bytes and its own link are written before the release-store that makes it reachable.
+            Link(node, level) = Link((byte*)_splice[level], level);
+            Volatile.Write(ref Link((byte*)_splice[level], level), (nint)node);
         }
 
-        Volatile.Write(ref _approximateBytes, _approximateBytes + key.Length + (value?.Length ?? 0) + 32);
+        Volatile.Write(ref _approximateBytes, _approximateBytes + size);
         Volatile.Write(ref _entryCount, _entryCount + 1);
         NoteSequence(sequence);
+        GC.KeepAlive(this);
     }
 
     /// <summary>Record a range delete of [<paramref name="begin"/>, <paramref name="end"/>). One writer at a time, with no concurrent writer.</summary>
@@ -167,7 +259,7 @@ internal sealed class MemTable : IEntrySource
         TombstoneSet current = _tombstones;
         TombstoneSet next = current.With(new RangeTombstone(begin, end, sequence));
         Volatile.Write(ref _tombstones, next);
-        Volatile.Write(ref _approximateBytes, _approximateBytes + begin.Length + end.Length + 32 + next.FragmentBytes - current.FragmentBytes);
+        Volatile.Write(ref _approximateBytes, _approximateBytes + TombstoneBytes(begin, end) + next.FragmentBytes - current.FragmentBytes);
         NoteSequence(sequence);
     }
 
@@ -183,12 +275,12 @@ internal sealed class MemTable : IEntrySource
 
     /// <summary>
     /// Insert one version of <paramref name="key"/> while other threads insert too. The caller adds
-    /// the entry to the counters with <see cref="AddCounts"/>, once for each run of entries, and no
-    /// thread calls <see cref="Add"/> or <see cref="AddRangeTombstone"/> until every concurrent
-    /// insert has returned. The memtable keeps the arrays it is given.
+    /// the entry to the counters with <see cref="AddCounts"/>, with the node's <paramref name="bytes"/>, once for
+    /// each run of entries, and no thread calls <see cref="Add"/> or <see cref="AddRangeTombstone"/> until every
+    /// concurrent insert has returned. The memtable copies the bytes.
     /// </summary>
     /// <returns>How many times a link changed under the insert, so a level was searched again.</returns>
-    public int AddConcurrently(byte[] key, long sequence, OperationKind kind, byte[]? value)
+    public int AddConcurrently(byte[] key, long sequence, OperationKind kind, byte[]? value, out long bytes)
     {
         int height = RandomHeight(Random.Shared);
 
@@ -204,14 +296,15 @@ internal sealed class MemTable : IEntrySource
         // On the stack: an inserter's splice is its own, and a thread keeps no node of a memtable.
         Splice prev = default;
         Splice next = default;
-        Node x = _head;
+        byte* x = _head;
         for (int level = top - 1; level >= 0; level--)
         {
             x = FindSpliceForLevel(x, key, sequence, level, out next[level]);
-            prev[level] = x;
+            prev[level] = (nint)x;
         }
 
-        Node node = new(key, sequence, kind, value, height);
+        int size = NodeSize(height, key.Length, value?.Length ?? 0);
+        byte* node = Build(_arena.AllocateConcurrently(size), height, key, sequence, kind, value);
         int retries = 0;
         for (int level = 0; level < height; level++)
         {
@@ -221,21 +314,23 @@ internal sealed class MemTable : IEntrySource
             // still before the key when the swap fails, and the search goes on from it.
             while (true)
             {
-                node.Next[level] = next[level];
-                if (ReferenceEquals(Interlocked.CompareExchange(ref prev[level]!.Next[level], node, next[level]), next[level]))
+                Link(node, level) = next[level];
+                if (Interlocked.CompareExchange(ref Link((byte*)prev[level], level), (nint)node, next[level]) == next[level])
                     break;
 
                 retries++;
-                prev[level] = FindSpliceForLevel(prev[level]!, key, sequence, level, out next[level]);
+                prev[level] = (nint)FindSpliceForLevel((byte*)prev[level], key, sequence, level, out next[level]);
             }
         }
 
+        bytes = size;
+        GC.KeepAlive(this);
         return retries;
     }
 
     /// <summary>
     /// Record a range delete of [<paramref name="begin"/>, <paramref name="end"/>) while other threads
-    /// insert too. The caller adds it to the counters with <see cref="AddCounts"/>.
+    /// insert too. The caller adds it to the counters with <see cref="AddCounts"/>, with <see cref="TombstoneBytes"/>.
     /// </summary>
     public void AddRangeTombstoneConcurrently(byte[] begin, byte[] end, long sequence)
     {
@@ -259,10 +354,10 @@ internal sealed class MemTable : IEntrySource
     }
 
     /// <summary>
-    /// Add a run of concurrent inserts to the counters: <paramref name="bytes"/> by
-    /// <see cref="EntryBytes"/>, <paramref name="entries"/> point entries, and the sequence numbers
-    /// from <paramref name="firstSequence"/> to <paramref name="lastSequence"/>. One atomic update
-    /// for each counter and run, as RocksDB's <c>MemTable::BatchPostProcess</c>.
+    /// Add a run of concurrent inserts to the counters: <paramref name="bytes"/> from
+    /// <see cref="AddConcurrently"/> and <see cref="TombstoneBytes"/>, <paramref name="entries"/> point entries, and
+    /// the sequence numbers from <paramref name="firstSequence"/> to <paramref name="lastSequence"/>. One atomic
+    /// update for each counter and run, as RocksDB's <c>MemTable::BatchPostProcess</c>.
     /// </summary>
     public void AddCounts(long bytes, long entries, long firstSequence, long lastSequence)
     {
@@ -294,17 +389,31 @@ internal sealed class MemTable : IEntrySource
 
     // The last node of the level before (key, sequence), from start on, which must be before it;
     // next is the node after it.
-    private static Node FindSpliceForLevel(Node start, byte[] key, long sequence, int level, out Node? next)
+    private static byte* FindSpliceForLevel(byte* start, byte[] key, long sequence, int level, out nint next)
     {
-        Node x = start;
-        next = Volatile.Read(ref x.Next[level]);
-        while (next is not null && Compare(next, key, sequence) < 0)
+        byte* x = start;
+        next = Volatile.Read(ref Link(x, level));
+        while (next != 0 && Compare((byte*)next, key, sequence) < 0)
         {
-            x = next;
-            next = Volatile.Read(ref x.Next[level]);
+            x = (byte*)next;
+            next = Volatile.Read(ref Link(x, level));
         }
 
         return x;
+    }
+
+    // The node's fields, key and value, written into its memory, which no reader can reach yet; its links are the caller's.
+    private static byte* Build(byte* node, int height, byte[] key, long sequence, OperationKind kind, byte[]? value)
+    {
+        *(long*)(node + SequenceOffset) = sequence;
+        *(int*)(node + KeyLengthOffset) = key.Length;
+        *(int*)(node + ValueLengthOffset) = value?.Length ?? -1;
+        node[KindOffset] = (byte)kind;
+        node[HeightOffset] = (byte)height;
+        byte* data = node + LinksOffset + (height * sizeof(long));
+        key.CopyTo(new Span<byte>(data, key.Length));
+        value?.CopyTo(new Span<byte>(data + key.Length, value.Length));
+        return node;
     }
 
     // ── Reader side: any thread, no lock ─────────────────────────────────────────────────────────
@@ -312,22 +421,24 @@ internal sealed class MemTable : IEntrySource
     /// <inheritdoc />
     public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out Entry entry)
     {
-        Node? node = Seek(key, snapshot);
-        if (node is not null && node.Key.AsSpan().SequenceEqual(key))
-        {
-            entry = node.ToEntry();
-            return true;
-        }
-
-        entry = default;
-        return false;
+        byte* node = Seek(key, snapshot);
+        bool found = node is not null && KeyOf(node).SequenceEqual(key);
+        entry = found ? ToEntry(node) : default;
+        GC.KeepAlive(this);
+        return found;
     }
 
     /// <inheritdoc />
     public long CoveringTombstone(ReadOnlySpan<byte> key, long snapshot) => Volatile.Read(ref _tombstones).Covering(key, snapshot);
 
     /// <inheritdoc />
-    public byte[]? LastKeyBefore(byte[]? limit, bool fillCache) => (limit is null ? Last() : FindLessThan(limit))?.Key;
+    public byte[]? LastKeyBefore(byte[]? limit, bool fillCache)
+    {
+        byte* node = limit is null ? Last() : FindLessThan(limit);
+        byte[]? key = node is null ? null : KeyOf(node).ToArray();
+        GC.KeepAlive(this);
+        return key;
+    }
 
     /// <inheritdoc />
     public IEntryCursor NewCursor(bool fillCache) => new Cursor(this);
@@ -335,8 +446,9 @@ internal sealed class MemTable : IEntrySource
     /// <summary>Every entry in internal key order, every version of each key included, when no writer is left.</summary>
     public IEnumerable<Entry> Entries()
     {
-        for (Node? node = First(); node is not null; node = Volatile.Read(ref node.Next[0]))
-            yield return node.ToEntry();
+        // An iterator's body is safe code, so it walks the nodes by address.
+        for (nint node = First(); node != 0; node = NextOf(node))
+            yield return EntryOf(node);
     }
 
     /// <summary>
@@ -359,16 +471,17 @@ internal sealed class MemTable : IEntrySource
     public IEnumerable<Entry> FlushEntries(long snapshot, IReadOnlyList<RangeTombstone> tombstones)
     {
         TombstoneSweep sweep = new(tombstones);
-        byte[]? previous = null;
-        for (Node? node = First(); node is not null; node = Volatile.Read(ref node.Next[0]))
+        nint previous = 0;
+        for (nint node = First(); node != 0; node = NextOf(node))
         {
             // The first version at or below the snapshot of each key is its newest.
-            if (node.Sequence > snapshot || (previous is not null && node.Key.AsSpan().SequenceEqual(previous)))
+            if (SequenceAt(node) > snapshot || (previous != 0 && SameKey(node, previous)))
                 continue;
 
-            previous = node.Key;
-            if (sweep.Covering(node.Key) < node.Sequence)
-                yield return node.ToEntry();
+            previous = node;
+            Entry entry = EntryOf(node);
+            if (sweep.Covering(entry.Key) < entry.Sequence)
+                yield return entry;
         }
     }
 
@@ -388,14 +501,14 @@ internal sealed class MemTable : IEntrySource
     /// The first entry at or after (<paramref name="key"/>, <paramref name="sequence"/>) in internal key
     /// order. <c>long.MaxValue</c> finds the first version of the first key at or after <paramref name="key"/>.
     /// </summary>
-    private Node? Seek(ReadOnlySpan<byte> key, long sequence)
+    private byte* Seek(ReadOnlySpan<byte> key, long sequence)
     {
-        Node x = _head;
+        byte* x = _head;
         int level = Volatile.Read(ref _height) - 1;
 
         while (true)
         {
-            Node? next = Volatile.Read(ref x.Next[level]);
+            byte* next = (byte*)Volatile.Read(ref Link(x, level));
             if (next is not null && Compare(next, key, sequence) < 0)
                 x = next;
             else if (level == 0)
@@ -406,39 +519,75 @@ internal sealed class MemTable : IEntrySource
     }
 
     // The last entry whose key is less than key, or null.
-    private Node? FindLessThan(ReadOnlySpan<byte> key)
+    private byte* FindLessThan(ReadOnlySpan<byte> key)
     {
-        Node x = _head;
+        byte* x = _head;
         int level = Volatile.Read(ref _height) - 1;
 
         while (true)
         {
-            Node? next = Volatile.Read(ref x.Next[level]);
+            byte* next = (byte*)Volatile.Read(ref Link(x, level));
             if (next is not null && Compare(next, key, long.MaxValue) < 0)
                 x = next;
             else if (level == 0)
-                return ReferenceEquals(x, _head) ? null : x;
+                return x == _head ? null : x;
             else
                 level--;
         }
     }
 
-    private Node? First() => Volatile.Read(ref _head.Next[0]);
+    private nint First() => Volatile.Read(ref Link(_head, 0));
 
-    private Node? Last()
+    private byte* Last()
     {
-        Node x = _head;
+        byte* x = _head;
         for (int level = Volatile.Read(ref _height) - 1; level >= 0; level--)
-            for (Node? next = Volatile.Read(ref x.Next[level]); next is not null; next = Volatile.Read(ref x.Next[level]))
+            for (byte* next = (byte*)Volatile.Read(ref Link(x, level)); next is not null; next = (byte*)Volatile.Read(ref Link(x, level)))
                 x = next;
 
-        return ReferenceEquals(x, _head) ? null : x;
+        return x == _head ? null : x;
     }
 
-    private static int Compare(Node node, ReadOnlySpan<byte> key, long sequence)
+    // ── Nodes ────────────────────────────────────────────────────────────────────────────────────
+
+    // The nodes by address, for the iterators.
+    private static nint NextOf(nint node) => Volatile.Read(ref Link((byte*)node, 0));
+
+    private static long SequenceAt(nint node) => SequenceOf((byte*)node);
+
+    private static bool SameKey(nint node, nint other) => KeyOf((byte*)node).SequenceEqual(KeyOf((byte*)other));
+
+    private static Entry EntryOf(nint node) => ToEntry((byte*)node);
+
+    private static ref nint Link(byte* node, int level) => ref *(nint*)(node + LinksOffset + (level * sizeof(long)));
+
+    private static long SequenceOf(byte* node) => *(long*)(node + SequenceOffset);
+
+    private static ReadOnlySpan<byte> KeyOf(byte* node) =>
+        new(node + LinksOffset + (node[HeightOffset] * sizeof(long)), *(int*)(node + KeyLengthOffset));
+
+    // The value of a node, empty for none.
+    private static ReadOnlySpan<byte> ValueOf(byte* node)
     {
-        return InternalKey.Compare(node.Key, node.Sequence, key, sequence);
+        int valueLength = *(int*)(node + ValueLengthOffset);
+        return valueLength <= 0
+            ? default
+            : new(node + LinksOffset + (node[HeightOffset] * sizeof(long)) + *(int*)(node + KeyLengthOffset), valueLength);
     }
+
+    // The entry of a node, its key and value copied into new arrays.
+    private static Entry ToEntry(byte* node)
+    {
+        int keyLength = *(int*)(node + KeyLengthOffset);
+        int valueLength = *(int*)(node + ValueLengthOffset);
+        byte* data = node + LinksOffset + (node[HeightOffset] * sizeof(long));
+        byte[] key = new ReadOnlySpan<byte>(data, keyLength).ToArray();
+        byte[]? value = valueLength < 0 ? null : new ReadOnlySpan<byte>(data + keyLength, valueLength).ToArray();
+        return new Entry(key, SequenceOf(node), (OperationKind)node[KindOffset], value);
+    }
+
+    private static int Compare(byte* node, ReadOnlySpan<byte> key, long sequence) =>
+        InternalKey.Compare(KeyOf(node), SequenceOf(node), key, sequence);
 
     private int RandomHeight() => RandomHeight(_random);
 
@@ -451,36 +600,67 @@ internal sealed class MemTable : IEntrySource
         return height;
     }
 
-    private sealed class Node(byte[] key, long sequence, OperationKind kind, byte[]? value, int height)
-    {
-        public readonly byte[] Key = key;
-        public readonly long Sequence = sequence;
-        public readonly OperationKind Kind = kind;
-        public readonly byte[]? Value = value;
-        public readonly Node?[] Next = new Node?[height];
-
-        public Entry ToEntry() => new(Key, Sequence, Kind, Value);
-    }
-
     [InlineArray(MaxHeight)]
     private struct Splice
     {
-        private Node? _element;
+        private nint _element;
     }
 
+    // Copies an entry out only when it is asked for, once per position: an iterator compares keys and sequence
+    // numbers in place and takes the entry of the cursor that wins.
     private sealed class Cursor(MemTable table) : IEntryCursor
     {
-        private Node? _node;
+        private nint _node;
+        private Entry? _current;
 
-        public bool Valid => _node is not null;
+        public bool Valid => _node != 0;
 
-        public Entry Current => _node!.ToEntry();
+        public Entry Current
+        {
+            get
+            {
+                Entry entry = _current ??= ToEntry((byte*)_node);
+                GC.KeepAlive(table);
+                return entry;
+            }
+        }
 
-        public void SeekToFirst() => _node = table.First();
+        public ReadOnlySpan<byte> CurrentKey => KeyOf((byte*)_node);
 
-        public void Seek(ReadOnlySpan<byte> key) => _node = table.Seek(key, long.MaxValue);
+        public long CurrentSequence
+        {
+            get
+            {
+                long sequence = SequenceOf((byte*)_node);
+                GC.KeepAlive(table);
+                return sequence;
+            }
+        }
 
-        public void Next() => _node = Volatile.Read(ref _node!.Next[0]);
+        public OperationKind CurrentKind
+        {
+            get
+            {
+                OperationKind kind = (OperationKind)((byte*)_node)[KindOffset];
+                GC.KeepAlive(table);
+                return kind;
+            }
+        }
+
+        public ReadOnlySpan<byte> CurrentValue => ValueOf((byte*)_node);
+
+        public void SeekToFirst() => Move(table.First());
+
+        public void Seek(ReadOnlySpan<byte> key) => Move((nint)table.Seek(key, long.MaxValue));
+
+        public void Next() => Move(Volatile.Read(ref Link((byte*)_node, 0)));
+
+        private void Move(nint node)
+        {
+            _node = node;
+            _current = null;
+            GC.KeepAlive(table);
+        }
     }
 
     /// <summary>
