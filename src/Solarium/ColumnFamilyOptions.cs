@@ -83,9 +83,9 @@ public sealed record ColumnFamilyOptions
     /// Keeps the data blocks that reads take from the SSTables in <see cref="BlockCache"/>, verified and
     /// decompressed, which RocksDB does whenever it has a block cache. A read whose block is cached makes no file
     /// read and decompresses nothing; a read that misses caches the block unless <see cref="ReadOptions.FillCache"/>
-    /// is false, and compactions never do. It pays where reads from few threads keep finding their blocks cached;
-    /// with many reader threads, or a store much larger than the cache, its locks and the garbage of the blocks it
-    /// evicts made reads slower than the operating system's page cache alone (see <c>docs/benchmarks.md</c>).
+    /// is false, and compactions never do. It pays where reads keep finding their blocks cached; on a store much
+    /// larger than the cache, most reads miss, and the copy and eviction of each miss under a shard's lock made reads
+    /// slower than the operating system's page cache alone (see <c>docs/benchmarks.md</c>).
     /// Requires <see cref="BlockCache"/>. Default: false, and every data block is read from the file.
     /// </summary>
     public bool CacheDataBlocks { get; init; }

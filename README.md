@@ -67,7 +67,7 @@ Solarium is young, and its on-disk format may still change. Done:
 
 Not done yet:
 
-- a block cache that pays for data blocks on many threads: with the LRU cache, caching them (`CacheDataBlocks`, off by default) made reads slower from 8 threads and on stores larger than the cache, so the OS page cache serves them;
+- a block cache that pays for data blocks on stores larger than the cache: with the LRU cache, caching them (`CacheDataBlocks`, off by default) made reads faster on a store that fits in the cache but slower on one ten times its size, so the OS page cache serves them;
 - recovery after a WAL, flush or compaction failure inside the engine: the database refuses all writes until it is opened again (`SolariumWAL` reopens it on its own);
 - subcompactions, which split one large merge across threads, and more than one flush thread.
 

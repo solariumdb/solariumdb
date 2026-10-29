@@ -36,11 +36,12 @@ engines it registered.
 Two of Kahuna's storage settings pace the store's compactions. `--storage-compaction-rate-mbps` gives the
 store a `RateLimiter` of that rate for its flush and compaction writes, and runs `max(2, CPUs / 2)`
 compactions at once, as the RocksDB backend does; `--storage-max-background-compactions` sets that count
-instead. With neither, the store runs one compaction at a time and paces nothing. Choose a rate of about a
-third to half of what the disk commits in synced writes: on a disk that commits about 100 MB/s, 50 made the
-store's synced batches of 64 rows 2.5 times as fast as one unpaced compaction, and loads 1.2 times as fast
-(see "Paced background writes" in [benchmarks.md](benchmarks.md)). Too low a rate lets level 0 grow until
-writes slow down.
+instead. With neither, the store runs one compaction at a time and paces nothing. The limiter paces flushes
+too, so its rate must stay above what the store ingests, and below what leaves the disk to the WAL's syncs: on
+a disk whose synced writes took 4 to 8 ms, 50 made the store's synced batches of 64 rows 2.5 times as fast as
+one unpaced compaction, but on the same disk at about 1 ms, the synced batches outran 25 and 50, and flushes
+held them to 0.2 to 0.4 times their unpaced rate (see "Paced background writes" in
+[benchmarks.md](benchmarks.md)). Too low a rate lets level 0 grow until writes slow down.
 
 Two settings give the WAL and the store of a node memory to share; both providers take the node's
 `SharedStorageMemory` and use the same Solarium objects for it:
