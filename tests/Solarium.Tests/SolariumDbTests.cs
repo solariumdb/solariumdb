@@ -948,6 +948,40 @@ public sealed class SolariumDbTests : IDisposable
         Assert.Equal(10 * 1024, db.Get(B("medium"))!.Length);
     }
 
+    [Theory]
+    [MemberData(nameof(Environments.AvailableWithCommits), MemberType = typeof(Environments))]
+    public void A_large_batch_is_appended_from_its_own_record_without_a_copy_and_replays(string environment, bool pipelined)
+    {
+        using EnvironmentScope scope = Environments.Create(environment);
+        DbOptions options = scope.Options() with { EnablePipelinedWrite = pipelined };
+        const int count = 4096;
+
+        using (SolariumDb db = SolariumDb.Open(DbPath, options))
+        {
+            db.Put(B("before"), B("1"));
+
+            // About 4 MiB: a record of its own, which the leader completes in place.
+            WriteBatch large = new();
+            for (int i = 0; i < count; i++)
+                large.Put(B($"large/{i:D4}"), Enumerable.Repeat((byte)i, 1024).ToArray());
+            db.Write(large, WriteOptions.Synced);
+
+            db.Put(B("after"), B("2"), options: WriteOptions.Synced);
+
+            Assert.InRange(db.GroupBufferCapacity, 0, 64 * 1024);
+            Assert.Equal(count + 2, db.LatestSequenceNumber);
+            Assert.Equal("2", S(db.Get(B("after"))));
+        }
+
+        // Replay checks each record's CRC, so a record completed wrongly in place would stop it here.
+        using SolariumDb reopened = SolariumDb.Open(DbPath, options);
+        Assert.Equal(count + 2, reopened.LatestSequenceNumber);
+        Assert.Equal("1", S(reopened.Get(B("before"))));
+        Assert.Equal("2", S(reopened.Get(B("after"))));
+        for (int i = 0; i < count; i++)
+            Assert.Equal(Enumerable.Repeat((byte)i, 1024).ToArray(), reopened.Get(B($"large/{i:D4}")));
+    }
+
     [Fact]
     public void A_full_memtable_switches_when_its_family_is_not_the_first_of_the_batch()
     {

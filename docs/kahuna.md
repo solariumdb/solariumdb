@@ -143,6 +143,12 @@ environment changes how the files are read and written, not what they hold.
   not give it to the as-of trim of a checkpoint copy.
 - **The purge flushes first.** Solarium's `CompactRange` does not flush a memtable first, so the trim and
   the merge flush each family before they compact it, which a full purge of the copy needs.
+- **A key's rows go with one range tombstone.** `DeleteKeyValues` and `DeleteLocks` delete each key's rows,
+  `key~` up to `key\x7F`, with one `DeleteRange`, where the RocksDB backend walks the rows and deletes each
+  one. The rows are the same, but the batch has one operation per key, however deep its history. A
+  whole-partition purge before a snapshot install deletes 256 keys a call; with a delete per row, a call on a
+  store with millions of history rows built them all on the managed heap at once, where the RocksDB backend's
+  batch is native memory.
 - **Batched reads go one family per call.** Solarium's `MultiGet` reads one column family per call; every
   batched read here reads the kv family only.
 

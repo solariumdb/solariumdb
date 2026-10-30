@@ -3077,8 +3077,9 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
 
     /// <summary>
     /// Physically removes each key's rows — <c>~CURRENT</c>, every <c>~&lt;revision&gt;</c> history
-    /// row and the <c>~NOREV</c> provenance marker all share the <c>key~</c> raw prefix, so one
-    /// bounded prefix walk per key collects them all — in a single write batch.
+    /// row and the <c>~NOREV</c> provenance marker all share the <c>key~</c> raw prefix — with one
+    /// range tombstone per key, in a single write batch whose size depends on the keys only, not on
+    /// how much history they hold.
     /// </summary>
     public bool DeleteKeyValues(IReadOnlyList<string> keys)
     {
@@ -3111,26 +3112,28 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
 
     private bool DeleteFamilyRows(IReadOnlyList<string> keys, ColumnFamily columnFamily)
     {
+        // [key~, key\x7F) holds exactly the raw keys that start with "key~", since '~' is 0x7E: the
+        // rows a prefix walk would find. A delete per row instead made the batch, and its WAL record,
+        // as large as the key's history — millions of rows on a deep-history store, which a
+        // whole-partition purge before a snapshot install then built on the managed heap at once.
         WriteBatch batch = new();
-        using Iterator iterator = db.NewIterator(columnFamily);
+        byte[] bounds = [];
 
         foreach (string key in keys)
         {
-            byte[] prefix = Encoding.UTF8.GetBytes(key + "~");
+            int length = Encoding.UTF8.GetByteCount(key) + 1;
+            if (bounds.Length < 2 * length)
+                bounds = new byte[Math.Max(2 * length, 2 * bounds.Length)];
 
-            iterator.Seek(prefix);
+            // The batch copies both bounds, so one buffer serves every key.
+            Span<byte> begin = bounds.AsSpan(0, length);
+            Span<byte> end = bounds.AsSpan(length, length);
+            Encoding.UTF8.GetBytes(key, begin);
+            begin[^1] = (byte)'~';
+            begin[..^1].CopyTo(end);
+            end[^1] = (byte)'~' + 1;
 
-            while (iterator.Valid())
-            {
-                ReadOnlySpan<byte> rawKey = iterator.Key();
-
-                if (!rawKey.StartsWith(prefix))
-                    break;
-
-                // Copy the key out of the iterator: it must outlive the next step for batch.Delete.
-                batch.Delete(rawKey.ToArray(), columnFamily);
-                iterator.Next();
-            }
+            batch.DeleteRange(begin, end, columnFamily);
         }
 
         db.Write(batch, DefaultWriteOptions);

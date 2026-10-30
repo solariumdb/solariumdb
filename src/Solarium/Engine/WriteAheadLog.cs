@@ -210,12 +210,21 @@ internal sealed class WriteAheadLog : IDisposable
     {
         Span<byte> copy = output.GetSpan(record.Length)[..record.Length];
         record.CopyTo(copy);
+        CompleteRecord(copy, firstSequence, durableOffset);
+        output.Advance(record.Length);
+    }
 
-        Span<byte> payload = copy[HeaderSize..];
+    /// <summary>
+    /// Complete a record of <see cref="EncodeRecord"/> in place, as <see cref="CopyRecord"/> completes
+    /// its copy: with <paramref name="firstSequence"/>, the log's <paramref name="durableOffset"/>, and
+    /// the CRC of its payload. Only for a record that nothing else reads.
+    /// </summary>
+    public static void CompleteRecord(Span<byte> record, long firstSequence, long durableOffset)
+    {
+        Span<byte> payload = record[HeaderSize..];
         WriteInt64LittleEndian(payload, firstSequence);
         WriteInt64LittleEndian(payload[8..], durableOffset);
-        WriteUInt32LittleEndian(copy[4..], Crc32.HashToUInt32(payload));
-        output.Advance(record.Length);
+        WriteUInt32LittleEndian(record[4..], Crc32.HashToUInt32(payload));
     }
 
     /// <summary>

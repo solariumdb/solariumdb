@@ -61,6 +61,7 @@ public sealed class SolariumDb : IDisposable
     private readonly object _writeLock = new();
     private readonly List<Writer> _queue = [];
     private ArrayBufferWriter<byte> _records = new();   // leader only
+    private long _lastGroupBytes;                        // leader only: the bytes the last group appended
     private readonly long _maxGroupBytes;
     private readonly HashSet<ColumnFamily> _written = [];        // leader only
     private bool _leaderActive;
@@ -1576,10 +1577,10 @@ public sealed class SolariumDb : IDisposable
             PrepareGroup(group);
             if (_writeStall != WriteStallCondition.Normal)
             {
-                // The group pays for the bytes of the group before it, which _records still holds, as
-                // RocksDB charges its last group.
+                // The group pays for the bytes of the group before it, as RocksDB charges its last
+                // group.
                 if (_writeStall == WriteStallCondition.Delayed)
-                    delay = WriteDelay(_records.WrittenCount);
+                    delay = WriteDelay(_lastGroupBytes);
                 if (delay == 0)
                     WaitWhileStopped();
             }
@@ -1599,24 +1600,43 @@ public sealed class SolariumDb : IDisposable
         long sequence = first - 1;
         bool sync = false;
         long durable = wal.Log!.DurableLength;
-        // A group above the cap, one large batch, leaves a buffer that large; a new one lets it go.
-        if (_records.Capacity > 2 * _maxGroupBytes)
-            _records = new ArrayBufferWriter<byte>();
-        else
-            _records.ResetWrittenCount();
-
-        foreach (Writer writer in group)
+        ReadOnlySpan<byte> records;
+        if (group.Count == 1 && group[0].OwnedRecord is { } owned)
         {
-            writer.FirstSequence = sequence + 1;
-            WriteAheadLog.CopyRecord(_records, writer.Record, sequence + 1, durable);
+            // A large batch is alone in its group, and its record is its writer's own array, which
+            // waits in Write until the group completes: completed in place and appended from there,
+            // it is not copied into _records, which would grow to its size, by doubling.
+            Writer writer = group[0];
+            writer.FirstSequence = first;
+            records = owned.AsSpan(0, writer.RecordLength);
+            WriteAheadLog.CompleteRecord(owned.AsSpan(0, writer.RecordLength), first, durable);
             sequence += writer.OperationCount;
-            sync |= writer.Sync;
+            sync = writer.Sync;
+        }
+        else
+        {
+            // A group above the cap leaves a buffer that large; a new one lets it go.
+            if (_records.Capacity > 2 * _maxGroupBytes)
+                _records = new ArrayBufferWriter<byte>();
+            else
+                _records.ResetWrittenCount();
+
+            foreach (Writer writer in group)
+            {
+                writer.FirstSequence = sequence + 1;
+                WriteAheadLog.CopyRecord(_records, writer.Record, sequence + 1, durable);
+                sequence += writer.OperationCount;
+                sync |= writer.Sync;
+            }
+
+            records = _records.WrittenSpan;
         }
 
+        _lastGroupBytes = records.Length;
         stamp = EndStage(EncodeStage, stamp);
         try
         {
-            wal.Log!.Append(_records.WrittenSpan, sync);
+            wal.Log!.Append(records, sync);
         }
         catch (Exception e)
         {
@@ -1867,6 +1887,12 @@ public sealed class SolariumDb : IDisposable
 
     /// <summary>The length of this thread's kept record buffer, 0 when it has none.</summary>
     internal static int KeptRecordBufferLength => t_record?.Length ?? 0;
+
+    /// <summary>
+    /// The capacity of the buffer that the leader copies a group's records into. A batch above
+    /// <see cref="MaxKeptRecord"/> bytes that is alone in its group does not grow it.
+    /// </summary>
+    internal int GroupBufferCapacity => _records.Capacity;
 
     // Before a group: switch full memtables, keep the WAL files under their limit, rotate the WAL.
     private void PrepareGroup(List<Writer> group)
@@ -3440,10 +3466,18 @@ public sealed class SolariumDb : IDisposable
         public bool Sync { get; } = sync;
 
         /// <summary>
-        /// The batch's WAL record, without its first sequence number and CRC. It belongs to the
-        /// writer's thread: the leader copies it, and never writes it.
+        /// The batch's WAL record, without its first sequence number and CRC. A record of up to
+        /// <see cref="MaxKeptRecord"/> bytes is in the buffer of the writer's thread: the leader
+        /// copies it, and never writes it.
         /// </summary>
         public ReadOnlySpan<byte> Record => record.AsSpan(0, recordLength);
+
+        /// <summary>
+        /// The array that holds <see cref="Record"/> when it is this writer's alone, a record above
+        /// <see cref="MaxKeptRecord"/> bytes, which no later write of the thread reuses: the leader
+        /// may complete it in place. Null for a record in the thread's kept buffer.
+        /// </summary>
+        public byte[]? OwnedRecord => recordLength > MaxKeptRecord ? record : null;
 
         /// <summary>The length of <see cref="Record"/>, which the group size cap counts.</summary>
         public int RecordLength => recordLength;
