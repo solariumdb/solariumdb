@@ -314,7 +314,7 @@ public sealed class VersionTests : IDisposable
             Assert.Equal("x", S(db.Get(B("only0"))));
         }
 
-        Assert.Equal(3u, ManifestVersion(path));
+        Assert.Equal(4u, ManifestVersion(path));
     }
 
     [Fact]
@@ -394,6 +394,7 @@ public sealed class VersionTests : IDisposable
         Smallest = table.Smallest,
         Largest = table.Largest,
         LargestIsExclusive = table.LargestIsExclusive,
+        Id = table.Id,
     };
 
     // The manifest of directory in the layout of version 1 or 2, which have no table flags.

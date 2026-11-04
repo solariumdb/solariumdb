@@ -169,7 +169,7 @@ public sealed class PartitionTests : IDisposable
         };
         using (SolariumDb db = SolariumDb.Open(DbPath, options, ["other"]))
         {
-            Assert.Equal("solarium-format 5", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
+            Assert.Equal("solarium-format 6", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
             Assert.All(db.DefaultColumnFamily.Version.Tables, table => Assert.Equal(1, table.PartitionCount));
             AssertFixture(db);
 
@@ -222,11 +222,7 @@ public sealed class PartitionTests : IDisposable
         return TableReader.Open(1, file, caching);
     }
 
-    private static uint FooterVersion(string file)
-    {
-        byte[] bytes = File.ReadAllBytes(file);
-        return BitConverter.ToUInt32(bytes, bytes.Length - TableFormat.FooterSize + 48);
-    }
+    private static uint FooterVersion(string file) => TableBytes.Version(file);
 
     private static void AssertFixture(SolariumDb db)
     {

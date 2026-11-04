@@ -30,6 +30,7 @@ internal sealed class TableBuilder : IDisposable
     private long _written;   // the bytes of the file written, below _offset by the buffered ones
     private long _synced;    // the bytes of the file whose writeback has started
     private readonly Crc32 _crc = new();
+    private readonly ulong _id;   // in the footer and in every block's checksum
     private readonly ArrayBufferWriter<byte> _block = new(TableFormat.BlockSize * 2);
     private readonly int _partitionSize;
     private readonly ArrayBufferWriter<byte> _partitionIndex = new();   // the index entries of the open partition
@@ -55,10 +56,15 @@ internal sealed class TableBuilder : IDisposable
     {
     }
 
-    /// <summary>A builder that cuts an index partition at <paramref name="partitionSize"/> bytes of index entries; for tests.</summary>
-    internal TableBuilder(IStorageFile file, CompressionType compression, TablePacing pacing, int partitionSize)
+    /// <summary>
+    /// A builder that cuts an index partition at <paramref name="partitionSize"/> bytes of index entries and writes
+    /// <paramref name="id"/> as the table id, or a random one when it is 0; a fixed id makes two tables of the same
+    /// entries the same bytes. For tests.
+    /// </summary>
+    internal TableBuilder(IStorageFile file, CompressionType compression, TablePacing pacing, int partitionSize, ulong id = 0)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(partitionSize, 1);
+        _id = id == 0 ? NewTableId() : id;
         _file = file;
         _compression = compression;
         _pacing = pacing;
@@ -179,7 +185,8 @@ internal sealed class TableBuilder : IDisposable
         (long, int) indexHandle = WriteBlock(topLevel.WrittenSpan);
 
         Span<byte> footer = stackalloc byte[TableFormat.FooterSize];
-        int at = 0;
+        WriteUInt64LittleEndian(footer, _id);
+        int at = sizeof(ulong);
         foreach ((long offset, int size) in new[] { rangeHandle, filterHandle, propertiesHandle, indexHandle })
         {
             WriteInt64LittleEndian(footer[at..], offset);
@@ -196,7 +203,7 @@ internal sealed class TableBuilder : IDisposable
         _file.Flush();
 
         return new TableProperties(_offset, _entryCount, _minSequence == long.MaxValue ? 0 : _minSequence, _maxSequence, _smallest ?? [], _largest ?? [],
-            TableProperties.IsExclusive(lastKey, _largest ?? []));
+            TableProperties.IsExclusive(lastKey, _largest ?? []), _id);
     }
 
     private void FinishDataBlock()
@@ -228,7 +235,7 @@ internal sealed class TableBuilder : IDisposable
     }
 
     // A data block: the entries, or their LZ4 block when it is worth it, then the type and the CRC-32
-    // of both. Kept raw unless compression saves an eighth, as RocksDB's GoodCompressionRatio: a
+    // of both, bound to the table and the block's offset. Kept raw unless compression saves an eighth, as RocksDB's GoodCompressionRatio: a
     // block that barely shrinks would cost a decompression on every read for almost nothing.
     private (long Offset, int Size) WriteDataBlock(ReadOnlySpan<byte> entries)
     {
@@ -257,19 +264,20 @@ internal sealed class TableBuilder : IDisposable
         _crc.Reset();
         _crc.Append(payload);
         _crc.Append(trailer[..1]);
-        WriteUInt32LittleEndian(trailer[1..], _crc.GetCurrentHashAsUInt32());
+        WriteUInt32LittleEndian(trailer[1..], _crc.GetCurrentHashAsUInt32() ^ TableFormat.ChecksumModifier(_id, offset));
         Append(trailer);
 
         return (offset, payload.Length + trailer.Length);
     }
 
+    // A block other than a data block: the payload, then its CRC-32 bound to the table and the block's offset.
     private (long Offset, int Size) WriteBlock(ReadOnlySpan<byte> payload)
     {
         long offset = _offset;
         Append(payload);
 
         Span<byte> checksum = stackalloc byte[4];
-        WriteUInt32LittleEndian(checksum, Crc32.HashToUInt32(payload));
+        WriteUInt32LittleEndian(checksum, TableFormat.BlockChecksum(payload, _id, offset));
         Append(checksum);
 
         return (offset, payload.Length + 4);
@@ -318,6 +326,22 @@ internal sealed class TableBuilder : IDisposable
             _file.SyncRange(_synced, _written - _synced);
             _synced = _written;
         }
+    }
+
+    // A random nonzero id, so no two tables, of this database or of another, are likely to share one; 0 means
+    // a table of a version before 5, which has no id.
+    private static ulong NewTableId()
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        ulong id;
+        do
+        {
+            Random.Shared.NextBytes(bytes);
+            id = ReadUInt64LittleEndian(bytes);
+        }
+        while (id == 0);
+
+        return id;
     }
 
     private void NoteSequence(long sequence)

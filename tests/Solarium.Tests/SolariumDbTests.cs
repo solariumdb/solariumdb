@@ -1155,7 +1155,7 @@ public sealed class SolariumDbTests : IDisposable
         const int Payload = 4 + 1 + 8 + 1 + 4 + 1;
         Assert.Equal(0, bytes[Payload]);
         BitConverter.TryWriteBytes(bytes.AsSpan(0, 4), 7);
-        BitConverter.TryWriteBytes(bytes.AsSpan(Payload + 1, 4), System.IO.Hashing.Crc32.HashToUInt32(bytes.AsSpan(0, Payload + 1)));
+        TableBytes.Reseal(bytes, 0, Payload + 5);
         File.WriteAllBytes(table, bytes);
 
         using SolariumDb damaged = SolariumDb.Open(DbPath, scope.Options());

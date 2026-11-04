@@ -15,24 +15,28 @@ namespace Solarium.Engine;
 /// Layout, little-endian:
 /// <code>
 ///   [u32 payload length][u32 CRC-32 of payload][payload]
-///   payload = [u32 manifest version = 3][u64 next file number][u32 WAL file count][u64 WAL file number]...
+///   payload = [u32 manifest version = 4][u64 next file number][u32 WAL file count][u64 WAL file number]...
 ///             [u32 family count] family...
 ///   family  = [u32 id][u32 name length][name, UTF-8][u64 flushed sequence][u32 table count] table...
 ///   table   = [u64 number][u32 level][u64 size][u64 entry count][u64 min sequence][u64 max sequence]
-///             [u32 length][smallest key][u32 length][largest key][u8 flags]
+///             [u32 length][smallest key][u32 length][largest key][u8 flags][u64 table id]
 ///   flags   = bit 0: the largest key is a range tombstone's end, below which the table ends
 /// </code>
+/// The table id is the one in the table's footer, 0 for a table of a version before 5, which has none. An open
+/// checks each table against its record: a table file replaced by another, valid one does not match.
 /// A family's tables are those of level 0, newest first, then those of each of levels 1 to 6
 /// (<see cref="BottomLevel"/>) in key order, where no two tables of a level share a key: each one
-/// ends below the next one's smallest key. Version 2 has level 0 and level 6 only and no flags;
-/// version 1, written before level 6 existed, has level 0 only. Both still load. A save writes
-/// version 3, so a reader built before it refuses the file instead of misreading it.
+/// ends below the next one's smallest key. Version 3 has no table ids, which load as 0; version 2
+/// has level 0 and level 6 only and no flags; version 1, written before level 6 existed, has level 0
+/// only. All three still load. A save writes version 4, so a reader built before it refuses the
+/// file instead of misreading it.
 /// </remarks>
 internal sealed class Manifest
 {
     /// <summary>The name of the manifest file inside the database directory.</summary>
     public const string FileName = "MANIFEST";
-    private const uint Version = 3;
+    private const uint Version = 4;
+    private const uint Version3 = 3;
     private const uint Version2 = 2;
     private const uint Version1 = 1;
     private const byte LargestIsExclusiveFlag = 1;
@@ -86,7 +90,7 @@ internal sealed class Manifest
         }
         catch (Exception e) when (e is InvalidDataException or ArgumentOutOfRangeException)
         {
-            throw new SolariumException($"'{path}' is corrupt: {e.Message}.", e);
+            throw SolariumException.Corruption($"'{path}' is corrupt: {e.Message}.", e);
         }
     }
 
@@ -120,6 +124,7 @@ internal sealed class Manifest
                 PutBytes(payload, table.Smallest);
                 PutBytes(payload, table.Largest);
                 payload.Write([table.LargestIsExclusive ? LargestIsExclusiveFlag : (byte)0]);
+                Put64(payload, (long)table.Id);
             }
         }
 
@@ -134,7 +139,7 @@ internal sealed class Manifest
     {
         int position = 0;
         uint version = Get32(payload, ref position);
-        if (version != Version && version != Version2 && version != Version1)
+        if (version != Version && version != Version3 && version != Version2 && version != Version1)
             throw new InvalidDataException($"manifest version {version} is not supported");
 
         Manifest manifest = new() { NextFileNumber = Get64(payload, ref position) };
@@ -168,9 +173,11 @@ internal sealed class Manifest
                 long maxSequence = Get64(payload, ref position);
                 byte[] smallest = GetBytes(payload, ref position);
                 byte[] largest = GetBytes(payload, ref position);
-                byte flags = version == Version ? Get8(payload, ref position) : (byte)0;
+                byte flags = version is Version or Version3 ? Get8(payload, ref position) : (byte)0;
                 if ((flags & ~LargestIsExclusiveFlag) != 0)
                     throw new InvalidDataException($"table {number} has unknown flags {flags}");
+
+                ulong tableId = version == Version ? (ulong)Get64(payload, ref position) : 0;
 
                 family.Tables.Add(new ManifestTable
                 {
@@ -183,6 +190,7 @@ internal sealed class Manifest
                     Smallest = smallest,
                     Largest = largest,
                     LargestIsExclusive = (flags & LargestIsExclusiveFlag) != 0,
+                    Id = tableId,
                 });
             }
 

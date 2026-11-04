@@ -1,4 +1,3 @@
-using System.IO.Hashing;
 using Solarium.Engine;
 using Solarium.Storage;
 using static Solarium.Tests.Text;
@@ -145,7 +144,7 @@ public sealed class CompressionTests : IDisposable
         DbOptions options = Options(scope, CompressionType.Lz4) with { CreateMissingColumnFamilies = false };
         using (SolariumDb db = SolariumDb.Open(DbPath, options, ["other"]))
         {
-            Assert.Equal("solarium-format 5", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
+            Assert.Equal("solarium-format 6", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
             AssertFixture(db);
             ColumnFamily other = db.GetColumnFamily("other");
             db.CompactRange(null, null);
@@ -185,7 +184,7 @@ public sealed class CompressionTests : IDisposable
 
         // One data block, from the start of the file to the range tombstone block.
         byte[] bytes = File.ReadAllBytes(path);
-        int size = (int)BitConverter.ToInt64(bytes, bytes.Length - TableFormat.FooterSize);
+        int size = TableBytes.FooterHandle(bytes, 0).Offset;
         Assert.Equal(TableFormat.Lz4Block, bytes[size - 5]);
         int raw = BitConverter.ToInt32(bytes, 0);
         switch (damage)
@@ -210,7 +209,7 @@ public sealed class CompressionTests : IDisposable
                 break;
         }
 
-        BitConverter.TryWriteBytes(bytes.AsSpan(size - 4, 4), Crc32.HashToUInt32(bytes.AsSpan(0, size - 4)));
+        TableBytes.Reseal(bytes, 0, size);
         File.WriteAllBytes(path, bytes);
 
         using TableReader table = TableReader.Open(1, DefaultStorageEnvironment.Instance.OpenFile(path));
@@ -294,20 +293,24 @@ public sealed class CompressionTests : IDisposable
             DefaultColumnFamilyOptions = new ColumnFamilyOptions { Compression = compression, DisableAutoCompactions = true },
         };
 
+    // The bytes of a table of the memtable, under one fixed table id, so two tables of the same entries are the same bytes.
     private byte[] Build(EnvironmentScope scope, MemTable memTable, CompressionType compression)
     {
         string path = _directory.Combine($"{Guid.NewGuid():N}.sst");
         using (IStorageFile file = scope.Environment.OpenFile(path))
-            TableBuilder.Build(file, memTable.Entries(), memTable.Tombstones, compression);
+        {
+            using TableBuilder builder = new(file, compression, default, TableFormat.PartitionSize, id: 1);
+            foreach (Entry entry in memTable.Entries())
+                builder.Add(entry);
+
+            builder.Finish(memTable.Tombstones);
+        }
+
 
         return File.ReadAllBytes(path);
     }
 
-    private static uint FooterVersion(string path)
-    {
-        byte[] bytes = File.ReadAllBytes(path);
-        return BitConverter.ToUInt32(bytes, bytes.Length - TableFormat.FooterSize + 48);
-    }
+    private static uint FooterVersion(string path) => TableBytes.Version(path);
 
     private static byte[] RandomBytes(Random random, int count)
     {

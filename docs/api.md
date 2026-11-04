@@ -16,6 +16,7 @@ Solarium's public API follows RocksDB's names and semantics. This table maps eac
 | `DeleteFilesInRange(begin, end, family, includeEnd)` | `DeleteFilesInRange`; `includeEnd` defaults to true, as in RocksDB's C API |
 | `CreateCheckpoint(directory)` | `Checkpoint::CreateCheckpoint`; its SSTables are links, or copies across file systems, and it holds no WAL file (see [rocksdb-differences.md](rocksdb-differences.md)) |
 | `LatestSequenceNumber` | `GetLatestSequenceNumber` |
+| `SolariumException.IsCorruption` | `Status::IsCorruption`: damage that no crash explains, in a table, the WAL or the manifest (see [durability.md](durability.md)); an exception that wraps a corruption, such as a write refused after a compaction met one, is a corruption too |
 | `GetProperty(name, family)` | `GetProperty`, for the integer properties listed below |
 | `GetLiveFilesMetaData()`, `LiveFileMetaData` | `GetLiveFilesMetaData`: name, family, level, size, smallest and largest key, sequence numbers, entries |
 | `ColumnFamilyOptions.WriteBufferSize` (default 64 MB) | `write_buffer_size` |

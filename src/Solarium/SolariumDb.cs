@@ -43,7 +43,8 @@ namespace Solarium;
 public sealed class SolariumDb : IDisposable
 {
     private const string FormatFileName = "FORMAT";
-    private const string FormatVersion = "solarium-format 5";
+    private const string FormatVersion = "solarium-format 6";
+    private const string FormatVersion5 = "solarium-format 5";
     private const string FormatVersion4 = "solarium-format 4";
     private const string FormatVersion3 = "solarium-format 3";
     private const string FormatVersion2 = "solarium-format 2";
@@ -2701,7 +2702,7 @@ public sealed class SolariumDb : IDisposable
         foreach (long listed in _manifest.WalNumbers)
         {
             if (Array.BinarySearch(numbers, listed) < 0)
-                throw new SolariumException(
+                throw SolariumException.Corruption(
                     $"WAL file {WalPath(listed)} is missing. The manifest lists it as holding data that no SSTable has.");
         }
 
@@ -2750,14 +2751,14 @@ public sealed class SolariumDb : IDisposable
             {
                 bool continuous = expected == 0 ? firstSequence <= flushed + 1 : firstSequence == expected;
                 if (!continuous)
-                    throw new SolariumException(
+                    throw SolariumException.Corruption(
                         $"The WAL in '{_directory}' is missing writes before sequence number {firstSequence}: a WAL file was lost or is damaged.");
 
                 long sequence = firstSequence;
                 foreach (WalOperation operation in operations)
                 {
                     if ((uint)operation.FamilyId >= (uint)_byId.Length || _byId[operation.FamilyId] is not { } family)
-                        throw new SolariumException($"The WAL refers to column family id {operation.FamilyId}, which the manifest does not list.");
+                        throw SolariumException.Corruption($"The WAL in '{_directory}' refers to column family id {operation.FamilyId}, which the manifest does not list.");
 
                     // Data that an SSTable already holds: a WAL file can outlive the flush of its data.
                     if (sequence > family.Record.FlushedSequence)
@@ -3165,21 +3166,33 @@ public sealed class SolariumDb : IDisposable
             foreach (ManifestTable entry in record.Tables)
             {
                 IStorageFile file = _environment.OpenFile(TablePath(entry.Number));
+                TableReader table;
                 try
                 {
-                    byLevel[entry.Level].Add(TableReader.Open(entry.Number, file, Caching(options, entry.Level)));
+                    table = TableReader.Open(entry.Number, file, Caching(options, entry.Level));
                 }
                 catch
                 {
                     file.Dispose();
                     throw;
                 }
+
+                // A whole table file that another valid one replaced, an older table or one of another database,
+                // passes every checksum of its own: only the manifest's record of the table tells it apart.
+                if (entry.Mismatch(table.Properties) is { } mismatch)
+                {
+                    table.Dispose();
+                    throw SolariumException.Corruption(
+                        $"SSTable {TablePath(entry.Number)} of column family '{record.Name}' is not the table the manifest records: {mismatch}.");
+                }
+
+                byLevel[entry.Level].Add(table);
             }
 
             for (int level = 1; level < byLevel.Length; level++)
                 for (int i = 1; i < byLevel[level].Count; i++)
                     if (byLevel[level][i - 1].Properties.Overlaps(byLevel[level][i].Properties))
-                        throw new SolariumException(
+                        throw SolariumException.Corruption(
                             $"SSTables {byLevel[level][i - 1].Number} and {byLevel[level][i].Number} of column family '{record.Name}' in '{_directory}' overlap at level {level}.");
         }
         catch
@@ -3303,14 +3316,16 @@ public sealed class SolariumDb : IDisposable
         string version = Encoding.UTF8.GetString(DurableFiles.ReadAllBytes(environment, path));
         if (version == FormatVersion1)
             MigrateFromFormat1(environment, directory);
-        else if (version == FormatVersion2 || version == FormatVersion3 || version == FormatVersion4)
+        else if (version == FormatVersion2 || version == FormatVersion3 || version == FormatVersion4 || version == FormatVersion5)
         {
             // Format 3 differs from 2 in new WAL files only, which have a header and durable offsets;
             // the files of format 2 replay as WAL version 1. Format 4 differs from 3 in new SSTables
             // only, version 3, whose data blocks have a type and may be compressed; version 2 tables
             // still read. Format 5 differs from 4 in new SSTables only, version 4, whose index and
-            // filter are partitioned; version 3 and 2 tables still read, as one partition. FORMAT
-            // changes first, so a version of Solarium that reads an older format never sees a WAL
+            // filter are partitioned; version 3 and 2 tables still read, as one partition. Format 6
+            // differs from 5 in new SSTables, version 5, whose block checksums are bound to the table
+            // and the offset, and in the manifest, version 4, which records each table's id; version
+            // 4 and older tables still read, and a version 3 manifest still loads. FORMAT changes first, so a version of Solarium that reads an older format never sees a WAL
             // file it would cut as a torn tail, or a table it cannot read.
             DurableFiles.ReplaceText(environment, path, FormatVersion);
         }
@@ -3350,7 +3365,7 @@ public sealed class SolariumDb : IDisposable
             .Where(name => name is not ("LOCK" or FormatFileName) && !name.EndsWith(".tmp", StringComparison.Ordinal))
             .Order(StringComparer.Ordinal)];
         if (unknown.Length > 0)
-            throw new SolariumException(
+            throw SolariumException.Corruption(
                 $"'{directory}' has no {Manifest.FileName} but holds {string.Join(", ", unknown.Take(5))}{(unknown.Length > 5 ? $" and {unknown.Length - 5} more" : "")}; " +
                 $"it is a database whose {Manifest.FileName} is lost, and it is not opened so that nothing in it is deleted.");
 

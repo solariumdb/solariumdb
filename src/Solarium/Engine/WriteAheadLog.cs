@@ -135,7 +135,7 @@ internal sealed class WriteAheadLog : IDisposable
             if (!cleanEnd)
             {
                 if (!tolerateTornTail)
-                    throw new SolariumException(
+                    throw SolariumException.Corruption(
                         $"The WAL is corrupt at offset {recordOffset}, in a file that a newer WAL file follows. " +
                         "That file was flushed before the next one started, so this is not the result of a crash.");
 
@@ -143,12 +143,12 @@ internal sealed class WriteAheadLog : IDisposable
                 {
                     long proof = DurableOffsetAfter(file, recordOffset, fileLength, lastSequence);
                     if (proof >= 0)
-                        throw new SolariumException(
+                        throw SolariumException.Corruption(
                             $"The WAL is corrupt at offset {recordOffset}, which the intact record at offset {proof} shows had been flushed. " +
                             "No crash explains this; the database refuses to open rather than drop the data after it.");
                 }
                 else if (!IsTornTail(file, result, recordOffset, size, fileLength))
-                    throw new SolariumException(
+                    throw SolariumException.Corruption(
                         $"The WAL is corrupt at offset {recordOffset}, with intact data after it, so the database refuses to open rather than drop that data. " +
                         "This file was written before WAL records said what was flushed: a power loss can leave this when the device wrote the unsynced end out of order, " +
                         "but so can damage to flushed data.");
@@ -416,7 +416,7 @@ internal sealed class WriteAheadLog : IDisposable
         }
         catch (Exception e) when (e is InvalidDataException or ArgumentOutOfRangeException)
         {
-            throw new SolariumException($"The WAL record at offset {recordOffset} has a valid checksum but does not decode: {e.Message}", e);
+            throw SolariumException.Corruption($"The WAL record at offset {recordOffset} has a valid checksum but does not decode: {e.Message}", e);
         }
     }
 

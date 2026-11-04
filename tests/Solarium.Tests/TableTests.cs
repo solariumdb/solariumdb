@@ -240,11 +240,7 @@ public sealed class TableTests : IDisposable
     }
 
     // The offset and size (with its CRC) of the block that footer handle i names.
-    private static (int Offset, int Size) Handle(byte[] table, int i)
-    {
-        int footer = table.Length - TableFormat.FooterSize;
-        return ((int)BitConverter.ToInt64(table, footer + (i * 12)), BitConverter.ToInt32(table, footer + (i * 12) + 8));
-    }
+    private static (int Offset, int Size) Handle(byte[] table, int i) => TableBytes.FooterHandle(table, i);
 
     // The offset and size (with its CRC) of index partition p's block, from its top-level index entry:
     // [u32 length][last key][u64 last sequence][u64 index offset][u32 index size][u64 filter offset][u32 filter size].
@@ -259,11 +255,8 @@ public sealed class TableTests : IDisposable
         return ((int)BitConverter.ToInt64(table, at + 4 + key + 8), BitConverter.ToInt32(table, at + 4 + key + 16));
     }
 
-    // Writes the CRC of a block whose payload was changed, so only its decoder can find the change.
-    private static void Reseal(byte[] table, int offset, int size)
-    {
-        BitConverter.TryWriteBytes(table.AsSpan(offset + size - 4, 4), Crc32.HashToUInt32(table.AsSpan(offset, size - 4)));
-    }
+    // Writes the checksum of a block whose payload was changed, so only its decoder can find the change.
+    private static void Reseal(byte[] table, int offset, int size) => TableBytes.Reseal(table, offset, size);
 
     private TableReader Build(EnvironmentScope scope, MemTable memTable)
     {

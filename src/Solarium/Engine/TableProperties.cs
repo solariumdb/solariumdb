@@ -5,10 +5,11 @@ namespace Solarium.Engine;
 /// to <see cref="Largest"/>, which is included unless <see cref="LargestIsExclusive"/>: the largest bound
 /// is then the end of a range tombstone, which covers keys below it only, and no entry of the table has
 /// that key. Two tables of a sorted level can then meet at one key without overlapping, as RocksDB's
-/// files meet at a range tombstone's sentinel key.
+/// files meet at a range tombstone's sentinel key. <see cref="Id"/> is the random id in the table's footer
+/// (<see cref="TableFormat"/>), or 0 for a table of a version before 5, which has none.
 /// </summary>
 internal sealed record TableProperties(long Size, long EntryCount, long MinSequence, long MaxSequence, byte[] Smallest, byte[] Largest,
-    bool LargestIsExclusive)
+    bool LargestIsExclusive, ulong Id)
 {
     /// <summary>
     /// Whether a table whose last entry has the user key <paramref name="lastKey"/> (null: no entry) and

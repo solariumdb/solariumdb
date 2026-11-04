@@ -29,7 +29,8 @@ internal sealed class TableReader : IEntrySource, IDisposable
     private const int IndexHandle = 3;
 
     private readonly IStorageFile _file;
-    private readonly long _length;
+    private readonly long _blocksEnd;   // where the footer starts: no block handle reaches past it
+    private readonly ulong _id;         // the table id in the footer, bound into every block's checksum; 0 before version 5
     private readonly TablePartitions _partitions;
     private readonly byte[]? _lastKey;   // the last key of the last block, the table's last key with a version
     private readonly IndexAndFilter[]? _resident;   // null when a cache holds the partitions
@@ -44,13 +45,14 @@ internal sealed class TableReader : IEntrySource, IDisposable
     private int _references;   // Interlocked: the versions that list the table and are not closed
     private int _disposed;     // Interlocked
 
-    private TableReader(long number, IStorageFile file, long length, TablePartitions partitions, IndexAndFilter[] blocks, TableCaching caching,
+    private TableReader(long number, IStorageFile file, long blocksEnd, TablePartitions partitions, IndexAndFilter[] blocks, TableCaching caching,
         RangeTombstone[] tombstones, TableProperties properties, bool typedBlocks)
     {
         Number = number;
         _typedBlocks = typedBlocks;
         _file = file;
-        _length = length;
+        _blocksEnd = blocksEnd;
+        _id = properties.Id;
         _partitions = partitions;
         _lastKey = partitions.Count == 0 ? null : partitions.Index.LastKey(partitions.Count - 1).ToArray();
         _tombstones = tombstones;
@@ -127,44 +129,65 @@ internal sealed class TableReader : IEntrySource, IDisposable
         try
         {
             long length = file.GetLength();
-            if (length < TableFormat.FooterSize)
+            if (length < TableFormat.FooterSize4)
                 throw Corrupt(number, "the file is shorter than its footer");
 
-            byte[] footer = new byte[TableFormat.FooterSize];
-            ReadExactly(file, footer, length - TableFormat.FooterSize, number);
-            if (ReadUInt64LittleEndian(footer.AsSpan(56)) != TableFormat.Magic)
+            // The magic and the version are at the same place from the end in every version, and the version
+            // says how long the footer is: a version 5 footer has the table id before the handles.
+            int footerRead = (int)Math.Min(length, TableFormat.FooterSize);
+            byte[] footer = new byte[footerRead];
+            ReadExactly(file, footer, length - footerRead, number);
+            byte[] handles = footer[(footerRead - TableFormat.FooterSize4)..];
+            if (ReadUInt64LittleEndian(handles.AsSpan(56)) != TableFormat.Magic)
                 throw Corrupt(number, "the magic number does not match");
 
-            if (Crc32.HashToUInt32(footer.AsSpan(0, 52)) != ReadUInt32LittleEndian(footer.AsSpan(52)))
+            uint version = ReadUInt32LittleEndian(handles.AsSpan(48));
+            ulong id = 0;
+            int footerSize = TableFormat.FooterSize4;
+            ReadOnlySpan<byte> checksummed = handles.AsSpan(0, 52);
+            if (version == TableFormat.Version)
+            {
+                if (footerRead < TableFormat.FooterSize)
+                    throw Corrupt(number, "the file is shorter than its footer");
+
+                id = ReadUInt64LittleEndian(footer);
+                footerSize = TableFormat.FooterSize;
+                checksummed = footer.AsSpan(0, TableFormat.FooterSize - 12);   // the id, the handles and the version
+            }
+
+            if (Crc32.HashToUInt32(checksummed) != ReadUInt32LittleEndian(handles.AsSpan(52)))
                 throw Corrupt(number, "the footer has a bad checksum");
 
-            uint version = ReadUInt32LittleEndian(footer.AsSpan(48));
-            if (version != TableFormat.Version && version != TableFormat.Version3 && version != TableFormat.Version2)
+            if (version != TableFormat.Version && version != TableFormat.Version4 && version != TableFormat.Version3 && version != TableFormat.Version2)
                 throw Corrupt(number, $"format version {version} is not supported");
 
-            RangeTombstone[] tombstones = DecodeTombstones(ReadFooterBlock(file, number, footer, length, 0));
-            TableProperties properties = DecodeProperties(ReadFooterBlock(file, number, footer, length, 2), length);
+            if (version == TableFormat.Version && id == 0)
+                throw Corrupt(number, "the footer has table id 0");
+
+            long blocksEnd = length - footerSize;
+            RangeTombstone[] tombstones = DecodeTombstones(ReadFooterBlock(file, number, id, handles, blocksEnd, 0));
+            TableProperties properties = DecodeProperties(ReadFooterBlock(file, number, id, handles, blocksEnd, 2), length, id);
 
             TablePartitions partitions;
             IndexAndFilter[] blocks;
-            if (version == TableFormat.Version)
+            if (version is TableFormat.Version or TableFormat.Version4)
             {
-                partitions = DecodeTopLevel(ReadFooterBlock(file, number, footer, length, IndexHandle), number, length);
+                partitions = DecodeTopLevel(ReadFooterBlock(file, number, id, handles, blocksEnd, IndexHandle), number, blocksEnd);
                 blocks = new IndexAndFilter[partitions.Count];
                 for (int partition = 0; partition < blocks.Length; partition++)
                 {
-                    blocks[partition] = ReadPartition(file, number, partitions, partition, length);
+                    blocks[partition] = ReadPartition(file, number, id, partitions, partition, blocksEnd);
                     CheckPartition(number, partitions, partition, blocks[partition].Index);
                 }
             }
             else
             {
                 // One index and one filter block: one partition, whose last key is the index's.
-                (long filterOffset, int filterSize) = FooterHandle(footer, FilterHandle);
-                (long indexOffset, int indexSize) = FooterHandle(footer, IndexHandle);
+                (long filterOffset, int filterSize) = FooterHandle(handles, FilterHandle);
+                (long indexOffset, int indexSize) = FooterHandle(handles, IndexHandle);
                 IndexAndFilter whole = new(
-                    DecodeIndex(ReadBlockAt(file, number, indexOffset, indexSize, length), number, length),
-                    BloomFilter.Decode(ReadBlockAt(file, number, filterOffset, filterSize, length)));
+                    DecodeIndex(ReadBlockAt(file, number, id, indexOffset, indexSize, blocksEnd), number, blocksEnd),
+                    BloomFilter.Decode(ReadBlockAt(file, number, id, filterOffset, filterSize, blocksEnd)));
                 int count = whole.Index.Count;
                 partitions = count == 0
                     ? new TablePartitions(new TableIndex([], [0], [], [], []), [], [])
@@ -178,7 +201,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
             // The top-level index holds the last key of the last block, the table's last entry.
             int partitionCount = partitions.Count;
             properties = properties with { LargestIsExclusive = TableProperties.IsExclusive(partitionCount == 0 ? null : partitions.Index.LastKey(partitionCount - 1).ToArray(), properties.Largest) };
-            return new TableReader(number, file, length, partitions, blocks, caching, tombstones, properties, version != TableFormat.Version2);
+            return new TableReader(number, file, blocksEnd, partitions, blocks, caching, tombstones, properties, version != TableFormat.Version2);
         }
         catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException)
         {
@@ -223,7 +246,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
         if (block == index.Count)
             return false;
 
-        handle = new DataBlockHandle(block, index.Offset(block), index.Size(block));
+        handle = new DataBlockHandle(index, partition, block);
         return true;
     }
 
@@ -278,12 +301,15 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
     /// <summary>
     /// The entries of the data block <paramref name="handle"/> names, from its bytes as the file has them: the first
-    /// <paramref name="bytesRead"/> of <paramref name="raw"/>, which must be the whole block. Verifies and
-    /// decompresses it. Returns <paramref name="raw"/> when the block is not compressed, else a buffer rented from
+    /// <paramref name="bytesRead"/> of <paramref name="raw"/>, which must be the whole block. Verifies it, decompresses
+    /// it, and checks its keys against its index entry. Returns <paramref name="raw"/> when the block is not compressed, else a buffer rented from
     /// <see cref="ArrayPool{T}.Shared"/> that the caller returns; the entries are its first
     /// <paramref name="length"/> bytes. The caller keeps <paramref name="raw"/> either way.
     /// </summary>
-    /// <exception cref="SolariumException">The file ended before the block did, or the block fails its checksum or does not decompress.</exception>
+    /// <exception cref="SolariumException">
+    /// A corruption: the file ended before the block did, or the block fails its checksum, does not decompress or
+    /// decode, or holds keys of another place than its index entry's.
+    /// </exception>
     public byte[] DecodeReadBlock(byte[] raw, int bytesRead, DataBlockHandle handle, out int length)
     {
         if (bytesRead < handle.Size)
@@ -342,7 +368,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
         TableIndex index = Partition(partition, fillCache).Index;
         int low = index.FindBlockAtOrAfter(limit);
-        BlockBuffer block = DataBlock(new DataBlockHandle(low, index.Offset(low), index.Size(low)), fillCache);
+        BlockBuffer block = DataBlock(new DataBlockHandle(index, partition, low), fillCache);
         try
         {
             SpanReader reader = new(block.Entries);
@@ -401,7 +427,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
                 stop.ThrowIfCancellationRequested();
                 int read = _file.Read(buffer.AsSpan(0, (int)Math.Min(buffer.Length, size - offset)), offset);
                 if (read == 0)
-                    throw new SolariumException($"SSTable {Number} ended at {offset} bytes of {size} while it was copied.");
+                    throw SolariumException.Corruption($"SSTable {TableFormat.FileName(Number)} ended at {offset} bytes of {size} while it was copied.");
 
                 target.Write(buffer.AsSpan(0, read), offset);
                 offset += read;
@@ -470,7 +496,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
         IndexAndFilter blocks;
         try
         {
-            blocks = ReadPartition(_file, Number, _partitions, partition, _length);
+            blocks = ReadPartition(_file, Number, _id, _partitions, partition, _blocksEnd);
         }
         catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException)
         {
@@ -511,11 +537,12 @@ internal sealed class TableReader : IEntrySource, IDisposable
         return new BlockBuffer(inserted);
     }
 
-    // Decode every entry of a block into entries (cleared first). Keys and values are copied out.
-    private void DecodeDataBlock(TableIndex index, int block, bool fillCache, List<Entry> entries)
+    // Decode every entry of block `block` of partition `partition`, whose index is `index`, into entries (cleared
+    // first). Keys and values are copied out.
+    private void DecodeDataBlock(TableIndex index, int partition, int block, bool fillCache, List<Entry> entries)
     {
         entries.Clear();
-        BlockBuffer buffer = DataBlock(new DataBlockHandle(block, index.Offset(block), index.Size(block)), fillCache);
+        BlockBuffer buffer = DataBlock(new DataBlockHandle(index, partition, block), fillCache);
         try
         {
             SpanReader reader = new(buffer.Entries);
@@ -558,15 +585,84 @@ internal sealed class TableReader : IEntrySource, IDisposable
         }
     }
 
-    // The entries of the data block whose bytes, checksum included, are the first handle.Size of raw: raw itself
-    // when the block is not compressed, else a buffer rented from ArrayPool<byte>.Shared that the caller returns.
-    // The caller keeps raw either way.
+    // The entries of the data block whose bytes, checksum included, are the first handle.Size of raw, checked
+    // against the block's index entry: raw itself when the block is not compressed, else a buffer rented from
+    // ArrayPool<byte>.Shared that the caller returns. The caller keeps raw either way. Every block that a read takes
+    // from the file comes through here before it reaches a cache, so a cached block is a checked one.
     private byte[] DecodeBlock(byte[] raw, DataBlockHandle handle, out int length)
+    {
+        byte[] entries = DecompressBlock(raw, handle, out length);
+        try
+        {
+            CheckBounds(entries.AsSpan(0, length), handle);
+            return entries;
+        }
+        catch
+        {
+            if (!ReferenceEquals(entries, raw))
+                ArrayPool<byte>.Shared.Return(entries);
+
+            throw;
+        }
+    }
+
+    // A data block's entries must lie where its index entry places it: its last entry is the last internal key the
+    // index holds for it, and its first comes after the last key of the block before it, in this partition or at the
+    // end of the one before. A whole, valid block that a misdirected write put at another block's place passes the
+    // checksum of a table before version 5, and would answer a lookup for its own keys with "not found", or a scan
+    // with another range's rows: as damage it fails here instead.
+    private void CheckBounds(ReadOnlySpan<byte> entries, DataBlockHandle handle)
+    {
+        int block = handle.Block;
+        long offset = handle.Offset;
+        TableIndex index = handle.Index;
+        ReadOnlySpan<byte> firstKey;
+        long firstSequence;
+        ReadOnlySpan<byte> lastKey;
+        long lastSequence;
+        try
+        {
+            SpanReader reader = new(entries);
+            if (reader.AtEnd)
+                throw Corrupt(Number, $"data block {block} at offset {offset} has no entries");
+
+            firstKey = reader.Span();
+            firstSequence = reader.Int64();
+            reader.EntryKind();
+            reader.Span();
+            lastKey = firstKey;
+            lastSequence = firstSequence;
+            while (!reader.AtEnd)
+            {
+                lastKey = reader.Span();
+                lastSequence = reader.Int64();
+                reader.EntryKind();
+                reader.Span();
+            }
+        }
+        catch (ArgumentOutOfRangeException e)
+        {
+            throw DataBlockCorrupt(block, offset, e);
+        }
+
+        if (!lastKey.SequenceEqual(index.LastKey(block)) || lastSequence != index.LastSequence(block))
+            throw Corrupt(Number, $"data block {block} at offset {offset} of index partition {handle.Partition} ends at another key than its index entry holds; it holds another place's data");
+
+        bool hasPrevious = block > 0 || handle.Partition > 0;
+        ReadOnlySpan<byte> previousKey = block > 0 ? index.LastKey(block - 1) : hasPrevious ? _partitions.Index.LastKey(handle.Partition - 1) : default;
+        long previousSequence = block > 0 ? index.LastSequence(block - 1) : hasPrevious ? _partitions.Index.LastSequence(handle.Partition - 1) : 0;
+        if (hasPrevious && InternalKey.Compare(firstKey, firstSequence, previousKey, previousSequence) <= 0)
+            throw Corrupt(Number, $"data block {block} at offset {offset} of index partition {handle.Partition} starts at or before the last key of the block before it; it holds another place's data");
+    }
+
+    // The entries of the data block whose bytes, checksum included, are the first handle.Size of raw, verified and
+    // decompressed, as DecodeBlock returns them.
+    private byte[] DecompressBlock(byte[] raw, DataBlockHandle handle, out int length)
     {
         int size = handle.Size;
         long offset = handle.Offset;
         int block = handle.Block;
-        if (Crc32.HashToUInt32(raw.AsSpan(0, size - 4)) != ReadUInt32LittleEndian(raw.AsSpan(size - 4)))
+        if (TableFormat.BlockChecksum(raw.AsSpan(0, size - 4), _id, offset) != ReadUInt32LittleEndian(raw.AsSpan(size - 4)))
             throw Corrupt(Number, $"the block at offset {offset} has a bad checksum");
 
         if (!_typedBlocks)
@@ -637,34 +733,34 @@ internal sealed class TableReader : IEntrySource, IDisposable
         }
     }
 
-    // The offset and size of the block that footer handle `handle` names.
-    private static (long Offset, int Size) FooterHandle(byte[] footer, int handle) =>
-        (ReadInt64LittleEndian(footer.AsSpan(handle * 12)), ReadInt32LittleEndian(footer.AsSpan((handle * 12) + 8)));
+    // The offset and size of the block that footer handle `handle` names, from the footer's 48 bytes of handles.
+    private static (long Offset, int Size) FooterHandle(byte[] handles, int handle) =>
+        (ReadInt64LittleEndian(handles.AsSpan(handle * 12)), ReadInt32LittleEndian(handles.AsSpan((handle * 12) + 8)));
 
     // The payload of the block at footer handle `handle`, read and verified.
-    private static byte[] ReadFooterBlock(IStorageFile file, long number, byte[] footer, long length, int handle)
+    private static byte[] ReadFooterBlock(IStorageFile file, long number, ulong id, byte[] handles, long blocksEnd, int handle)
     {
-        (long offset, int size) = FooterHandle(footer, handle);
-        return ReadBlockAt(file, number, offset, size, length);
+        (long offset, int size) = FooterHandle(handles, handle);
+        return ReadBlockAt(file, number, id, offset, size, blocksEnd);
     }
 
-    // The payload of the block at (offset, size), read and verified.
-    private static byte[] ReadBlockAt(IStorageFile file, long number, long offset, int size, long length)
+    // The payload of the block at (offset, size) of table `id`, read and verified.
+    private static byte[] ReadBlockAt(IStorageFile file, long number, ulong id, long offset, int size, long blocksEnd)
     {
-        CheckHandle(number, offset, size, length - TableFormat.FooterSize);
+        CheckHandle(number, offset, size, blocksEnd);
         byte[] block = new byte[size];
-        ReadVerifiedBlock(file, number, offset, block);
+        ReadVerifiedBlock(file, number, id, offset, block);
         return block[..^4];
     }
 
     // A partition's filter and index blocks, read, verified and decoded.
-    private static IndexAndFilter ReadPartition(IStorageFile file, long number, TablePartitions partitions, int partition, long length) =>
-        new(DecodeIndex(ReadBlockAt(file, number, partitions.Index.Offset(partition), partitions.Index.Size(partition), length), number, length),
-            BloomFilter.Decode(ReadBlockAt(file, number, partitions.FilterOffset(partition), partitions.FilterSize(partition), length)));
+    private static IndexAndFilter ReadPartition(IStorageFile file, long number, ulong id, TablePartitions partitions, int partition, long blocksEnd) =>
+        new(DecodeIndex(ReadBlockAt(file, number, id, partitions.Index.Offset(partition), partitions.Index.Size(partition), blocksEnd), number, blocksEnd),
+            BloomFilter.Decode(ReadBlockAt(file, number, id, partitions.FilterOffset(partition), partitions.FilterSize(partition), blocksEnd)));
 
     // An index block, decoded into the compact index: the last keys laid end to end in one array, measured in a
-    // first pass over the block.
-    private static TableIndex DecodeIndex(byte[] payload, long number, long length)
+    // first pass over the block. No handle may reach past blocksEnd, where the footer starts.
+    private static TableIndex DecodeIndex(byte[] payload, long number, long blocksEnd)
     {
         SpanReader reader = new(payload);
         int count = reader.Count(IndexEntrySize);
@@ -696,15 +792,15 @@ internal sealed class TableReader : IEntrySource, IDisposable
             lastSequences[i] = reader.Int64();
             offsets[i] = reader.Int64();
             sizes[i] = reader.Int32();
-            CheckHandle(number, offsets[i], sizes[i], length - TableFormat.FooterSize);
+            CheckHandle(number, offsets[i], sizes[i], blocksEnd);
         }
 
         keyStarts[count] = position;
         return new TableIndex(keys, keyStarts, lastSequences, offsets, sizes);
     }
 
-    // The top-level index of a version 4 table: each partition's last key and the handles of its index and filter.
-    private static TablePartitions DecodeTopLevel(byte[] payload, long number, long length)
+    // The top-level index of a version 5 or 4 table: each partition's last key and the handles of its index and filter.
+    private static TablePartitions DecodeTopLevel(byte[] payload, long number, long blocksEnd)
     {
         SpanReader reader = new(payload);
         int count = reader.Count(TopLevelEntrySize);
@@ -742,8 +838,8 @@ internal sealed class TableReader : IEntrySource, IDisposable
             indexSizes[i] = reader.Int32();
             filterOffsets[i] = reader.Int64();
             filterSizes[i] = reader.Int32();
-            CheckHandle(number, indexOffsets[i], indexSizes[i], length - TableFormat.FooterSize);
-            CheckHandle(number, filterOffsets[i], filterSizes[i], length - TableFormat.FooterSize);
+            CheckHandle(number, indexOffsets[i], indexSizes[i], blocksEnd);
+            CheckHandle(number, filterOffsets[i], filterSizes[i], blocksEnd);
         }
 
         keyStarts[count] = position;
@@ -759,11 +855,12 @@ internal sealed class TableReader : IEntrySource, IDisposable
             throw Corrupt(number, $"index partition {partition} at offset {partitions.Index.Offset(partition)} does not end at the key the top-level index holds for it");
     }
 
-    // Read a whole block (payload and checksum) into block, and verify the checksum.
-    private static void ReadVerifiedBlock(IStorageFile file, long number, long offset, Span<byte> block)
+    // Read a whole block (payload and checksum) of table `id` into block, and verify the checksum, which binds the
+    // block to the table and the offset from version 5.
+    private static void ReadVerifiedBlock(IStorageFile file, long number, ulong id, long offset, Span<byte> block)
     {
         ReadExactly(file, block, offset, number);
-        if (Crc32.HashToUInt32(block[..^4]) != ReadUInt32LittleEndian(block[^4..]))
+        if (TableFormat.BlockChecksum(block[..^4], id, offset) != ReadUInt32LittleEndian(block[^4..]))
             throw Corrupt(number, $"the block at offset {offset} has a bad checksum");
     }
 
@@ -798,22 +895,22 @@ internal sealed class TableReader : IEntrySource, IDisposable
         return tombstones;
     }
 
-    private static TableProperties DecodeProperties(byte[] payload, long size)
+    private static TableProperties DecodeProperties(byte[] payload, long size, ulong id)
     {
         SpanReader reader = new(payload);
-        TableProperties properties = new(size, reader.Int64(), reader.Int64(), reader.Int64(), reader.Bytes(), reader.Bytes(), LargestIsExclusive: false);
+        TableProperties properties = new(size, reader.Int64(), reader.Int64(), reader.Int64(), reader.Bytes(), reader.Bytes(), LargestIsExclusive: false, id);
         reader.ExpectEnd();
         return properties;
     }
 
     private static SolariumException Corrupt(long number, string detail)
     {
-        return new SolariumException($"SSTable {TableFormat.FileName(number)} is corrupt: {detail}.");
+        return SolariumException.Corruption($"SSTable {TableFormat.FileName(number)} is corrupt: {detail}.");
     }
 
     private SolariumException DataBlockCorrupt(int block, long offset, ArgumentOutOfRangeException cause)
     {
-        return new SolariumException($"SSTable {TableFormat.FileName(Number)} is corrupt: data block {block} at offset {offset} has a valid checksum but does not decode: {cause.Message}", cause);
+        return SolariumException.Corruption($"SSTable {TableFormat.FileName(Number)} is corrupt: data block {block} at offset {offset} has a valid checksum but does not decode: {cause.Message}", cause);
     }
 
     // Holds one decoded block at a time, in a list it reuses, and the index of the partition it reads, which it
@@ -885,7 +982,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
                 {
                     _partition = partition;
                     _block = block;
-                    table.DecodeDataBlock(index, block, fillCache, _entries);
+                    table.DecodeDataBlock(index, partition, block, fillCache, _entries);
                     return;
                 }
 

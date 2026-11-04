@@ -30,7 +30,7 @@ internal static class ColumnFamilyCatalog
         {
             string[] parts = line.Split('\t');
             if (parts.Length != 2 || !int.TryParse(parts[0], out int id) || id < 0 || id > Manifest.MaxFamilyId || !families.TryAdd(id, parts[1]))
-                throw new SolariumException($"'{path}' is corrupt at line '{line}'.");
+                throw SolariumException.Corruption($"'{path}' is corrupt at line '{line}'.");
         }
 
         return families;

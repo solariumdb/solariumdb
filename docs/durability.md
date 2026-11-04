@@ -28,6 +28,15 @@ A process crash can only cut the last write short. A power loss can also lose an
 
 The cut can drop a synced write only when flushed data was damaged in a way no crash causes, and no record after it was written: damage inside the last synced group of the file, with nothing appended since. Then nothing in the file shows that the group had been flushed. RocksDB's two recovery modes for this case are `TolerateCorruptedTailRecords`, which Kommander uses and which fails the open after any power loss that left such a hole, and `PointInTimeRecovery`, which drops everything after the first damage whatever its cause. The power-loss test opens after every kind of loss it simulates.
 
+## Damage to the SSTables
+
+A table file is written once, flushed before the manifest names it, and never written again, so damage to it is never a crash's torn tail: whatever a read finds wrong is corruption, which throws `SolariumException` with `IsCorruption` set and names the file and the offset. A retry fails the same way; the data must come from another copy. What is checked:
+
+- At open, the footer (its magic, version and CRC-32) and every block but the data blocks, each against its checksum, and each index partition against the key the top-level index holds for it. The table must then be the one the manifest records: the same table id (from table version 5, when the manifest records one), size, entry count, sequence numbers and key range. A table file that another, whole and valid one replaced, an older table of the same size or the same-numbered table of another database, fails here, before the open replays the WAL or saves the manifest, so every file the manifest lists stays as it was.
+- At each read of a data block from the file, by `Get`, `MultiGet`, an iterator or a compaction: its checksum, bound in table version 5 to the table's id and the block's offset, so a block copied from another place of the table or from another table fails it; its decoding, every length, count and entry kind; and its keys against its index entry, the last one equal to it and the first after the block before it, which finds a misplaced block in a table of any version. A block that a cache holds passed these checks before it went in.
+
+A read that hits corruption fails, and nothing else changes: other keys still read. A compaction that hits it stops the database's writes, as any compaction failure does.
+
 ## How it is tested
 
 [testing.md](testing.md) describes the power-loss and kill tests that check these rules.

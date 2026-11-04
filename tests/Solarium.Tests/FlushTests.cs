@@ -605,7 +605,7 @@ public sealed class FlushTests : IDisposable
             db.Put(B("a"), B("1"));
 
         Assert.False(File.Exists(Path.Combine(DbPath, "FORMAT.tmp")));
-        Assert.Equal("solarium-format 5", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
+        Assert.Equal("solarium-format 6", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
         using SolariumDb reopened = SolariumDb.Open(DbPath);
         Assert.Equal("1", S(reopened.Get(B("a"))));
     }
@@ -665,7 +665,7 @@ public sealed class FlushTests : IDisposable
             db.Put(B("c"), B("3"));
         }
 
-        Assert.Equal("solarium-format 5", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
+        Assert.Equal("solarium-format 6", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
         using SolariumDb reopened = SolariumDb.Open(DbPath);
         Assert.Equal(["a=1", "b=2", "c=3"], Scan(reopened));
     }
@@ -689,7 +689,7 @@ public sealed class FlushTests : IDisposable
             db.Put(B("a"), B("2"));
         }
 
-        Assert.Equal("solarium-format 5", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
+        Assert.Equal("solarium-format 6", File.ReadAllText(Path.Combine(DbPath, "FORMAT")));
         Assert.False(File.Exists(Path.Combine(DbPath, "COLUMN_FAMILIES")));
         Assert.False(File.Exists(Path.Combine(DbPath, "wal.log")));
 

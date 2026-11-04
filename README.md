@@ -60,6 +60,7 @@ Solarium is young, and its on-disk format may still change. Done:
 - the embedded API, column families, atomic batches across them, `DeleteRange`, and iterators with an upper bound;
 - group commit with pipelined writes, and lock-free reads on a skip-list memtable;
 - WAL recovery that cuts a torn tail and refuses damage to flushed data, checked by power-loss and kill tests;
+- SSTable checksums bound to each block's table and offset, data blocks checked against their index entries, and opens that refuse a table file the manifest does not record, all reported as corruption (`SolariumException.IsCorruption`);
 - memtable flushes to SSTables, LZ4 block compression, WAL rotation with a size cap, the manifest, leveled compaction into RocksDB's seven levels with its dynamic level sizing and concurrent compactions, a rate limiter and `bytes_per_sync` for flushes and compactions, a memtable budget shared across databases (`WriteBufferManager`), a block cache that bounds the memory of the tables' index and filter blocks, can hold the memtable budget too, and caches data blocks when asked, `DeleteFilesInRange`, checkpoints, and write stalls;
 - the RocksDB properties and live-file metadata that Kommander reads;
 - `Solarium.Kommander`, which passes Kommander's conformance suite for WAL backends and the behavior tests of its RocksDB backend, runs three-node Kommander clusters in the tests, and publishes the engine `raft.wal.*` metrics;
