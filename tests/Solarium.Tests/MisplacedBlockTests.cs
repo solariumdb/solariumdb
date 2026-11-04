@@ -239,6 +239,43 @@ public sealed class MisplacedBlockTests : IDisposable
         Assert.Equal(Value("a", 5), S(entry.Value));
     }
 
+    // A version 5 data block names its last entry, so the check against its index entry decodes that entry
+    // alone: a name that is not the block's last entry, under a checksum valid for it, is damage too.
+    [Theory]
+    [MemberData(nameof(Environments.Available), MemberType = typeof(Environments))]
+    public void A_data_block_that_names_another_entry_than_its_last_fails_every_read_as_corruption(string environment)
+    {
+        using EnvironmentScope scope = Environments.Create(environment);
+        string table = WriteStore(scope, DbPath, "a");
+        byte[] original = File.ReadAllBytes(table);
+        (int offset, int size) = TableBytes.DataBlocks(original)[1];
+        int payload = size - TableFormat.DataTrailerSize;
+        const int Entry = 4 + 5 + 13 + ValueSize;
+        Assert.Equal(payload - Entry, BitConverter.ToInt32(original, offset + payload));
+
+        (int LastEntry, string Detail)[] cases =
+        [
+            (payload - (2 * Entry), "but an entry there does not end the block"),
+            (0, "names its first entry as its last"),
+            (payload, "not between the end of its first entry"),
+            (Entry - 1, "not between the end of its first entry"),
+            (payload - Entry + 1, "does not decode"),
+            (-1, "names its last entry at -1"),
+        ];
+
+        foreach ((int lastEntry, string detail) in cases)
+        {
+            byte[] bytes = (byte[])original.Clone();
+            BitConverter.TryWriteBytes(bytes.AsSpan(offset + payload, 4), lastEntry);
+            TableBytes.Reseal(bytes, offset, size);
+            File.WriteAllBytes(table, bytes);
+
+            using SolariumDb db = SolariumDb.Open(DbPath, Options(scope));
+            AssertEveryReadIsCorruption(db, B("a0040"), detail);
+            Assert.Equal(Value("a", 5), S(db.Get(B("a0005"))));
+        }
+    }
+
     // The corruption flag that tells damage apart from a failure of the storage, which the next open clears.
     [Fact]
     public void Corruption_is_flagged_and_a_storage_failure_is_not()

@@ -42,14 +42,16 @@ internal sealed class TableReader : IEntrySource, IDisposable
     private readonly RangeTombstone[] _tombstones;
     private readonly FragmentedTombstones? _fragments;   // past MemTable.LinearTombstoneLimit tombstones
     private readonly bool _typedBlocks;   // format version 3 and later: a data block ends with a type byte before its CRC-32
+    private readonly bool _lastEntryOffsets;   // format version 5: a data block's trailer holds the offset of its last entry
     private int _references;   // Interlocked: the versions that list the table and are not closed
     private int _disposed;     // Interlocked
 
     private TableReader(long number, IStorageFile file, long blocksEnd, TablePartitions partitions, IndexAndFilter[] blocks, TableCaching caching,
-        RangeTombstone[] tombstones, TableProperties properties, bool typedBlocks)
+        RangeTombstone[] tombstones, TableProperties properties, uint version)
     {
         Number = number;
-        _typedBlocks = typedBlocks;
+        _typedBlocks = version != TableFormat.Version2;
+        _lastEntryOffsets = version == TableFormat.Version;
         _file = file;
         _blocksEnd = blocksEnd;
         _id = properties.Id;
@@ -201,7 +203,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
             // The top-level index holds the last key of the last block, the table's last entry.
             int partitionCount = partitions.Count;
             properties = properties with { LargestIsExclusive = TableProperties.IsExclusive(partitionCount == 0 ? null : partitions.Index.LastKey(partitionCount - 1).ToArray(), properties.Largest) };
-            return new TableReader(number, file, blocksEnd, partitions, blocks, caching, tombstones, properties, version != TableFormat.Version2);
+            return new TableReader(number, file, blocksEnd, partitions, blocks, caching, tombstones, properties, version);
         }
         catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException)
         {
@@ -591,10 +593,10 @@ internal sealed class TableReader : IEntrySource, IDisposable
     // from the file comes through here before it reaches a cache, so a cached block is a checked one.
     private byte[] DecodeBlock(byte[] raw, DataBlockHandle handle, out int length)
     {
-        byte[] entries = DecompressBlock(raw, handle, out length);
+        byte[] entries = DecompressBlock(raw, handle, out length, out int lastEntry);
         try
         {
-            CheckBounds(entries.AsSpan(0, length), handle);
+            CheckBounds(entries.AsSpan(0, length), handle, lastEntry);
             return entries;
         }
         catch
@@ -610,8 +612,10 @@ internal sealed class TableReader : IEntrySource, IDisposable
     // index holds for it, and its first comes after the last key of the block before it, in this partition or at the
     // end of the one before. A whole, valid block that a misdirected write put at another block's place passes the
     // checksum of a table before version 5, and would answer a lookup for its own keys with "not found", or a scan
-    // with another range's rows: as damage it fails here instead.
-    private void CheckBounds(ReadOnlySpan<byte> entries, DataBlockHandle handle)
+    // with another range's rows: as damage it fails here instead. A version 5 block names its last entry at
+    // lastEntry, so the check decodes two entries, and the last must end where the block does; an older block
+    // (lastEntry -1) is walked to its end.
+    private void CheckBounds(ReadOnlySpan<byte> entries, DataBlockHandle handle, int lastEntry)
     {
         int block = handle.Block;
         long offset = handle.Offset;
@@ -632,12 +636,33 @@ internal sealed class TableReader : IEntrySource, IDisposable
             reader.Span();
             lastKey = firstKey;
             lastSequence = firstSequence;
-            while (!reader.AtEnd)
+            if (lastEntry > 0)
             {
+                if (lastEntry < reader.Position || lastEntry >= entries.Length)
+                    throw Corrupt(Number, $"data block {block} at offset {offset} names its last entry at {lastEntry}, not between the end of its first entry at {reader.Position} and the end of its {entries.Length} bytes of entries");
+
+                reader = new SpanReader(entries[lastEntry..]);
                 lastKey = reader.Span();
                 lastSequence = reader.Int64();
                 reader.EntryKind();
                 reader.Span();
+                if (!reader.AtEnd)
+                    throw Corrupt(Number, $"data block {block} at offset {offset} names its last entry at {lastEntry}, but an entry there does not end the block");
+            }
+            else if (lastEntry == 0)
+            {
+                if (!reader.AtEnd)
+                    throw Corrupt(Number, $"data block {block} at offset {offset} names its first entry as its last, but the entry does not end the block");
+            }
+            else
+            {
+                while (!reader.AtEnd)
+                {
+                    lastKey = reader.Span();
+                    lastSequence = reader.Int64();
+                    reader.EntryKind();
+                    reader.Span();
+                }
             }
         }
         catch (ArgumentOutOfRangeException e)
@@ -657,7 +682,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
     // The entries of the data block whose bytes, checksum included, are the first handle.Size of raw, verified and
     // decompressed, as DecodeBlock returns them.
-    private byte[] DecompressBlock(byte[] raw, DataBlockHandle handle, out int length)
+    private byte[] DecompressBlock(byte[] raw, DataBlockHandle handle, out int length, out int lastEntry)
     {
         int size = handle.Size;
         long offset = handle.Offset;
@@ -665,17 +690,27 @@ internal sealed class TableReader : IEntrySource, IDisposable
         if (TableFormat.BlockChecksum(raw.AsSpan(0, size - 4), _id, offset) != ReadUInt32LittleEndian(raw.AsSpan(size - 4)))
             throw Corrupt(Number, $"the block at offset {offset} has a bad checksum");
 
+        lastEntry = -1;
         if (!_typedBlocks)
         {
             length = size - 4;
             return raw;
         }
 
-        if (size < 5)
-            throw Corrupt(Number, $"data block {block} at offset {offset} has no type");
+        int trailer = _lastEntryOffsets ? TableFormat.DataTrailerSize : TableFormat.DataTrailerSize4;
+        if (size < trailer)
+            throw Corrupt(Number, $"data block {block} at offset {offset} is {size} bytes, shorter than its {trailer} byte trailer");
 
-        int payload = size - 5;
-        byte type = raw[payload];
+        // The type is the byte before the CRC-32 in every version that has one.
+        int payload = size - trailer;
+        byte type = raw[size - 5];
+        if (_lastEntryOffsets)
+        {
+            lastEntry = ReadInt32LittleEndian(raw.AsSpan(payload));
+            if (lastEntry < 0)
+                throw Corrupt(Number, $"data block {block} at offset {offset} names its last entry at {lastEntry}");
+        }
+
         if (type == TableFormat.RawBlock)
         {
             length = payload;
@@ -1036,6 +1071,8 @@ internal sealed class TableReader : IEntrySource, IDisposable
         private int _position;
 
         public readonly bool AtEnd => _position == _data.Length;
+
+        public readonly int Position => _position;
 
         public byte Byte()
         {

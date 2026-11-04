@@ -44,6 +44,7 @@ internal sealed class TableBuilder : IDisposable
     private byte[]? _smallest;
     private byte[]? _largest;
     private Entry _lastInBlock;
+    private int _lastInBlockOffset;   // where the open block's last entry starts among its entries
     private byte[] _compressed = [];   // the size prefix and the LZ4 bytes of the last data block, reused
 
     /// <summary>
@@ -105,6 +106,7 @@ internal sealed class TableBuilder : IDisposable
         _entryCount++;
 
         int valueLength = entry.Value?.Length ?? 0;
+        _lastInBlockOffset = _block.WrittenCount;
         Span<byte> span = _block.GetSpan(4 + entry.Key.Length + 13 + valueLength);
         WriteInt32LittleEndian(span, entry.Key.Length);
         entry.Key.CopyTo(span[4..]);
@@ -234,8 +236,8 @@ internal sealed class TableBuilder : IDisposable
         _partitionBlocks = 0;
     }
 
-    // A data block: the entries, or their LZ4 block when it is worth it, then the type and the CRC-32
-    // of both, bound to the table and the block's offset. Kept raw unless compression saves an eighth, as RocksDB's GoodCompressionRatio: a
+    // A data block: the entries, or their LZ4 block when it is worth it, then the offset of the last entry among
+    // the entries, the type, and the CRC-32 of all three, bound to the table and the block's offset. Kept raw unless compression saves an eighth, as RocksDB's GoodCompressionRatio: a
     // block that barely shrinks would cost a decompression on every read for almost nothing.
     private (long Offset, int Size) WriteDataBlock(ReadOnlySpan<byte> entries)
     {
@@ -259,12 +261,13 @@ internal sealed class TableBuilder : IDisposable
         long offset = _offset;
         Append(payload);
 
-        Span<byte> trailer = stackalloc byte[5];
-        trailer[0] = type;
+        Span<byte> trailer = stackalloc byte[TableFormat.DataTrailerSize];
+        WriteInt32LittleEndian(trailer, _lastInBlockOffset);
+        trailer[4] = type;
         _crc.Reset();
         _crc.Append(payload);
-        _crc.Append(trailer[..1]);
-        WriteUInt32LittleEndian(trailer[1..], _crc.GetCurrentHashAsUInt32() ^ TableFormat.ChecksumModifier(_id, offset));
+        _crc.Append(trailer[..5]);
+        WriteUInt32LittleEndian(trailer[5..], _crc.GetCurrentHashAsUInt32() ^ TableFormat.ChecksumModifier(_id, offset));
         Append(trailer);
 
         return (offset, payload.Length + trailer.Length);

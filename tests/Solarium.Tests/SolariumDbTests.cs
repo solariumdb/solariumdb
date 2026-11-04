@@ -1147,15 +1147,17 @@ public sealed class SolariumDbTests : IDisposable
         }
 
         // The first data block starts the file: [key length 1]["a"][sequence][kind][value length 1]["b"],
-        // then its type (raw) and its CRC, which covers the type. A key length of 7 takes the "a" and 6
-        // bytes of the sequence, so the sequence takes the rest, and the kind is past the end.
+        // then the offset of its last entry (0), its type (raw) and its CRC, which covers both. A key length
+        // of 7 takes the "a" and 6 bytes of the sequence, so the sequence takes the rest, and the kind is
+        // past the end.
         string table = Assert.Single(Directory.GetFiles(DbPath, "*.sst"));
         byte[] bytes = File.ReadAllBytes(table);
         Assert.Equal(1, BitConverter.ToInt32(bytes, 0));
         const int Payload = 4 + 1 + 8 + 1 + 4 + 1;
-        Assert.Equal(0, bytes[Payload]);
+        Assert.Equal(0, BitConverter.ToInt32(bytes, Payload));
+        Assert.Equal(TableFormat.RawBlock, bytes[Payload + 4]);
         BitConverter.TryWriteBytes(bytes.AsSpan(0, 4), 7);
-        TableBytes.Reseal(bytes, 0, Payload + 5);
+        TableBytes.Reseal(bytes, 0, Payload + TableFormat.DataTrailerSize);
         File.WriteAllBytes(table, bytes);
 
         using SolariumDb damaged = SolariumDb.Open(DbPath, scope.Options());
