@@ -1,7 +1,7 @@
 // Copied without changes from Kommander (https://github.com/kahunakv/kommander), MIT License,
 // Copyright (c) 2025 Andres Gutierrez: Kommander.Tests/WAL/WalConformanceTests.cs at commit 1bee500,
-// the commit that set version 1.11.3; the file is unchanged at ead1e6b, which set 1.12.0, the version
-// Solarium.Kommander references. Only the abstract suite is copied; the subclasses for Kommander's
+// the commit that set version 1.11.3; the abstract suite is unchanged at d44cf2f, which set 1.13.2, the
+// version Solarium.Kommander references. Only the abstract suite is copied; the subclasses for Kommander's
 // own backends are left out. Copy it again, whole, when the package moves to a newer Kommander.
 
 

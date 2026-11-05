@@ -164,6 +164,21 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     private bool disposed;
 
     /// <summary>
+    /// The storage damage this store fail-stopped on, or null while it is healthy. Set exactly once
+    /// (compare-exchange from null) by <see cref="FailStop(string, Exception?)"/>; read lock-free on every
+    /// fence entry. A damaged store is never reopened and never served again in this process: the files
+    /// stay as they are for forensics, and the repair is the operator's (restore the store from a backup,
+    /// or move it aside so the node is rebuilt from its peers).
+    /// </summary>
+    private StorageCorruptionException? corruptionFailure;
+
+    /// <summary>
+    /// The store identity row (<see cref="PersistentStoreIdentity"/>), in the reserved '\0' namespace so
+    /// every user scan is inert to it, like the pruned-history floor and the tilde registry.
+    /// </summary>
+    private static ReadOnlySpan<byte> StoreIdentityKeyUtf8 => "\0store_identity"u8;
+
+    /// <summary>
     /// Reports write failures that this backend converts into a <c>false</c> return — see the
     /// store methods' failure contract. Never null (falls back to <see cref="NullLogger"/>).
     /// </summary>
@@ -421,9 +436,32 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         this.writeBufferManager = writeBufferManager;
         this.logger = logger ?? NullLogger.Instance;
 
-        db = OpenStore(out columnFamilyKeys, out columnFamilyLocks);
+        try
+        {
+            db = OpenStore(out columnFamilyKeys, out columnFamilyLocks);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            // A store whose files fail their checks at open (a damaged WAL record with intact records after
+            // it, a table that is not the one the manifest records) is refused, not opened short: the
+            // constructor fails, so the node does not start over it.
+            throw FailStop(Evidence(ex), ex);
+        }
 
-        InitializeTildeRegistry();
+        try
+        {
+            InitializeTildeRegistry();
+            ValidateDurabilityFloors();
+        }
+        catch (Exception ex)
+        {
+            // The constructor is the only owner; releasing the database here frees the path's LOCK file.
+            db.Dispose();
+            if (IsCorruption(ex))
+                throw FailStop(Evidence(ex), ex);
+
+            throw;
+        }
     }
 
     /// <summary>
@@ -581,6 +619,11 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     /// </summary>
     private void EnterDbFence()
     {
+        // Fail-stopped on damage: refused before the fence, so the answer is the same whether the database
+        // is still open (damage found on a read or a write) or closed (damage found on a reopen).
+        if (Volatile.Read(ref corruptionFailure) is { } corruption)
+            throw Refusal(corruption);
+
         swapFence.EnterReadLock();
 
         if (storageUnavailable)
@@ -592,6 +635,101 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     }
 
     private void ExitDbFence() => swapFence.ExitReadLock();
+
+    // ── Fail-stop on storage damage ──────────────────────────────────────────────────────────
+    //
+    // Solarium reports damage it finds as a SolariumException with IsCorruption set, the equivalent of
+    // RocksDB's Corruption status: a block that fails its checksum or does not decode, a block that holds
+    // another place's data, a table that is not the one the manifest records, a damaged WAL record with
+    // intact records after it. Every path to the database can meet it: a point read or MultiGet of a
+    // damaged block, an iterator that reaches one (a Solarium iterator throws there; it never ends short
+    // as if the range had ended), a write refused because a compaction met damage, and the open itself.
+    // Each one fail-stops the store: the first damage wins, and from then on every operation is refused
+    // at the fence with the same StorageCorruptionException, stores return false, and the ENOSPC
+    // recovery declines to close or reopen the database, so the files are left exactly as they are.
+    //
+    // This is deliberately not a reopen-and-retry: the ENOSPC recovery exists because a full volume is
+    // transient, while damage is not; a reopen would meet it again on the next read or compaction.
+
+    /// <summary>True when <paramref name="ex"/> is a failure that Solarium classifies as damage to the store's files.</summary>
+    private static bool IsCorruption(Exception? ex) => ex is SolariumException { IsCorruption: true };
+
+    /// <summary>
+    /// Latches the fail-stop once (the first damage wins; later ones are the same damage seen again),
+    /// with one Critical line naming the store directory and the evidence, and returns the exception
+    /// every refused operation throws from now on. Idempotent and lock-free, so it is safe from any read
+    /// or write path and from inside an exception filter.
+    /// </summary>
+    private StorageCorruptionException FailStop(string evidence, Exception? cause = null)
+    {
+        string storePath = Path.Combine(path, dbRevision);
+        StorageCorruptionException failure = new(
+            storePath,
+            $"The Solarium store at '{storePath}' is fail-stopped on storage damage and refuses every operation until an operator repairs or replaces it: {evidence}",
+            cause);
+
+        StorageCorruptionException? first = Interlocked.CompareExchange(ref corruptionFailure, failure, null);
+        if (first is not null)
+            return Refusal(first);
+
+        logger.LogCritical(cause,
+            "Solarium store at {Path}/{Revision} is fail-stopped on storage damage: {Evidence}. Every operation is refused and the files are left as they are; restore the store from a backup, or move it aside so the node is rebuilt from its peers",
+            path, dbRevision, evidence);
+
+        return failure;
+    }
+
+    /// <summary>
+    /// The messages of <paramref name="ex"/> and of the Solarium failures inside it, outermost first. A write
+    /// refused after a compaction met damage says only that writes stopped; the damaged file and offset are in
+    /// the failures it wraps, and the fail-stop reason must name them.
+    /// </summary>
+    private static string Evidence(Exception ex)
+    {
+        StringBuilder text = new(ex.Message);
+        for (Exception? inner = ex.InnerException; inner is SolariumException; inner = inner.InnerException)
+            text.Append(": ").Append(inner.Message);
+
+        return text.ToString();
+    }
+
+    /// <summary>
+    /// A fresh exception carrying the latched failure, so concurrent refusals never throw one shared
+    /// instance (a thrown exception records its stack on itself). Only ever built on the refusal path.
+    /// </summary>
+    private static StorageCorruptionException Refusal(StorageCorruptionException latched) =>
+        new(latched.StorePath, latched.Message, latched.InnerException);
+
+    /// <summary>
+    /// For the store paths, whose contract is a <c>false</c> return rather than a throw: latches the
+    /// fail-stop when <paramref name="ex"/> is storage damage, so the writer's next attempt is refused at
+    /// the fence instead of touching the database again.
+    /// </summary>
+    private void NoteStoreFailure(Exception ex)
+    {
+        if (IsCorruption(ex))
+            FailStop(Evidence(ex), ex);
+    }
+
+    /// <summary>
+    /// Enters the fence for a store method, whose contract is "false on failure": false, with nothing
+    /// entered, when the store is fail-stopped. Every other failure to enter throws, as it always did.
+    /// </summary>
+    private bool TryEnterDbFenceForStore()
+    {
+        try
+        {
+            EnterDbFence();
+            return true;
+        }
+        catch (StorageCorruptionException)
+        {
+            return false;
+        }
+    }
+
+    /// <inheritdoc />
+    public string? GetFailStopReason() => Volatile.Read(ref corruptionFailure)?.Message;
 
     /// <summary>
     /// Reopen preflight: a reopen while the volume is still (nearly) full cannot succeed — Solarium
@@ -639,6 +777,16 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     /// </summary>
     public bool TryRecoverFromStorageFailure()
     {
+        // Damage is not what this recovery is for: a reopen would meet it again on the next read or
+        // compaction. The store stays as it is (open or closed) and keeps refusing at the fence.
+        if (Volatile.Read(ref corruptionFailure) is { } corruption)
+        {
+            logger.LogWarning(
+                "Solarium store at {Path}/{Revision} declines the storage-failure recovery: it is fail-stopped on storage damage, which a reopen does not repair: {Message}",
+                path, dbRevision, corruption.Message);
+            return false;
+        }
+
         if (!HasFreeSpaceForReopen())
         {
             logger.LogWarning(
@@ -676,7 +824,19 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
                 try
                 {
                     db = OpenStore(out columnFamilyKeys, out columnFamilyLocks);
-                    InitializeTildeRegistry();
+                    try
+                    {
+                        InitializeTildeRegistry();
+                        ValidateDurabilityFloors();
+                    }
+                    catch
+                    {
+                        // The store stays closed (storageUnavailable), so nothing else would release the
+                        // database this attempt opened, nor the LOCK file a later attempt needs.
+                        db.Dispose();
+                        throw;
+                    }
+
                     ClearPruneMemos();
                     ResetSweepQuiescence();
                     storageUnavailable = false;
@@ -692,6 +852,16 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
                     logger.LogError(ex,
                         "SolariumDb store at {Path}/{Revision} failed reopen attempt {Attempt}/{Max}",
                         path, dbRevision, attempt, RecoveryReopenAttempts);
+
+                    // A reopen that fails on damage fails the same way every time; stop retrying it. The
+                    // store stays closed and fail-stopped, and every caller is refused at the fence.
+                    if (IsCorruption(ex) || ex is StorageCorruptionException)
+                    {
+                        if (IsCorruption(ex))
+                            FailStop(Evidence(ex), ex);
+
+                        return false;
+                    }
 
                     if (attempt < RecoveryReopenAttempts)
                         Thread.Sleep(200 * attempt);
@@ -713,6 +883,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         {
             lock (_floorLock)
                 return CurrentPrunedFloorLocked();
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
         }
         finally
         {
@@ -759,8 +933,9 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
                 else
                     _prunedFloorCorrupt = true;
             }
-            catch
+            catch (Exception ex)
             {
+                NoteStoreFailure(ex);
                 _prunedFloorCorrupt = true;
             }
         }
@@ -819,10 +994,19 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
 
     public bool StoreDurabilityFloors(IReadOnlyList<(int PartitionId, long Floor)> floors)
     {
-        EnterDbFence();
+        // "false on failure" contract: once the store is fail-stopped the fence refuses the write before
+        // the body runs, and that refusal is a failed store, not a throw.
+        if (!TryEnterDbFenceForStore())
+            return false;
+
         try
         {
             return StoreDurabilityFloorsFenced(floors);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            FailStop(Evidence(ex), ex);
+            return false;
         }
         finally
         {
@@ -864,6 +1048,7 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         }
         catch (Exception ex)
         {
+            NoteStoreFailure(ex);
             logger.LogError(ex, "SolariumDb write of {Count} durability floors failed", floors.Count);
             return false;
         }
@@ -877,8 +1062,125 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         try
         {
             byte[]? data = db.Get(Encoding.UTF8.GetBytes(DurabilityFloorKeyPrefix + partitionId), columnFamilyKeys);
+            if (data is null)
+                return -1;
 
-            return data is { Length: 8 } ? BinaryPrimitives.ReadInt64LittleEndian(data) : -1;
+            // A floor row that is not exactly 8 bytes is damage to the store's own bookkeeping, not an
+            // absent floor: reading it as "no floor" would let the restart replay only the suffix the
+            // WAL still holds over rows this store may have, or may not have.
+            if (data.Length != 8)
+                throw FailStop($"the durability floor row of partition #{partitionId} holds {data.Length} bytes; expected 8");
+
+            return BinaryPrimitives.ReadInt64LittleEndian(data);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>True: every floor the node gives is stored, so a data partition without one was never flushed here.</remarks>
+    public bool KeepsDurabilityFloors => true;
+
+    /// <summary>
+    /// Refuses a store whose durability floor rows cannot be decoded. Runs at every open (the constructor
+    /// and the recovery reopen), before any floor is consulted, so a damaged row fails the open with a
+    /// clear message instead of being read as "no floor" at the restart replay. The rows are few (one per
+    /// partition this node ever flushed for), so the scan costs nothing measurable. No fence: no reader
+    /// exists yet (constructor), or every reader is blocked on the fence's write side (recovery).
+    /// </summary>
+    private void ValidateDurabilityFloors()
+    {
+        using Iterator iterator = db.NewIterator(columnFamilyKeys);
+        for (iterator.Seek(DurabilityFloorKeyPrefixUtf8); iterator.Valid() && iterator.Key().StartsWith(DurabilityFloorKeyPrefixUtf8); iterator.Next())
+            if (iterator.Value().Length != 8)
+                throw FailStop($"the durability floor row '{Encoding.UTF8.GetString(iterator.Key())}' holds {iterator.Value().Length} bytes; expected 8");
+    }
+
+    /// <inheritdoc />
+    public bool SupportsStoreIdentity => true;
+
+    /// <inheritdoc />
+    /// <exception cref="StorageCorruptionException">The identity row does not decode, or the store is fail-stopped.</exception>
+    public PersistentStoreIdentity? GetStoreIdentity()
+    {
+        EnterDbFence();
+        try
+        {
+            byte[]? data = db.Get(StoreIdentityKeyUtf8, columnFamilyKeys);
+            if (data is null)
+                return null;
+
+            if (!PersistentStoreIdentity.TryDecode(data, out PersistentStoreIdentity? identity))
+                throw FailStop($"the store identity row holds {data.Length} bytes that do not decode as an identity");
+
+            return identity;
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    /// <inheritdoc />
+    public bool WriteStoreIdentity(PersistentStoreIdentity identity)
+    {
+        if (!TryEnterDbFenceForStore())
+            return false;
+
+        try
+        {
+            // Synced: the identity is what tells a wiped store from a fresh one at the next open, so it
+            // must not be lost to a crash right after the first open.
+            db.Put(StoreIdentityKeyUtf8, identity.Encode(), columnFamilyKeys, DefaultWriteOptions);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            NoteStoreFailure(ex);
+            logger.LogError(ex, "SolariumDb write of the store identity failed");
+            return false;
+        }
+        finally
+        {
+            ExitDbFence();
+        }
+    }
+
+    /// <summary>
+    /// True when the store holds a key-value row, a lock row or a durability floor: anything a node wrote,
+    /// as opposed to the internal '\0' markers (the identity, the tilde registry, the pruned-history floor)
+    /// and the legacy pruned-history floor.
+    /// </summary>
+    public bool HoldsDurableState()
+    {
+        EnterDbFence();
+        try
+        {
+            using (Iterator iterator = db.NewIterator(columnFamilyKeys))
+                for (iterator.SeekToFirst(); iterator.Valid(); iterator.Next())
+                {
+                    ReadOnlySpan<byte> rawKey = iterator.Key();
+                    if ((rawKey.Length == 0 || rawKey[0] != 0) && !rawKey.SequenceEqual(LegacyPrunedFloorKeyUtf8))
+                        return true;
+                }
+
+            using Iterator locks = db.NewIterator(columnFamilyLocks);
+            locks.SeekToFirst();
+            return locks.Valid();
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
         }
         finally
         {
@@ -894,6 +1196,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
             db.Delete(Encoding.UTF8.GetBytes(DurabilityFloorKeyPrefix + partitionId), columnFamilyKeys);
             return true;
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -907,10 +1213,19 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     /// <returns>Returns <c>true</c> if the operation completes successfully.</returns>
     public bool StoreLocks(List<PersistenceRequestItem> items)
     {
-        EnterDbFence();
+        // "false on failure" contract: once the store is fail-stopped the fence refuses the write before
+        // the body runs, and that refusal is a failed store, not a throw.
+        if (!TryEnterDbFenceForStore())
+            return false;
+
         try
         {
             return StoreLocksFenced(items);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            FailStop(Evidence(ex), ex);
+            return false;
         }
         finally
         {
@@ -955,6 +1270,7 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         }
         catch (Exception ex)
         {
+            NoteStoreFailure(ex);
             logger.LogError(ex, "SolariumDb write of {Count} locks failed", items.Count);
             return false;
         }
@@ -1026,10 +1342,19 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     /// <returns>Returns <c>true</c> if the operation is successfully completed.</returns>
     public bool StoreKeyValues(List<PersistenceRequestItem> items)
     {
-        EnterDbFence();
+        // "false on failure" contract: once the store is fail-stopped the fence refuses the write before
+        // the body runs, and that refusal is a failed store, not a throw.
+        if (!TryEnterDbFenceForStore())
+            return false;
+
         try
         {
             return StoreKeyValuesFenced(items);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            FailStop(Evidence(ex), ex);
+            return false;
         }
         finally
         {
@@ -1083,6 +1408,7 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         }
         catch (Exception ex)
         {
+            NoteStoreFailure(ex);
             logger.LogError(ex, "SolariumDb read of {Count} current heads failed", currentCandidates.Count);
             return false;
         }
@@ -1155,6 +1481,7 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         }
         catch (Exception ex)
         {
+            NoteStoreFailure(ex);
             logger.LogError(ex, "SolariumDb read of guarded history rows failed");
             return false;
         }
@@ -1189,6 +1516,7 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         }
         catch (Exception ex)
         {
+            NoteStoreFailure(ex);
             logger.LogError(ex, "SolariumDb write of {Count} key-values failed", items.Count);
             return false;
         }
@@ -1817,6 +2145,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         {
             return GetLockFenced(resource);
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -1884,6 +2216,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         try
         {
             return GetKeyValueFenced(keyName);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
         }
         finally
         {
@@ -1955,6 +2291,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         {
             return GetKeyValuesFenced(keyNames);
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -2007,6 +2347,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         try
         {
             return GetKeyValueRevisionFenced(keyName, revision);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
         }
         finally
         {
@@ -2132,6 +2476,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
 
             return new KeyValueHydration(head, recent);
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -2161,6 +2509,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         try
         {
             return GetKeyValueRevisionAtOrBeforeFenced(keyName, maxRevision, readTimestamp, ref tally);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
         }
         finally
         {
@@ -2329,6 +2681,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         {
             return GetKeyValueByPrefixFenced(prefixKeyName);
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -2417,6 +2773,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         try
         {
             return GetKeyValueByPrefixAtOrBeforeFenced(prefixKeyName, readTimestamp, shouldAbort);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
         }
         finally
         {
@@ -2676,6 +3036,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         {
             return GetKeyValueByRangeFenced(prefix, startKey, null, false, limit, ref tally);
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -2693,6 +3057,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         try
         {
             return GetKeyValueByRangeFenced(prefix, startKey, endKey, endInclusive, limit, ref tally);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
         }
         finally
         {
@@ -2943,6 +3311,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         {
             return ScanKeyValuesFenced(cursor, limit);
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -3017,6 +3389,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         {
             return ScanLocksFenced(cursor, limit);
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -3090,6 +3466,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         {
             return DeleteFamilyRows(keys, columnFamilyKeys);
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -3103,6 +3483,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         try
         {
             return DeleteFamilyRows(resources, columnFamilyLocks);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
         }
         finally
         {
@@ -3414,6 +3798,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         try
         {
             return PruneKeyValueRevisionsFenced(keys, retentionCount, retentionAge, batchSize, floorTimestamp, timeBudget, out result);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
         }
         finally
         {
@@ -3953,6 +4341,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         {
             return CreateCheckpointFenced(destinationPath, appliedIndex, appliedTime, cut, retainKey, ct);
         }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            throw FailStop(Evidence(ex), ex);
+        }
         finally
         {
             ExitDbFence();
@@ -4112,7 +4504,11 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
                     int lastTilde = rawKey.LastIndexOf((byte)'~');
                     if (lastTilde < 0)
                     {
-                        if (retainKey is not null && rawKey.StartsWith(DurabilityFloorKeyPrefixUtf8))
+                        // The identity names the node that owns the live store, never the data: an image
+                        // restored or seeded on another node must not carry it, or that node would refuse
+                        // its own store as foreign. The node that opens the image stamps its own.
+                        if (rawKey.SequenceEqual(StoreIdentityKeyUtf8)
+                            || (retainKey is not null && rawKey.StartsWith(DurabilityFloorKeyPrefixUtf8)))
                         {
                             batch.Delete(rawKey.ToArray(), kv);
                             batchOps++;
@@ -4262,9 +4658,9 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
                     if (rawKey.SequenceEqual(TildeRegistrySentinelKeyUtf8))
                         sourceHasSentinel = true;
                     else if (rawKey.SequenceEqual(PrunedFloorKeyUtf8) || rawKey.SequenceEqual(LegacyPrunedFloorKeyUtf8)
-                             || rawKey.StartsWith(DurabilityFloorKeyPrefixUtf8))
+                             || rawKey.StartsWith(DurabilityFloorKeyPrefixUtf8) || rawKey.SequenceEqual(StoreIdentityKeyUtf8))
                     {
-                        // Combined (the floor) or dropped (durability floors) below.
+                        // Combined (the floor) or dropped (durability floors, the source node's identity) below.
                     }
                     else
                     {

@@ -63,13 +63,13 @@ Solarium is young, and its on-disk format may still change. Done:
 - SSTable checksums bound to each block's table and offset, data blocks checked against their index entries, and opens that refuse a table file the manifest does not record, all reported as corruption (`SolariumException.IsCorruption`);
 - memtable flushes to SSTables, LZ4 block compression, WAL rotation with a size cap, the manifest, leveled compaction into RocksDB's seven levels with its dynamic level sizing and concurrent compactions, a rate limiter and `bytes_per_sync` for flushes and compactions, a memtable budget shared across databases (`WriteBufferManager`), a block cache that bounds the memory of the tables' index and filter blocks, can hold the memtable budget too, and caches data blocks when asked, `DeleteFilesInRange`, checkpoints, and write stalls;
 - the RocksDB properties and live-file metadata that Kommander reads;
-- `Solarium.Kommander`, which passes Kommander's conformance suite for WAL backends and the behavior tests of its RocksDB backend, runs three-node Kommander clusters in the tests, and publishes the engine `raft.wal.*` metrics;
-- `Solarium.Kahuna`, a port of Kahuna's RocksDB persistence backend that passes its behavior tests, with providers that a Kahuna server loads as an extension for `--storage solarium` and `--wal-storage solarium`.
+- `Solarium.Kommander`, which passes Kommander's conformance suite for WAL backends and the behavior tests of its RocksDB backend, runs three-node Kommander clusters in the tests, and publishes the engine `raft.wal.*` metrics, with Kommander's storage-damage contract: the term and vote flushed before they count, the acknowledged-presence watermark, a sync ledger and a hard-state ledger that find a WAL file cut after its fsync, and a fail-stop on corruption;
+- `Solarium.Kahuna`, a port of Kahuna's RocksDB persistence backend that passes its behavior tests, with providers that a Kahuna server loads as an extension for `--storage solarium` and `--wal-storage solarium`, and Kahuna's storage-damage contract: a fail-stop on corruption, declared durability floors, and the store stamped with its node's identity.
 
 Not done yet:
 
 - a block cache that pays for data blocks on stores larger than the cache: with the LRU cache, caching them (`CacheDataBlocks`, off by default) made reads faster on a store that fits in the cache but slower on one ten times its size, so the OS page cache serves them;
-- recovery after a WAL, flush or compaction failure inside the engine: the database refuses all writes until it is opened again (`SolariumWAL` reopens it on its own);
+- recovery after a WAL, flush or compaction failure inside the engine: the database refuses all writes until it is opened again (`SolariumWAL` and the Kahuna store reopen it on their own, except after corruption, on which they fail-stop);
 - subcompactions, which split one large merge across threads, and more than one flush thread.
 
 ## Documentation

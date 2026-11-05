@@ -1,7 +1,8 @@
 // Ported from Kommander's RocksDbWAL (https://github.com/kahunakv/kommander, Kommander/WAL/RocksDbWAL.cs at
-// commit 1bee500), MIT License, Copyright (c) 2025 Andres Gutierrez. The key layout, the row encoding, the
-// metadata keys, the commit frontier and the compaction floor are the same; each RocksDB call is replaced by
-// its Solarium equivalent.
+// commit 1bee500, and its storage-damage contract at commit e2763bc), MIT License, Copyright (c) 2025 Andres
+// Gutierrez. The key layout, the row encoding, the metadata keys, the commit frontier, the compaction floor, the
+// acknowledged-presence watermark, the fail-stop on corruption and the two ledgers are the same; each RocksDB
+// call is replaced by its Solarium equivalent.
 
 using System.Buffers;
 using System.Collections.Concurrent;
@@ -33,7 +34,12 @@ namespace Solarium.Kommander;
 /// <para>A storage failure stops all writes of a Solarium database until it is opened again. After a failed
 /// write, the WAL checks that the file system accepts a small durable write and that the database refuses
 /// one, then closes the database and opens it again, and the write is retried once; every write path is an
-/// idempotent upsert or delete.</para>
+/// idempotent upsert or delete. Damage to the database's files (<see cref="SolariumException.IsCorruption"/>)
+/// is not such a failure: the WAL fail-stops on it (<see cref="GetFailStopReason"/>) and never reopens.</para>
+/// <para>Two files beside the database keep, outside its WAL, what a WAL file truncated after its fsync would
+/// take with it: the sync ledger (<see cref="SolariumSyncLedger"/>), which attests the last synced sequence, and
+/// the hard-state ledger (<see cref="SolariumHardStateLedger"/>), which holds each partition's last term and
+/// vote. See <c>docs/kommander.md</c>.</para>
 /// </remarks>
 public sealed class SolariumWAL : IWAL
 {
@@ -64,6 +70,15 @@ public sealed class SolariumWAL : IWAL
     private const int SpaceProbeBytes = 64 * 1024;
 
     private static readonly byte[] EngineCanaryKey = "kommander_engine_canary"u8.ToArray();
+
+    // The database's identity: a GUID written once, at the first open that found none. The sync ledger records
+    // it, so a ledger copied from another directory is reset instead of believed.
+    private const string EngineIdentityKey = "raft_engine_identity";
+
+    // The persisted lost-synced-writes verdict, "id\nreason". Written when the sync ledger is found ahead of the
+    // database at open and never removed: each partition records the id it reconciled under ReconciledKey, so a
+    // restart before the reconciliation quarantines again, and a later event (a higher id) quarantines anew.
+    private const string LostSyncedWritesKey = "raft_lost_synced_writes";
     private static readonly TimeSpan ProbeInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan SustainedFailureLogInterval = TimeSpan.FromSeconds(30);
 
@@ -111,6 +126,30 @@ public sealed class SolariumWAL : IWAL
     // The highest physically present id of a partition. A value exists only after a scan under the
     // exclusive guard computed it; appends raise it, truncations set or remove it; absent means unknown.
     private readonly ConcurrentDictionary<int, PartitionMaxLog> _maxLogCache = new();
+
+    private readonly ConcurrentDictionary<int, byte[]> _ackedPresenceKeys = new();
+
+    // The persisted acknowledged-presence watermark of each partition (-1: none). Assigned only after the
+    // carrying batch landed, set exactly by the clamping paths under the exclusive write guard, and cleared by a
+    // reopen, which reloads it from the metadata family.
+    private readonly ConcurrentDictionary<int, long> _ackedPresenceCache = new();
+
+    private readonly SolariumSyncLedger _syncLedger;
+    private readonly SolariumHardStateLedger _hardStateLedger;
+
+    // False until the constructor bound the sync ledger to the database. The synced writes of the constructor
+    // itself (the format version, the identity, a verdict) are covered by the binding, which attests the whole
+    // replayed sequence.
+    private volatile bool _syncLedgerReady;
+
+    // The current lost-synced-writes verdict and its reason, cached from LostSyncedWritesKey; -1 for none.
+    private long _lostSyncedWritesVerdict = -1;
+    private string? _lostSyncedWritesReason;
+
+    // The damage this WAL fail-stopped on, or null while it is healthy. Set once, by a compare-exchange from
+    // null, and never cleared: no reopen repairs a damaged file.
+    private Exception? _corruptionFailure;
+    private long _syncMetadataWrites;
 
     private SolariumDb _db;
     private ColumnFamily _metadata;
@@ -182,21 +221,59 @@ public sealed class SolariumWAL : IWAL
         _enginePath = Path.Combine(path, revision);
         EnsureDirectory(_enginePath);
 
-        _db = SolariumDb.Open(_enginePath, _dbOptions, _familyNames);
-        (_metadata, _shards) = Families(_db);
-
-        // A WAL is new when its database holds nothing, not when its directory is missing: a host may
-        // create the directory first, and a crash during the first open can lose the unsynced version
-        // with the directory already there. The version is written synced, before any row, so a
-        // database that holds data without a version has another layout and is refused.
-        string? currentVersion = GetMetaData("version");
-        if (currentVersion is null && IsEmpty())
-            _db.Put(Encoding.UTF8.GetBytes("version"), Encoding.UTF8.GetBytes(FormatVersion), _metadata, WriteOptions.Synced);
-        else if (!string.Equals(currentVersion, FormatVersion, StringComparison.Ordinal))
+        try
         {
+            _db = SolariumDb.Open(_enginePath, _dbOptions, _familyNames);
+        }
+        catch (SolariumException e) when (e.IsCorruption)
+        {
+            // Damage the open's own checks find: nothing here is repaired in place. The node refuses to start
+            // on partial data, and the message names the file, so the operator can move the directory aside
+            // and let the node rebuild from its peers.
+            SolariumWalMetrics.RecordEngineFailStop();
+            _logger.LogCritical(
+                "Solarium WAL at '{Path}' refuses to open on storage damage: {Message}. Move the directory aside and let the node rebuild from its peers",
+                _enginePath, e.Message);
+            throw;
+        }
+
+        (_metadata, _shards) = Families(_db);
+        SolariumSyncLedger? syncLedger = null;
+        SolariumHardStateLedger? hardStateLedger = null;
+        try
+        {
+            // What the database replayed from its files, read before any write of this open: the sync ledger
+            // is compared with exactly this.
+            long replayed = _db.LatestSequenceNumber;
+            syncLedger = SolariumSyncLedger.Open(options.Environment, _enginePath, out SolariumSyncLedger.ReadStatus ledgerStatus, out SolariumSyncLedger.Record ledgerRecord);
+            hardStateLedger = SolariumHardStateLedger.Open(options.Environment, _enginePath);
+            _syncLedger = syncLedger;
+            _hardStateLedger = hardStateLedger;
+
+            // A WAL is new when its database holds nothing, not when its directory is missing: a host may
+            // create the directory first, and a crash during the first open can lose the unsynced version
+            // with the directory already there. The version is written synced, before any row, so a
+            // database that holds data without a version has another layout and is refused. A new
+            // database under a ledger that attests writes is one whose files were lost after their fsync.
+            string? currentVersion = GetMetaData("version");
+            bool empty = currentVersion is null && IsEmpty();
+            bool directoryErased = empty && ledgerStatus == SolariumSyncLedger.ReadStatus.Valid;
+            if (empty)
+                _db.Put(Encoding.UTF8.GetBytes("version"), Encoding.UTF8.GetBytes(FormatVersion), _metadata, WriteOptions.Synced);
+            else if (!string.Equals(currentVersion, FormatVersion, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"Solarium WAL format version '{currentVersion ?? "<missing>"}' in '{_enginePath}' is not compatible with '{FormatVersion}'.");
+
+            LoadLostSyncedWritesVerdict();
+            RestoreHardStateFromLedger();
+            BindSyncLedger(ledgerStatus, in ledgerRecord, replayed, directoryErased);
+        }
+        catch
+        {
+            hardStateLedger?.Dispose();
+            syncLedger?.Dispose();
             _db.Dispose();
-            throw new InvalidOperationException(
-                $"Solarium WAL format version '{currentVersion ?? "<missing>"}' in '{_enginePath}' is not compatible with '{FormatVersion}'.");
+            throw;
         }
 
         WarnIfSharedBudgetStarvesFlushUnit(options);
@@ -248,28 +325,35 @@ public sealed class SolariumWAL : IWAL
     /// <inheritdoc/>
     public List<RaftLog> ReadLogs(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-        List<RaftLog> result = [];
-        ColumnFamily family = Shard(partitionId);
-        long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
-        long commitFrontier = GetCommitFrontier(partitionId);
-
-        // Rows below the compaction floor are logically deleted even while their file is still on disk.
-        using Iterator iterator = NewPartitionBoundedIterator(family, partitionId);
-        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, Math.Max(Math.Max(0, lastCheckpoint), GetCompactionFloor(partitionId)));
-        iterator.Seek(seekKey);
-
-        Span<byte> prefix = stackalloc byte[PartitionPrefixWidth];
-        BuildPartitionPrefix(prefix, partitionId);
-        for (; iterator.Valid() && iterator.Key().StartsWith(prefix); iterator.Next())
+        try
         {
-            ReadLogFromWire(iterator.Value(), out RaftLogWireView view);
-            if (view.Partition == partitionId && view.Id >= lastCheckpoint)
-                result.Add(ToRaftLog(view, commitFrontier));
-        }
+            using EngineLease lease = AcquireEngine();
+            List<RaftLog> result = [];
+            ColumnFamily family = Shard(partitionId);
+            long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
+            long commitFrontier = GetCommitFrontier(partitionId);
 
-        return result;
+            // Rows below the compaction floor are logically deleted even while their file is still on disk.
+            using Iterator iterator = NewPartitionBoundedIterator(family, partitionId);
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, Math.Max(Math.Max(0, lastCheckpoint), GetCompactionFloor(partitionId)));
+            iterator.Seek(seekKey);
+
+            Span<byte> prefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(prefix, partitionId);
+            for (; iterator.Valid() && iterator.Key().StartsWith(prefix); iterator.Next())
+            {
+                ReadLogFromWire(iterator.Value(), out RaftLogWireView view);
+                if (view.Partition == partitionId && view.Id >= lastCheckpoint)
+                    result.Add(ToRaftLog(view, commitFrontier));
+            }
+
+            return result;
+        }
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
     }
 
     /// <inheritdoc/>
@@ -285,158 +369,221 @@ public sealed class SolariumWAL : IWAL
     /// </summary>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries, long maxBytes)
     {
-        using EngineLease lease = AcquireEngine();
-        List<RaftLog> result = maxEntries is > 0 and <= 1024 ? new(maxEntries) : [];
-        ColumnFamily family = Shard(partitionId);
-        long commitFrontier = GetCommitFrontier(partitionId);
-
-        // Clamped at the compaction floor: ids below it read as absent, as when their rows were deleted.
-        using Iterator iterator = NewPartitionBoundedIterator(family, partitionId);
-        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, Math.Max(Math.Max(0, startLogIndex), GetCompactionFloor(partitionId)));
-        iterator.Seek(seekKey);
-
-        Span<byte> prefix = stackalloc byte[PartitionPrefixWidth];
-        BuildPartitionPrefix(prefix, partitionId);
-        long payloadBytes = 0;
-        for (; iterator.Valid() && iterator.Key().StartsWith(prefix); iterator.Next())
+        try
         {
-            ReadLogFromWire(iterator.Value(), out RaftLogWireView view);
-            if (view.Partition != partitionId || view.Id < startLogIndex)
-                continue;
+            using EngineLease lease = AcquireEngine();
+            List<RaftLog> result = maxEntries is > 0 and <= 1024 ? new(maxEntries) : [];
+            ColumnFamily family = Shard(partitionId);
+            long commitFrontier = GetCommitFrontier(partitionId);
 
-            if (result.Count > 0 && payloadBytes + view.Log.Length > maxBytes)
-                break;
+            // Clamped at the compaction floor: ids below it read as absent, as when their rows were deleted.
+            using Iterator iterator = NewPartitionBoundedIterator(family, partitionId);
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, Math.Max(Math.Max(0, startLogIndex), GetCompactionFloor(partitionId)));
+            iterator.Seek(seekKey);
 
-            payloadBytes += view.Log.Length;
-            result.Add(ToRaftLog(view, commitFrontier));
-            if (result.Count >= maxEntries)
-                break;
+            Span<byte> prefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(prefix, partitionId);
+            long payloadBytes = 0;
+            for (; iterator.Valid() && iterator.Key().StartsWith(prefix); iterator.Next())
+            {
+                ReadLogFromWire(iterator.Value(), out RaftLogWireView view);
+                if (view.Partition != partitionId || view.Id < startLogIndex)
+                    continue;
+
+                if (result.Count > 0 && payloadBytes + view.Log.Length > maxBytes)
+                    break;
+
+                payloadBytes += view.Log.Length;
+                result.Add(ToRaftLog(view, commitFrontier));
+                if (result.Count >= maxEntries)
+                    break;
+            }
+
+            return result;
         }
-
-        return result;
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
     }
 
     /// <inheritdoc/>
     public long GetTermAt(int partitionId, long logIndex)
     {
-        using EngineLease lease = AcquireEngine();
+        try
+        {
+            using EngineLease lease = AcquireEngine();
 
-        // Below the compaction floor the row is logically gone whether or not its file was dropped yet.
-        if (logIndex < GetCompactionFloor(partitionId))
-            return -1;
+            // Below the compaction floor the row is logically gone whether or not its file was dropped yet.
+            if (logIndex < GetCompactionFloor(partitionId))
+                return -1;
 
-        Span<byte> key = stackalloc byte[LogKeyWidth];
-        BuildLogKey(key, partitionId, logIndex);
-        byte[]? value = _db.Get(key, Shard(partitionId));
-        return value is null ? -1 : ReadTermFromWire(value);
+            Span<byte> key = stackalloc byte[LogKeyWidth];
+            BuildLogKey(key, partitionId, logIndex);
+            byte[]? value = _db.Get(key, Shard(partitionId));
+            return value is null ? -1 : ReadTermFromWire(value);
+        }
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
     }
 
     /// <inheritdoc/>
     public long GetMaxLog(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-        long floor = GetCompactionFloor(partitionId);
-        if (_maxLogCache.TryGetValue(partitionId, out PartitionMaxLog? cached))
-            return ClampMaxLogAtFloor(Volatile.Read(ref cached.Value), floor);
-
-        // A miss scans under the exclusive guard, so no append or truncation lands between the scan and
-        // the store; the reverse seek is paid once per invalidation, not once per call.
-        _writeGuard.EnterWriteLock();
         try
         {
-            if (_maxLogCache.TryGetValue(partitionId, out cached))
-                return ClampMaxLogAtFloor(cached.Value, floor);
+            using EngineLease lease = AcquireEngine();
+            long floor = GetCompactionFloor(partitionId);
+            if (_maxLogCache.TryGetValue(partitionId, out PartitionMaxLog? cached))
+                return ClampMaxLogAtFloor(Volatile.Read(ref cached.Value), floor);
 
-            long max = ScanMaxLogId(partitionId);
-            _maxLogCache[partitionId] = new PartitionMaxLog(max);
-            return ClampMaxLogAtFloor(max, floor);
+            // A miss scans under the exclusive guard, so no append or truncation lands between the scan and
+            // the store; the reverse seek is paid once per invalidation, not once per call.
+            _writeGuard.EnterWriteLock();
+            try
+            {
+                if (_maxLogCache.TryGetValue(partitionId, out cached))
+                    return ClampMaxLogAtFloor(cached.Value, floor);
+
+                long max = ScanMaxLogId(partitionId);
+                _maxLogCache[partitionId] = new PartitionMaxLog(max);
+                return ClampMaxLogAtFloor(max, floor);
+            }
+            finally
+            {
+                _writeGuard.ExitWriteLock();
+            }
         }
-        finally
+        catch (Exception e) when (LatchIfCorruption(e))
         {
-            _writeGuard.ExitWriteLock();
+            throw;
         }
     }
 
     /// <inheritdoc/>
     public long GetCurrentTerm(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-        using Iterator iterator = _db.NewIterator(Shard(partitionId));
-        SeekToLastPartitionKey(iterator, partitionId);
-        if (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId)
-            && ParseLogIdFromKey(iterator.Key()) >= GetCompactionFloor(partitionId))
+        try
         {
-            ReadHeaderFromWire(iterator.Value(), out _, out _, out long term, out _);
-            return term;
-        }
+            using EngineLease lease = AcquireEngine();
+            using Iterator iterator = _db.NewIterator(Shard(partitionId));
+            SeekToLastPartitionKey(iterator, partitionId);
+            if (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId)
+                && ParseLogIdFromKey(iterator.Key()) >= GetCompactionFloor(partitionId))
+            {
+                ReadHeaderFromWire(iterator.Value(), out _, out _, out long term, out _);
+                return term;
+            }
 
-        return 0;
+            return 0;
+        }
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
     }
 
     /// <inheritdoc/>
     public long GetLastCheckpoint(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-        return GetLastCheckpointFromMeta(partitionId);
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+            return GetLastCheckpointFromMeta(partitionId);
+        }
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
     }
 
     /// <inheritdoc/>
     long IWAL.GetCompactionFloor(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-        return GetCompactionFloor(partitionId);
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+            return GetCompactionFloor(partitionId);
+        }
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
     }
 
     /// <inheritdoc/>
     public int CountPersistedLogs(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
+        try
+        {
+            using EngineLease lease = AcquireEngine();
 
-        // A maintenance scan over the whole partition: no cache fill, so a count never evicts the tail's indexes.
-        using Iterator iterator = NewPartitionBoundedIterator(Shard(partitionId), partitionId, fillCache: false);
-        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
-        iterator.Seek(seekKey);
+            // A maintenance scan over the whole partition: no cache fill, so a count never evicts the tail's indexes.
+            using Iterator iterator = NewPartitionBoundedIterator(Shard(partitionId), partitionId, fillCache: false);
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
+            iterator.Seek(seekKey);
 
-        Span<byte> prefix = stackalloc byte[PartitionPrefixWidth];
-        BuildPartitionPrefix(prefix, partitionId);
-        int count = 0;
-        for (; iterator.Valid() && iterator.Key().StartsWith(prefix); iterator.Next())
-            count++;
+            Span<byte> prefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(prefix, partitionId);
+            int count = 0;
+            for (; iterator.Valid() && iterator.Key().StartsWith(prefix); iterator.Next())
+                count++;
 
-        return count;
+            return count;
+        }
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
     }
 
     /// <inheritdoc/>
     public int CountRemovableLogs(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-        long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
-        if (lastCheckpoint <= 0)
-            return 0;
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+            long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
+            if (lastCheckpoint <= 0)
+                return 0;
 
-        // Bounded at the checkpoint: only the rows below it are removable. No cache fill, as in CountPersistedLogs.
-        using Iterator iterator = NewBoundedIterator(Shard(partitionId), partitionId, lastCheckpoint, fillCache: false);
-        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
-        iterator.Seek(seekKey);
+            // Bounded at the checkpoint: only the rows below it are removable. No cache fill, as in CountPersistedLogs.
+            using Iterator iterator = NewBoundedIterator(Shard(partitionId), partitionId, lastCheckpoint, fillCache: false);
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
+            iterator.Seek(seekKey);
 
-        Span<byte> prefix = stackalloc byte[PartitionPrefixWidth];
-        BuildPartitionPrefix(prefix, partitionId);
-        int count = 0;
-        for (; iterator.Valid() && iterator.Key().StartsWith(prefix) && ParseLogIdFromKey(iterator.Key()) < lastCheckpoint; iterator.Next())
-            count++;
+            Span<byte> prefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(prefix, partitionId);
+            int count = 0;
+            for (; iterator.Valid() && iterator.Key().StartsWith(prefix) && ParseLogIdFromKey(iterator.Key()) < lastCheckpoint; iterator.Next())
+                count++;
 
-        return count;
+            return count;
+        }
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
     }
 
     /// <inheritdoc/>
     public string? GetMetaData(string key)
     {
-        using EngineLease lease = AcquireEngine();
-        byte[]? value = _db.Get(Encoding.UTF8.GetBytes(key), _metadata);
-        return value is not null ? Encoding.UTF8.GetString(value) : null;
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+            byte[]? value = _db.Get(Encoding.UTF8.GetBytes(key), _metadata);
+            return value is not null ? Encoding.UTF8.GetString(value) : null;
+        }
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
     }
 
     // ── Writes ───────────────────────────────────────────────────────────────────────────────────
@@ -450,11 +597,19 @@ public sealed class SolariumWAL : IWAL
     /// flushes the WAL up to and including it. With <c>syncWrites</c> false at construction, every write
     /// is unsynced.
     /// </remarks>
-    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync)
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync) => Write(logs, sync, acknowledgedPresence: null);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The acknowledged-presence watermarks are staged into the same <see cref="WriteBatch"/> as the rows, the
+    /// frontier and the checkpoint, so they land atomically with the entries they describe and cost no write
+    /// of their own. A watermark below 0 is not written.
+    /// </remarks>
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync, IReadOnlyDictionary<int, long>? acknowledgedPresence)
     {
-        RaftOperationStatus status = WriteCore(logs, sync);
+        RaftOperationStatus status = WriteCore(logs, sync, acknowledgedPresence);
         if (status == RaftOperationStatus.Errored && TryRecoverEngineAfterFailure())
-            status = WriteCore(logs, sync);
+            status = WriteCore(logs, sync, acknowledgedPresence);
 
         if (status == RaftOperationStatus.Success)
             NoteStorageSuccess();
@@ -558,7 +713,81 @@ public sealed class SolariumWAL : IWAL
         return result;
     }
 
-    private RaftOperationStatus WriteCore(List<(int, List<RaftLog>)> logs, bool sync)
+    // ── Acknowledged presence ────────────────────────────────────────────────────────────────────
+    //
+    // Per partition, the highest id this node will have reported as contiguously, durably held once the batch
+    // that carries the value has landed: the Raft layer's presence frontier projected over the batch, folded
+    // per partition in submission order, and staged into the same batch as the rows. A restore whose
+    // contiguous frontier falls below it has lost acknowledged entries, and the partition is quarantined
+    // instead of voting from the shorter log. The value is assigned, never maximised: the Raft layer corrects
+    // it downwards after a failed write, and a max would discard that correction. Every path that removes rows
+    // clamps it to what survives (the truncations, a truncating snapshot install) or removes it (a partition
+    // delete), in the batch of the removal. -1 (absent) turns the check off: a fresh partition, or a WAL
+    // written before the watermark existed. An older version of this WAL ignores the key, the conservative way.
+
+    /// <inheritdoc/>
+    public long GetAcknowledgedPresence(int partitionId)
+    {
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+            return GetAckedPresence(partitionId);
+        }
+        catch (Exception e) when (LatchIfCorruption(e))
+        {
+            throw;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Under the exclusive write guard: an assignment from outside a batch must not interleave with a batch that
+    /// stages the same partition's watermark, or the two could land in the other order. Below 0 removes it.
+    /// </remarks>
+    public bool SetAcknowledgedPresence(int partitionId, long value)
+    {
+        bool ok = SetAcknowledgedPresenceCore(partitionId, value);
+        if (!ok && TryRecoverEngineAfterFailure())
+            ok = SetAcknowledgedPresenceCore(partitionId, value);
+
+        if (ok)
+            NoteStorageSuccess();
+
+        return ok;
+    }
+
+    private bool SetAcknowledgedPresenceCore(int partitionId, long value)
+    {
+        try
+        {
+            using EngineLease lease = AcquireEngineForWrite();
+            _writeGuard.EnterWriteLock();
+            try
+            {
+                WriteBatch batch = new();
+                if (value < 0)
+                    batch.Delete(AckedPresenceKey(partitionId), _metadata);
+                else
+                    PutAckedPresenceToBatch(batch, partitionId, value);
+
+                WriteAttested(batch, _writeOptions);
+                _ackedPresenceCache[partitionId] = Math.Max(value, -1);
+                return true;
+            }
+            finally
+            {
+                _writeGuard.ExitWriteLock();
+            }
+        }
+        catch (Exception e) when (e is not ObjectDisposedException)
+        {
+            _logger.LogError("SetAcknowledgedPresence({PartitionId}, {Value}): {Message}", partitionId, value, e.Message);
+            NoteStorageFailure(e);
+            return false;
+        }
+    }
+
+    private RaftOperationStatus WriteCore(List<(int, List<RaftLog>)> logs, bool sync, IReadOnlyDictionary<int, long>? acknowledgedPresence)
     {
         WriteOptions options = sync ? _writeOptions : WriteOptions.Default;
 
@@ -567,7 +796,7 @@ public sealed class SolariumWAL : IWAL
         bool exclusive = ContainsCommittedCheckpoint(logs);
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
             if (exclusive)
                 _writeGuard.EnterWriteLock();
             else
@@ -575,7 +804,9 @@ public sealed class SolariumWAL : IWAL
 
             try
             {
-                return logs is [{ Item2.Count: 1 }] ? WriteOne(logs[0].Item1, logs[0].Item2[0], options) : WriteMany(logs, exclusive, options);
+                return acknowledgedPresence is null && logs is [{ Item2.Count: 1 }]
+                    ? WriteOne(logs[0].Item1, logs[0].Item2[0], options)
+                    : WriteMany(logs, exclusive, options, acknowledgedPresence);
             }
             finally
             {
@@ -616,7 +847,7 @@ public sealed class SolariumWAL : IWAL
                     LogWithheldCheckpoint(partitionId, log.Id, currentFloor, firstMissing);
             }
 
-            _db.Write(checkpointBatch, options);
+            WriteAttested(checkpointBatch, options);
             RaiseMaxLogCache(partitionId, log.Id);
             return RaftOperationStatus.Success;
         }
@@ -635,7 +866,7 @@ public sealed class SolariumWAL : IWAL
                 if (absorbed)
                 {
                     // The commit is one small metadata put instead of a rewrite of the full row.
-                    _db.Put(CommitFrontierKey(partitionId), Utf8(advanced), _metadata, options);
+                    PutAttested(CommitFrontierKey(partitionId), Utf8(advanced), _metadata, options);
                     RaiseCommitFrontierCache(partitionId, advanced);
                     Interlocked.Increment(ref _commitMarkersAbsorbed);
                     return RaftOperationStatus.Success;
@@ -647,7 +878,7 @@ public sealed class SolariumWAL : IWAL
                     WriteBatch commitBatch = new();
                     PutLogToBatch(commitBatch, partitionId, log, family);
                     PutCommitFrontierToBatch(commitBatch, partitionId, advanced);
-                    _db.Write(commitBatch, options);
+                    WriteAttested(commitBatch, options);
                     RaiseCommitFrontierCache(partitionId, advanced);
                     RaiseMaxLogCache(partitionId, log.Id);
                     return RaftOperationStatus.Success;
@@ -663,7 +894,7 @@ public sealed class SolariumWAL : IWAL
         try
         {
             WriteLogEntry(value, partitionId, log, logTypeByteCount);
-            _db.Put(key, value, family, options);
+            PutAttested(key, value, family, options);
         }
         finally
         {
@@ -677,7 +908,7 @@ public sealed class SolariumWAL : IWAL
     }
 
     // The frontier locks of the partitions with commit markers, in ascending order, held through the write.
-    private RaftOperationStatus WriteMany(List<(int, List<RaftLog>)> logs, bool exclusive, WriteOptions options)
+    private RaftOperationStatus WriteMany(List<(int, List<RaftLog>)> logs, bool exclusive, WriteOptions options, IReadOnlyDictionary<int, long>? acknowledgedPresence)
     {
         List<int>? advancing = null;
         foreach ((int partitionId, List<RaftLog> entries) in logs)
@@ -691,7 +922,7 @@ public sealed class SolariumWAL : IWAL
                 }
 
         if (advancing is null)
-            return WriteManyLocked(logs, exclusive, options);
+            return WriteManyLocked(logs, exclusive, options, acknowledgedPresence);
 
         advancing.Sort();
         int held = 0;
@@ -700,7 +931,7 @@ public sealed class SolariumWAL : IWAL
             for (; held < advancing.Count; held++)
                 Monitor.Enter(FrontierLock(advancing[held]));
 
-            return WriteManyLocked(logs, exclusive, options);
+            return WriteManyLocked(logs, exclusive, options, acknowledgedPresence);
         }
         finally
         {
@@ -709,7 +940,7 @@ public sealed class SolariumWAL : IWAL
         }
     }
 
-    private RaftOperationStatus WriteManyLocked(List<(int, List<RaftLog>)> logs, bool exclusive, WriteOptions options)
+    private RaftOperationStatus WriteManyLocked(List<(int, List<RaftLog>)> logs, bool exclusive, WriteOptions options, IReadOnlyDictionary<int, long>? acknowledgedPresence)
     {
         // The entries of each partition, grouped by shard. A partition that appears once keeps the
         // caller's list; a second appearance makes an owned merged copy.
@@ -835,12 +1066,25 @@ public sealed class SolariumWAL : IWAL
             foreach ((int partitionId, long value) in frontierAdvances)
                 PutCommitFrontierToBatch(batch, partitionId, value);
 
+        // "This node reported id N as durably held" and "the row for N is on disk" become true in one atomic
+        // write, so a torn tail loses both or neither. For the same reason the watermark cannot expose a WAL
+        // file truncated after its fsync, which takes both; the sync ledger attests this batch from outside.
+        if (acknowledgedPresence is not null)
+            foreach ((int partitionId, long value) in acknowledgedPresence)
+                if (value >= 0)
+                    PutAckedPresenceToBatch(batch, partitionId, value);
+
         if (batch.Count > 0)
-            _db.Write(batch, options);
+            WriteAttested(batch, options);
 
         if (frontierAdvances is not null)
             foreach ((int partitionId, long value) in frontierAdvances)
                 RaiseCommitFrontierCache(partitionId, value);
+
+        if (acknowledgedPresence is not null)
+            foreach ((int partitionId, long value) in acknowledgedPresence)
+                if (value >= 0)
+                    _ackedPresenceCache[partitionId] = value;
 
         if (stagedMaxByPartition is not null)
             foreach ((int partitionId, long value) in stagedMaxByPartition)
@@ -915,11 +1159,18 @@ public sealed class SolariumWAL : IWAL
 
     private bool SetMetaDataCore(string key, string value)
     {
-        // Backs the hard state on the election path, so a failure is false, never an exception.
+        // Backs the hard state on the election path, so a failure is false, never an exception. Written with the
+        // WAL's write options, synced under syncWrites: a vote reply leaves, and a candidate asks for votes, only
+        // after this returns, and a vote that reached the candidate but not the device lets the node grant a
+        // second candidate the same term after a power loss. Metadata writes are rare (a vote, a term, an HLC
+        // slack window), so the flush costs little.
         try
         {
-            using EngineLease lease = AcquireEngine();
-            _db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), _metadata);
+            using EngineLease lease = AcquireEngineForWrite();
+            PutAttested(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), _metadata, _writeOptions);
+            if (_writeOptions.Sync)
+                Interlocked.Increment(ref _syncMetadataWrites);
+
             return true;
         }
         catch (Exception e) when (e is not ObjectDisposedException)
@@ -934,7 +1185,7 @@ public sealed class SolariumWAL : IWAL
     {
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
             ColumnFamily family = Shard(partitionId);
 
             // One range delete covers the partition; the probe only decides whether any row exists.
@@ -953,17 +1204,21 @@ public sealed class SolariumWAL : IWAL
             }
 
             // The metadata goes too: a stale floor, frontier or checkpoint would hide or certify the rows a
-            // reused partition id writes from low ids again.
+            // reused partition id writes from low ids again, and a stale watermark would make its next
+            // occupant restore as a loss.
             batch.Delete(LastCheckpointKey(partitionId), _metadata);
             batch.Delete(CommitFrontierKey(partitionId), _metadata);
             batch.Delete(CompactionFloorKey(partitionId), _metadata);
+            batch.Delete(AckedPresenceKey(partitionId), _metadata);
+            batch.Delete(Encoding.UTF8.GetBytes(ReconciledKey(partitionId)), _metadata);
 
             // An advance that read the old frontier must not put it back after the delete.
             lock (FrontierLock(partitionId))
             {
-                _db.Write(batch, _writeOptions);
+                WriteAttested(batch, _writeOptions);
                 _compactionFloorCache.TryRemove(partitionId, out _);
                 _commitFrontierCache.TryRemove(partitionId, out _);
+                _ackedPresenceCache.TryRemove(partitionId, out _);
             }
 
             InvalidateMaxLogCache(partitionId);
@@ -981,7 +1236,7 @@ public sealed class SolariumWAL : IWAL
     {
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
             _writeGuard.EnterWriteLock();
             try
             {
@@ -1012,6 +1267,13 @@ public sealed class SolariumWAL : IWAL
                 if (clampFloor)
                     PutCompactionFloorToBatch(batch, partitionId, clampedFloor);
 
+                // The rows above the cut go by this node's own decision (a conflicting tail, a hole repair),
+                // not by a loss: a watermark left above the surviving log would make the next restore report one.
+                long clampedAck = Math.Max(afterLogId, 0);
+                bool clampAck = GetAckedPresence(partitionId) > clampedAck;
+                if (clampAck)
+                    PutAckedPresenceToBatch(batch, partitionId, clampedAck);
+
                 // A truncation that removes the recorded checkpoint records the surviving one, exactly.
                 if (staged > 0 && GetLastCheckpointFromMeta(partitionId) > afterLogId)
                 {
@@ -1022,8 +1284,8 @@ public sealed class SolariumWAL : IWAL
                         PutLastCheckpointToBatch(batch, partitionId, surviving);
                 }
 
-                if (staged > 0 || clampFrontier || clampFloor)
-                    _db.Write(batch, _writeOptions);
+                if (staged > 0 || clampFrontier || clampFloor || clampAck)
+                    WriteAttested(batch, _writeOptions);
 
                 if (staged > 0)
                     InvalidateMaxLogCache(partitionId);
@@ -1034,6 +1296,9 @@ public sealed class SolariumWAL : IWAL
 
                 if (clampFloor)
                     _compactionFloorCache[partitionId] = clampedFloor;
+
+                if (clampAck)
+                    _ackedPresenceCache[partitionId] = clampedAck;
 
                 return RaftOperationStatus.Success;
             }
@@ -1059,7 +1324,7 @@ public sealed class SolariumWAL : IWAL
 
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
             _writeGuard.EnterWriteLock();
             try
             {
@@ -1091,7 +1356,18 @@ public sealed class SolariumWAL : IWAL
 
                 if (staged > 0)
                 {
-                    _db.Write(batch, _writeOptions);
+                    // A Proposed row removed inside the acknowledged prefix breaks the contiguity this node
+                    // promised, so the watermark clamps to the cut in the same batch. In steady state the cut
+                    // is at or above the watermark, and nothing changes.
+                    long clampedAck = Math.Max(afterLogId, 0);
+                    bool clampAck = GetAckedPresence(partitionId) > clampedAck;
+                    if (clampAck)
+                        PutAckedPresenceToBatch(batch, partitionId, clampedAck);
+
+                    WriteAttested(batch, _writeOptions);
+                    if (clampAck)
+                        _ackedPresenceCache[partitionId] = clampedAck;
+
                     if (_maxLogCache.TryGetValue(partitionId, out PartitionMaxLog? cachedMax) && cachedMax.Value > afterLogId)
                     {
                         if (survivingAbove > 0)
@@ -1122,7 +1398,7 @@ public sealed class SolariumWAL : IWAL
         WriteOptions options = sync ? _writeOptions : WriteOptions.Default;
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
             _writeGuard.EnterWriteLock();
             try
             {
@@ -1170,14 +1446,27 @@ public sealed class SolariumWAL : IWAL
                 if (clampFloor)
                     PutCompactionFloorToBatch(batch, partitionId, snapshotIndex);
 
+                // The boundary is a certified checkpoint, which attests its whole prefix as held, and the Raft
+                // layer seeds its presence frontier to it, so the watermark rises to the boundary. A truncating
+                // install removed every row above it, so a higher watermark clamps to it: the rows were
+                // discarded, not lost.
+                long currentAck = GetAckedPresence(partitionId);
+                long newAck = suffixTruncated ? snapshotIndex : Math.Max(currentAck, snapshotIndex);
+                bool setAck = newAck != currentAck;
+                if (setAck)
+                    PutAckedPresenceToBatch(batch, partitionId, newAck);
+
                 OnAfterBoundaryScanForTesting?.Invoke();
-                _db.Write(batch, options);
+                WriteAttested(batch, options);
 
                 if (clampFrontier)
                     _commitFrontierCache[partitionId] = snapshotIndex;
 
                 if (clampFloor)
                     _compactionFloorCache[partitionId] = snapshotIndex;
+
+                if (setAck)
+                    _ackedPresenceCache[partitionId] = newAck;
 
                 if (suffixTruncated)
                     SetMaxLogCache(partitionId, snapshotIndex);
@@ -1204,7 +1493,7 @@ public sealed class SolariumWAL : IWAL
         int passCap = maxTotalEntries ?? compactNumberEntries;
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
             ColumnFamily family = Shard(partitionId);
             long floor = GetCompactionFloor(partitionId);
             long newFloor = Math.Max(floor, lastCheckpoint);
@@ -1250,7 +1539,7 @@ public sealed class SolariumWAL : IWAL
                     batch.DeleteRange(begin, end, family);
                 }
 
-                _db.Write(batch, _writeOptions);
+                WriteAttested(batch, _writeOptions);
                 _compactionFloorCache[partitionId] = newFloor;
                 LastCompactionWriteCount = 1;
                 if (removed > 0 && _logger.IsEnabled(LogLevel.Debug))
@@ -1531,6 +1820,11 @@ public sealed class SolariumWAL : IWAL
 
     // -1 when no checkpoint was ever recorded for the partition. The key moves with every checkpoint
     // mutation, in the same batch, so there is no scan fallback.
+    private byte[] AckedPresenceKey(int partitionId) =>
+        _ackedPresenceKeys.GetOrAdd(partitionId, static id => Encoding.UTF8.GetBytes($"raft_acked_presence_p{id}"));
+
+    private static string ReconciledKey(int partitionId) => $"raft_reconciled_lost_synced_writes_p{partitionId}";
+
     private long GetLastCheckpointFromMeta(int partitionId) => ReadLong(LastCheckpointKey(partitionId), -1);
 
     private void PutLastCheckpointToBatch(WriteBatch batch, int partitionId, long value) => batch.Put(LastCheckpointKey(partitionId), Utf8(value), _metadata);
@@ -1552,6 +1846,18 @@ public sealed class SolariumWAL : IWAL
         _commitFrontierCache.AddOrUpdate(partitionId, static (_, v) => v, static (_, old, v) => Math.Max(old, v), value);
 
     // Rows below the floor are logically deleted (0: nothing compacted).
+    // The acknowledged-presence watermark (-1: none), loaded from the metadata family on first use. Under the lease.
+    private long GetAckedPresence(int partitionId)
+    {
+        if (_ackedPresenceCache.TryGetValue(partitionId, out long cached))
+            return cached;
+
+        long persisted = ReadLong(AckedPresenceKey(partitionId), -1);
+        return _ackedPresenceCache.TryAdd(partitionId, persisted) ? persisted : _ackedPresenceCache[partitionId];
+    }
+
+    private void PutAckedPresenceToBatch(WriteBatch batch, int partitionId, long value) => batch.Put(AckedPresenceKey(partitionId), Utf8(value), _metadata);
+
     private long GetCompactionFloor(int partitionId)
     {
         if (_compactionFloorCache.TryGetValue(partitionId, out long cached))
@@ -2119,6 +2425,16 @@ public sealed class SolariumWAL : IWAL
     // and the Raft layer retries on its own cadence. A reopen loses nothing acknowledged: synced writes
     // were flushed, and unsynced ones reached the OS before they were acknowledged.
 
+    // The write paths' lease: refused while the WAL is fail-stopped, without touching the database. Thrown as a
+    // RaftException, which every write core catches and reports as Errored.
+    private EngineLease AcquireEngineForWrite()
+    {
+        if (Volatile.Read(ref _corruptionFailure) is { } corruption)
+            throw new RaftException($"Solarium WAL at '{_enginePath}' is fail-stopped on storage damage and refuses writes: {corruption.Message}");
+
+        return AcquireEngine();
+    }
+
     private EngineLease AcquireEngine()
     {
         EngineLease lease = new(_engineGuard);
@@ -2131,6 +2447,9 @@ public sealed class SolariumWAL : IWAL
 
     private void NoteStorageFailure(Exception e)
     {
+        if (IsCorruption(e))
+            LatchCorruption(e);
+
         Volatile.Write(ref _lastStorageFailure, e);
         long now = _tickSource.GetTimestamp();
         int streak = Interlocked.Increment(ref _failureStreak);
@@ -2138,9 +2457,11 @@ public sealed class SolariumWAL : IWAL
         {
             Volatile.Write(ref _failureStreakStartTicks, now);
             Volatile.Write(ref _lastFailureLogTicks, now);
-            _logger.LogWarning(
-                "Solarium WAL at '{Path}' rejected a write: {Message}. Raft frontiers regress to the durable log; the WAL probes the file system on each failure and reopens the database once space is back",
-                _enginePath, e.Message);
+            if (Volatile.Read(ref _corruptionFailure) is null)
+                _logger.LogWarning(
+                    "Solarium WAL at '{Path}' rejected a write: {Message}. Raft frontiers regress to the durable log; the WAL probes the file system on each failure and reopens the database once space is back",
+                    _enginePath, e.Message);
+
             return;
         }
 
@@ -2169,8 +2490,20 @@ public sealed class SolariumWAL : IWAL
     // retry once: the database was reopened, or it accepts writes again.
     private bool TryRecoverEngineAfterFailure()
     {
-        // A managed exception (a bug, an invalid argument) is not a storage fault.
+        // Fail-stopped: damage is not a transient fault. The probe would pass, the reopen would succeed (the
+        // open checks the tables against the manifest, not every block), and the next read or compaction would
+        // meet the same damage.
         Exception? failure = Volatile.Read(ref _lastStorageFailure);
+        if (Volatile.Read(ref _corruptionFailure) is not null)
+            return false;
+
+        if (IsCorruption(failure))
+        {
+            LatchCorruption(failure!);
+            return false;
+        }
+
+        // A managed exception (a bug, an invalid argument) is not a storage fault.
         if (failure is not (SolariumException or IOException) && !_engineClosed)
             return false;
 
@@ -2237,11 +2570,16 @@ public sealed class SolariumWAL : IWAL
     {
         try
         {
-            _db.Put(EngineCanaryKey, BitConverter.GetBytes(_tickSource.GetTimestamp()), _metadata, WriteOptions.Synced);
+            PutAttested(EngineCanaryKey, BitConverter.GetBytes(_tickSource.GetTimestamp()), _metadata, WriteOptions.Synced);
             return true;
         }
         catch (SolariumException)
         {
+            return false;
+        }
+        catch (IOException)
+        {
+            // The sync ledger could not attest the canary: the volume is not taking durable writes.
             return false;
         }
     }
@@ -2258,6 +2596,7 @@ public sealed class SolariumWAL : IWAL
             // The caches describe the database being closed; the reopened one reloads them from metadata.
             _commitFrontierCache.Clear();
             _compactionFloorCache.Clear();
+            _ackedPresenceCache.Clear();
             _maxLogCache.Clear();
             try
             {
@@ -2275,6 +2614,10 @@ public sealed class SolariumWAL : IWAL
             (_metadata, _shards) = Families(_db);
             _engineClosed = false;
             EngineReopenCount++;
+
+            // The reopened database replayed its files again, and the ledger's attestation must still be
+            // covered: a volume that lost synced writes while the process ran shows here.
+            VerifySyncLedgerAfterReopen();
             SolariumWalMetrics.RecordEngineReopen(succeeded: true);
             _logger.LogWarning(
                 "Solarium WAL at '{Path}' was reopened to clear a storage failure (reopen #{Count}); the failure was: {Message}",
@@ -2284,12 +2627,331 @@ public sealed class SolariumWAL : IWAL
         catch (Exception e)
         {
             SolariumWalMetrics.RecordEngineReopen(succeeded: false);
-            _logger.LogCritical("Solarium WAL at '{Path}' could not be reopened: {Message}", _enginePath, e.Message);
+
+            // An open that fails on damage fails the same way every time: stop retrying it.
+            if (IsCorruption(e))
+                LatchCorruption(e);
+            else
+                _logger.LogCritical("Solarium WAL at '{Path}' could not be reopened: {Message}", _enginePath, e.Message);
+
             return false;
         }
     }
 
+    // ── Fail-stop on storage damage ──────────────────────────────────────────────────────────────
+    //
+    // Solarium reports damage it finds as a SolariumException with IsCorruption set: a block that fails its
+    // checksum or does not decode, a block that holds another place's data, a table that is not the one the
+    // manifest records, a damaged WAL record with intact records after it, and a write refused after a
+    // compaction met one. Fail-stop means: writes fail fast without touching the database
+    // (AcquireEngineForWrite), the recovery neither probes nor reopens, and reads go on, since every block
+    // Solarium returns is checked, and a read that reaches the damage throws and latches too. A Solarium
+    // iterator throws at a damaged block; it never ends short as if the range had ended. The Raft layer sees the
+    // latch through GetFailStopReason on its tick: a partition on this WAL steps down if it leads and neither
+    // votes, campaigns nor acknowledges. The latch is for the process; the repair is the operator's (move the
+    // directory aside, let the node rebuild from its peers).
+
+    private static bool IsCorruption(Exception? e) => e is SolariumException { IsCorruption: true };
+
+    // Records the fail-stop once, with one Critical line naming the directory and the evidence; later damage is
+    // the same seen again. Lock-free, so it is safe from any read or write path and from an exception filter.
+    private void LatchCorruption(Exception failure)
+    {
+        if (Interlocked.CompareExchange(ref _corruptionFailure, failure, null) is not null)
+            return;
+
+        SolariumWalMetrics.RecordEngineFailStop();
+        _logger.LogCritical(
+            "Solarium WAL at '{Path}' is fail-stopped on storage damage: {Message}. Writes are refused and the database is not reopened; move the directory aside and let the node rebuild from its peers",
+            _enginePath, Evidence(failure));
+    }
+
+    // The exception filter of the read entry points: latches damage seen on a read and returns false, so the
+    // exception reaches the caller unchanged. A read that reached damage is the same evidence a write is.
+    private bool LatchIfCorruption(Exception e)
+    {
+        if (IsCorruption(e))
+            LatchCorruption(e);
+
+        return false;
+    }
+
+    // The messages of a failure and of the Solarium failures inside it: a write refused after a compaction met
+    // damage says only that writes stopped, and the damaged file is in what it wraps.
+    private static string Evidence(Exception e)
+    {
+        StringBuilder text = new(e.Message);
+        for (Exception? inner = e.InnerException; inner is SolariumException; inner = inner.InnerException)
+            text.Append(": ").Append(inner.Message);
+
+        return text.ToString();
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The message names the damaged file. Set by the first damage any read or write met, or a reopen found,
+    /// and kept for the life of the WAL.
+    /// </remarks>
+    public string? GetFailStopReason() => Volatile.Read(ref _corruptionFailure) is { } failure ? Evidence(failure) : null;
+
+    // ── Sync ledger and hard-state ledger: lost synced writes ────────────────────────────────────
+    //
+    // A WAL file truncated after its fsync replays short and the database opens clean, and every proof kept
+    // inside the WAL (the acknowledged-presence watermark, the term and the vote) is cut with the rows it was
+    // meant to protect: a node then reports itself healthy after losing acknowledged entries, and can grant a
+    // second vote in a term it already voted in. Two files beside the database keep the proofs outside the
+    // WAL. The sync ledger attests, after every synced write and before it is reported successful, the batch's
+    // last sequence; at open, a ledger ahead of what the database replayed is a persisted verdict that
+    // quarantines every partition (GetLostSyncedWritesReason) until a leader has reconciled it. The
+    // hard-state ledger holds the last term and vote of each partition and is merged back at open where it is
+    // ahead, so no quarantine lift can let the node vote twice. The database keeps running: its files are
+    // consistent, only stale, and the repair is replication from a leader, which is why this is a quarantine
+    // and not the fail-stop (replication repairs a lost tail, not a damaged block).
+
+    // Writes the batch, and when the write is synced, attests its last sequence before returning. Every database
+    // write goes through here or PutAttested, so no synced write escapes the ledger. A ledger failure throws
+    // IOException, which the write cores report as a failed write: the rows are on the device, but the promise
+    // they would back is not covered, so the caller must not make it, as after a crash between the flush and the
+    // reply.
+    private void WriteAttested(WriteBatch batch, WriteOptions options)
+    {
+        _db.Write(batch, options);
+        if (options.Sync && _syncLedgerReady && batch.Count > 0)
+            _syncLedger.Attest(batch.Sequence + batch.Count - 1);
+    }
+
+    private void PutAttested(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ColumnFamily family, WriteOptions options) =>
+        WriteAttested(new WriteBatch().Put(key, value, family), options);
+
+    // Binds the sync ledger at open. A ledger of this database that attests no more than the replay is adopted;
+    // one ahead of the replay is the verdict, and is reset to the database after; one of another database is
+    // reset; a missing one is created. replayed is the database's sequence before any write of this open.
+    private void BindSyncLedger(SolariumSyncLedger.ReadStatus status, in SolariumSyncLedger.Record record, long replayed, bool directoryErased)
+    {
+        Guid? identity = ReadEngineIdentity();
+        if (status == SolariumSyncLedger.ReadStatus.Valid && identity is not null && record.Identity != identity.Value)
+        {
+            _logger.LogWarning(
+                "Solarium WAL at '{Path}': the sync ledger '{Ledger}' belongs to another database ({LedgerIdentity:N}, this one is {Identity:N}); it is reset",
+                _enginePath, _syncLedger.FilePath, record.Identity, identity.Value);
+            _syncLedger.Initialize(identity.Value, DurableMark(), afterGeneration: record.Generation);
+        }
+        else if (status == SolariumSyncLedger.ReadStatus.Valid && (directoryErased || identity is null || record.Sequence > replayed))
+        {
+            // Writes the ledger attested are not in the files the database replayed. A ledger over a database
+            // without an identity is the same event (the ledger is created only after the identity's synced
+            // put), and so is a database whose format version is gone.
+            string detail = directoryErased
+                ? "; the format version and the database identity written at the first open are gone as well"
+                : identity is null ? "; the database identity this ledger was created for is gone as well" : "";
+            RecordLostSyncedWritesVerdict(record.Sequence, replayed, detail);
+            identity ??= WriteEngineIdentity();
+            _syncLedger.Initialize(identity.Value, DurableMark(), afterGeneration: record.Generation);
+        }
+        else if (status == SolariumSyncLedger.ReadStatus.Valid)
+        {
+            // Everything the database replayed came from the device, so it is durable now, and so are the
+            // writes of this open: attested, it also covers writes an earlier process never synced but that
+            // reached the device.
+            _syncLedger.Adopt(in record);
+            _syncLedger.Attest(DurableMark());
+        }
+        else
+        {
+            if (status == SolariumSyncLedger.ReadStatus.Unreadable)
+                _logger.LogWarning(
+                    "Solarium WAL at '{Path}': no slot of the sync ledger '{Ledger}' passes its checksum, which no crash leaves; it is started over",
+                    _enginePath, _syncLedger.FilePath);
+
+            identity ??= WriteEngineIdentity();
+            long durable = DurableMark();
+            _syncLedger.Initialize(identity.Value, durable);
+            if (_logger.IsEnabled(LogLevel.Information))
+                _logger.LogInformation("Solarium WAL at '{Path}': created the sync ledger '{Ledger}' at sequence {Sequence}", _enginePath, _syncLedger.FilePath, durable);
+        }
+
+        _syncLedgerReady = true;
+    }
+
+    // A synced write of the canary, whose last sequence it returns: everything at or below it is durable then,
+    // the replay and every write of this open included, which with syncWrites off were not synced. The ledger is
+    // bound at this mark, never at the latest sequence, so it attests nothing a power loss could still take.
+    private long DurableMark()
+    {
+        WriteBatch batch = new WriteBatch().Put(EngineCanaryKey, BitConverter.GetBytes(_tickSource.GetTimestamp()), _metadata);
+        _db.Write(batch, WriteOptions.Synced);
+        return batch.Sequence;
+    }
+
+    // Persists the verdict with a new id above the last one, so partitions that reconciled an earlier event are
+    // quarantined again, with one Critical line naming both sequences. The database keeps accepting writes.
+    private void RecordLostSyncedWritesVerdict(long attested, long replayed, string detail)
+    {
+        long verdict = Math.Max(_lostSyncedWritesVerdict, 0) + 1;
+        string reason =
+            $"the write-ahead log lost synced writes: the sync ledger '{_syncLedger.FilePath}' attests sequence {attested} as durable, " +
+            $"but the database replayed only through sequence {replayed} ({attested - replayed} synced operations are missing{detail}). " +
+            "A WAL file was truncated or lost after its fsync, and the rows, watermarks, terms and votes it carried are gone with it";
+        if (!SetMetaData(LostSyncedWritesKey, $"{verdict}\n{reason}"))
+            throw new RaftException($"Solarium WAL at '{_enginePath}' could not record its lost-synced-writes verdict; the open is refused.");
+
+        Volatile.Write(ref _lostSyncedWritesReason, reason);
+        Volatile.Write(ref _lostSyncedWritesVerdict, verdict);
+        SolariumWalMetrics.RecordLostSyncedWrites();
+        _logger.LogCritical(
+            "Solarium WAL at '{Path}' lost synced writes: the sync ledger '{Ledger}' attests sequence {Attested}, the database replayed through {Replayed} ({Missing} operations missing{Detail}). Every partition is quarantined (verdict {Verdict}) until a leader reconciles its log",
+            _enginePath, _syncLedger.FilePath, attested, replayed, attested - replayed, detail, verdict);
+    }
+
+    // A verdict that an earlier open persisted, so the partitions that never reconciled it stay quarantined.
+    private void LoadLostSyncedWritesVerdict()
+    {
+        string? raw = GetMetaData(LostSyncedWritesKey);
+        int newline = raw?.IndexOf('\n') ?? -1;
+        if (raw is null || newline < 0 || !long.TryParse(raw.AsSpan(0, newline), NumberStyles.None, CultureInfo.InvariantCulture, out long verdict))
+            return;
+
+        _lostSyncedWritesReason = raw[(newline + 1)..];
+        _lostSyncedWritesVerdict = verdict;
+    }
+
+    /// <inheritdoc/>
+    public string? GetLostSyncedWritesReason(int partitionId)
+    {
+        long verdict = Volatile.Read(ref _lostSyncedWritesVerdict);
+        if (verdict < 0)
+            return null;
+
+        string? reconciled = GetMetaData(ReconciledKey(partitionId));
+        if (reconciled is not null && long.TryParse(reconciled, NumberStyles.None, CultureInfo.InvariantCulture, out long done) && done >= verdict)
+            return null;
+
+        return Volatile.Read(ref _lostSyncedWritesReason);
+    }
+
+    /// <inheritdoc/>
+    public bool MarkLostSyncedWritesReconciled(int partitionId)
+    {
+        long verdict = Volatile.Read(ref _lostSyncedWritesVerdict);
+        return verdict < 0 || SetMetaData(ReconciledKey(partitionId), verdict.ToString(CultureInfo.InvariantCulture));
+    }
+
+    // After a reopen replayed the files again. A loss found here happened while the process ran, on a volume
+    // that already failed once: a storage fault to fail-stop on, not a stale directory to reconcile.
+    private void VerifySyncLedgerAfterReopen()
+    {
+        long attested = _syncLedger.AttestedSequence;
+        long replayed = _db.LatestSequenceNumber;
+        if (attested <= replayed)
+            return;
+
+        LatchCorruption(new RaftException(
+            $"the write-ahead log lost synced writes while the process ran: the sync ledger '{_syncLedger.FilePath}' attests sequence {attested} " +
+            $"as durable, but the database reopened after a storage failure replayed only through sequence {replayed}. " +
+            "This node must not vote or lead from this directory: move it aside and let the node rebuild from its peers."));
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The database's put first (synced under <c>syncWrites</c>), then the hard-state ledger's record and its
+    /// flush. Durable only when both landed: a vote the ledger does not hold is one a truncated WAL file can
+    /// forget, which is the double vote this guards against. The value is the term, followed by a newline and the
+    /// vote when there is one, under <c>raft_hardstate_p{partition}</c>, as Kommander's default writes it, so
+    /// <see cref="IWAL.TryGetHardState"/> reads it.
+    /// </remarks>
+    public bool PersistHardState(int partitionId, long currentTerm, string? votedFor)
+    {
+        if (!SetMetaData(HardStateKey(partitionId), EncodeHardState(currentTerm, votedFor)))
+            return false;
+
+        try
+        {
+            _hardStateLedger.Append(partitionId, currentTerm, votedFor);
+            return true;
+        }
+        catch (Exception e)
+        {
+            _logger.LogError("PersistHardState({PartitionId}, {Term}, {VotedFor}): the hard-state ledger rejected the record: {Message}",
+                partitionId, currentTerm, votedFor, e.Message);
+            return false;
+        }
+    }
+
+    private static string HardStateKey(int partitionId) => $"raft_hardstate_p{partitionId}";
+
+    // The separator is left out with no vote, so the value never ends in '\n'; endpoints hold no '\n'.
+    private static string EncodeHardState(long term, string? votedFor) =>
+        string.IsNullOrEmpty(votedFor) ? term.ToString(CultureInfo.InvariantCulture) : $"{term.ToString(CultureInfo.InvariantCulture)}\n{votedFor}";
+
+    private static bool TryDecodeHardState(string? raw, out long term, out string? votedFor)
+    {
+        term = 0;
+        votedFor = null;
+        if (string.IsNullOrEmpty(raw))
+            return false;
+
+        int newline = raw.IndexOf('\n');
+        if (newline < 0)
+            return long.TryParse(raw, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out term);
+
+        if (!long.TryParse(raw.AsSpan(0, newline), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out term))
+            return false;
+
+        string vote = raw[(newline + 1)..];
+        votedFor = vote.Length == 0 ? null : vote;
+        return true;
+    }
+
+    // At open, writes back every partition's hard state that the ledger holds ahead of the database: a higher
+    // term, or a vote in the same term the database lacks. The ledger is appended only after the database's put
+    // returned, so it is ahead only when the database lost the put. Runs before the Raft layer reads the hard
+    // state, and before the sync ledger is bound, so the binding attests the write-back.
+    private void RestoreHardStateFromLedger()
+    {
+        foreach ((int partitionId, SolariumHardStateLedger.Entry entry) in _hardStateLedger.Snapshot())
+        {
+            bool has = TryDecodeHardState(GetMetaData(HardStateKey(partitionId)), out long term, out string? vote);
+            bool ahead = !has || entry.Term > term || (entry.Term == term && vote is null && entry.VotedFor is not null);
+            if (!ahead)
+                continue;
+
+            if (!SetMetaData(HardStateKey(partitionId), EncodeHardState(entry.Term, entry.VotedFor)))
+                throw new RaftException($"Solarium WAL at '{_enginePath}' could not restore the hard state of partition {partitionId} from the hard-state ledger; the open is refused.");
+
+            _logger.LogWarning(
+                "Solarium WAL at '{Path}' restored the hard state of partition {Partition} from the hard-state ledger: term {Term}, vote '{Vote}', where the database held term {DatabaseTerm}, vote '{DatabaseVote}'",
+                _enginePath, partitionId, entry.Term, entry.VotedFor, has ? term : -1, vote);
+        }
+    }
+
+    private Guid? ReadEngineIdentity() =>
+        GetMetaData(EngineIdentityKey) is { } text && Guid.TryParseExact(text, "N", out Guid identity) ? identity : null;
+
+    private Guid WriteEngineIdentity()
+    {
+        Guid identity = Guid.NewGuid();
+        if (!SetMetaData(EngineIdentityKey, identity.ToString("N")))
+            throw new RaftException($"Solarium WAL at '{_enginePath}' could not write its database identity; the open is refused.");
+
+        return identity;
+    }
+
     // ── Diagnostics and tests ────────────────────────────────────────────────────────────────────
+
+    /// <summary>For tests: the metadata puts written synced, the hard state among them.</summary>
+    internal long SyncMetadataWrites => Interlocked.Read(ref _syncMetadataWrites);
+
+    /// <summary>For tests: the sequence the sync ledger attests as durable.</summary>
+    internal long SyncLedgerAttestedSequence => _syncLedger.AttestedSequence;
+
+    /// <summary>For tests: the sync ledger's path.</summary>
+    internal string SyncLedgerPath => _syncLedger.FilePath;
+
+    /// <summary>For tests: the hard-state ledger's path.</summary>
+    internal string HardStateLedgerPath => _hardStateLedger.FilePath;
+
+    /// <summary>For tests: the id of the current lost-synced-writes verdict, or -1.</summary>
+    internal long LostSyncedWritesVerdict => Volatile.Read(ref _lostSyncedWritesVerdict);
 
     /// <summary>For tests: switches every family's memtable to a flush, waiting for the tables when <paramref name="wait"/> is set.</summary>
     internal void FlushMemTablesForTesting(bool wait = false)
@@ -2297,6 +2959,23 @@ public sealed class SolariumWAL : IWAL
         using EngineLease lease = AcquireEngine();
         foreach (ColumnFamily family in _db.ColumnFamilies)
             _db.Flush(family, wait);
+    }
+
+    /// <summary>For tests: flushes the metadata family alone and waits, as the flush that releases WAL files does, so the WAL file in use changes while the shard rows stay in the memtables.</summary>
+    internal void FlushMetadataForTesting()
+    {
+        using EngineLease lease = AcquireEngine();
+        _db.Flush(_metadata, wait: true);
+    }
+
+    /// <summary>For tests: the database's latest sequence number.</summary>
+    internal long EngineLatestSequence
+    {
+        get
+        {
+            using EngineLease lease = AcquireEngine();
+            return _db.LatestSequenceNumber;
+        }
     }
 
     /// <summary>For tests: compacts the shard of <paramref name="partitionId"/> into its sorted level.</summary>
@@ -2321,9 +3000,9 @@ public sealed class SolariumWAL : IWAL
     {
         using EngineLease lease = AcquireEngine();
         if (value <= 0)
-            _db.Delete(CommitFrontierKey(partitionId), _metadata, _writeOptions);
+            WriteAttested(new WriteBatch().Delete(CommitFrontierKey(partitionId), _metadata), _writeOptions);
         else
-            _db.Put(CommitFrontierKey(partitionId), Utf8(value), _metadata, _writeOptions);
+            PutAttested(CommitFrontierKey(partitionId), Utf8(value), _metadata, _writeOptions);
 
         _commitFrontierCache[partitionId] = Math.Max(value, 0);
     }
@@ -2433,6 +3112,8 @@ public sealed class SolariumWAL : IWAL
             _engineGuard.ExitWriteLock();
         }
 
+        _hardStateLedger.Dispose();
+        _syncLedger.Dispose();
         _writeGuard.Dispose();
         _engineGuard.Dispose();
     }

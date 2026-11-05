@@ -957,6 +957,7 @@ public sealed class SolariumDb : IDisposable
             if (group is null)
             {
                 writer.ThrowIfFailed();
+                batch.Sequence = writer.FirstSequence;
                 return;
             }
         }
@@ -1014,6 +1015,7 @@ public sealed class SolariumDb : IDisposable
         {
             CommitInMemTableStage(group, writer, range, leadsMemTableStage);
             writer.ThrowIfFailed();
+            batch.Sequence = writer.FirstSequence;
             return;
         }
 
@@ -1021,6 +1023,7 @@ public sealed class SolariumDb : IDisposable
             member.Complete(failure);
 
         writer.ThrowIfFailed();
+        batch.Sequence = writer.FirstSequence;
     }
 
     /// <summary>
@@ -3306,7 +3309,7 @@ public sealed class SolariumDb : IDisposable
         if (!environment.FileExists(path))
         {
             // A crash between the temporary file and the rename of the first FORMAT leaves FORMAT.tmp.
-            if (environment.GetChildren(directory).Any(name => name != "LOCK" && !name.EndsWith(".tmp", StringComparison.Ordinal)))
+            if (environment.GetChildren(directory).Any(name => name != "LOCK" && !name.EndsWith(".tmp", StringComparison.Ordinal) && !IsApplicationFile(name)))
                 throw new SolariumException($"'{directory}' is not empty and is not a Solarium database.");
 
             DurableFiles.ReplaceText(environment, path, FormatVersion);
@@ -3332,6 +3335,12 @@ public sealed class SolariumDb : IDisposable
         else if (version != FormatVersion)
             throw new SolariumException($"'{directory}' has format '{version}'; this version of Solarium reads '{FormatVersion}'.");
     }
+
+    // A file whose name starts with '.' is the application's, never the database's: Solarium writes none, and the
+    // open neither reads nor deletes one, as RocksDB ignores the names it does not know. An application keeps
+    // records beside the database there (Solarium.Kommander's ledgers), so a directory whose database files
+    // were lost while those records survived opens as a new database, and the application can tell.
+    private static bool IsApplicationFile(string name) => name.StartsWith('.');
 
     // Format 1: COLUMN_FAMILIES and one wal.log, no SSTables. Safe to run again after a crash.
     private static void MigrateFromFormat1(IStorageEnvironment environment, string directory)
@@ -3362,7 +3371,7 @@ public sealed class SolariumDb : IDisposable
     private static Manifest NewManifest(IStorageEnvironment environment, string directory)
     {
         string[] unknown = [.. environment.GetChildren(directory)
-            .Where(name => name is not ("LOCK" or FormatFileName) && !name.EndsWith(".tmp", StringComparison.Ordinal))
+            .Where(name => name is not ("LOCK" or FormatFileName) && !name.EndsWith(".tmp", StringComparison.Ordinal) && !IsApplicationFile(name))
             .Order(StringComparer.Ordinal)];
         if (unknown.Length > 0)
             throw SolariumException.Corruption(

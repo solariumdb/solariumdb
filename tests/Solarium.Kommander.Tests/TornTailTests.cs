@@ -1,4 +1,5 @@
 using Kommander.Data;
+using Kommander.WAL;
 using Solarium.Tests;
 using static Solarium.Kommander.Tests.Logs;
 
@@ -8,8 +9,10 @@ namespace Solarium.Kommander.Tests;
 /// A node killed mid-write must open its WAL again. A kill leaves the last WAL record short, the
 /// normal residue of an unclean stop, so a reopen keeps the synced prefix and drops that record;
 /// damage with whole records after it is still refused. The kill is staged on disk: the directory is
-/// copied while the WAL is open, then the copy's newest WAL file is cut or damaged. Ported from
-/// Kommander's <c>TestTornWalTailReopen</c> at commit 1bee500.
+/// copied while the WAL is open, then the copy's newest WAL file is cut or damaged. The torn record
+/// is an unsynced one, the only kind a kill can tear: a synced record cut short is a loss the sync
+/// ledger reports (<see cref="LostSyncedWriteTests"/>). Ported from Kommander's
+/// <c>TestTornWalTailReopen</c> at commit e2763bc.
 /// </summary>
 public sealed class TornTailTests : IDisposable
 {
@@ -24,7 +27,8 @@ public sealed class TornTailTests : IDisposable
 
     private string Crashed => _directory.Combine("crashed");
 
-    // Each synced write is acknowledged after its flush, so the torn record was never acknowledged.
+    // A synced write is acknowledged after its flush, and the torn record was not synced, so it was
+    // never acknowledged: the reopen drops it and reports no loss.
     [Theory]
     [MemberData(nameof(Environments.Available), MemberType = typeof(Environments))]
     public void A_torn_last_record_is_dropped_and_the_synced_prefix_survives(string environment)
@@ -40,6 +44,8 @@ public sealed class TornTailTests : IDisposable
         Assert.Equal([1L, 2L, 3L, 4L], Ids(reopened.ReadLogs(Partition)));
         Assert.Equal(4, reopened.GetMaxLog(Partition));
         Assert.Equal(4, reopened.GetCurrentTerm(Partition));
+        Assert.Null(((IWAL)reopened).GetLostSyncedWritesReason(Partition));
+        Assert.Null(reopened.GetFailStopReason());
     }
 
     // Only the last record can be short, so tolerating a torn tail costs nothing; a bad checksum with
@@ -66,13 +72,14 @@ public sealed class TornTailTests : IDisposable
         Assert.Contains(log.Name, error.Message);
     }
 
-    // Two synced writes, so the WAL file holds two records after the format version's, then a copy
-    // of the directory taken while the WAL is still open: the files a kill leaves behind.
+    // A synced write and an unsynced one, so the WAL file's last two records are theirs, then a copy
+    // of the directory, the ledgers with it, taken while the WAL is still open: the files a kill
+    // leaves behind.
     private void WriteTwoRecordsAndCopy(EnvironmentScope scope)
     {
         using SolariumWAL wal = Wals.Open(scope.Environment, Live, syncWrites: true);
         Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [Row(1), Row(2), Row(3), Row(4)])]));
-        Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [Row(5)])]));
+        Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [Row(5)])], sync: false));
         CopyDirectory(Path.Combine(Live, "wal"), Path.Combine(Crashed, "wal"));
     }
 

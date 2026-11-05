@@ -15,7 +15,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Kahuna.Core" Version="1.14.4" />
+    <PackageReference Include="Kahuna.Core" Version="1.15.4" />
   </ItemGroup>
 
   <!-- The Kahuna server that loads this extension has Kahuna.Core, Kommander and every package they use,

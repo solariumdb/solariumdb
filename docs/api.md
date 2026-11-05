@@ -8,6 +8,7 @@ Solarium's public API follows RocksDB's names and semantics. This table maps eac
 | `Get(key, family, ReadOptions)`, `MultiGet(keys, family, ReadOptions)` | `Get`, `MultiGet`; of the read options, only `fill_cache` applies. `MultiGet` reads the data blocks of its keys together, through `IStorageEnvironment.MultiRead` |
 | `Put`, `Delete`, `DeleteRange` | the same; a range whose end comes before its begin throws `ArgumentException` when added to the batch, where RocksDB fails the write with `InvalidArgument`, and an empty range writes nothing |
 | `Write(WriteBatch, WriteOptions)` | `Write`, with `WriteOptions.Sync` |
+| `WriteBatch.Sequence` | the sequence in the batch's header, which RocksDB fills in during the write (`WriteBatchInternal::Sequence`, `rocksdb_writebatch_data` in the C API): the batch's first sequence number, set when `Write` returns |
 | `NewIterator(family, ReadOptions)` | `NewIterator`, with `iterate_upper_bound` and `fill_cache` |
 | `ReadOptions.FillCache` (default true) | `fill_cache`: a data block, or an index and filter read again after an eviction, is not cached |
 | `Iterator`: `Seek`, `SeekToFirst`, `SeekToLast`, `Next`, `Prev`, `Valid`, `Key`, `Value` | the same |

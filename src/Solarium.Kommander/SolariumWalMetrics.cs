@@ -30,6 +30,14 @@ public static class SolariumWalMetrics
         "raft.wal.engine_reopens_total",
         description: "Solarium WAL engine reopens performed to clear a storage failure, by outcome.");
 
+    private static readonly Counter<long> EngineFailStops = Meter.CreateCounter<long>(
+        "raft.wal.engine_fail_stops_total",
+        description: "Solarium WAL engines that fail-stopped on storage damage and refuse every write.");
+
+    private static readonly Counter<long> LostSyncedWrites = Meter.CreateCounter<long>(
+        "raft.wal.lost_synced_writes_total",
+        description: "Solarium WAL opens that found the sync ledger ahead of the replayed log: synced writes were lost.");
+
     private static readonly KeyValuePair<string, object?> ReopenSucceeded = new("outcome", "success");
     private static readonly KeyValuePair<string, object?> ReopenFailed = new("outcome", "failed");
 
@@ -118,6 +126,12 @@ public static class SolariumWalMetrics
 
     /// <summary>Counts one reopen of a WAL's database, tagged by whether it opened.</summary>
     internal static void RecordEngineReopen(bool succeeded) => EngineReopens.Add(1, succeeded ? ReopenSucceeded : ReopenFailed);
+
+    /// <summary>Counts one WAL that fail-stopped on storage damage, or refused to open on it.</summary>
+    internal static void RecordEngineFailStop() => EngineFailStops.Add(1);
+
+    /// <summary>Counts one open whose sync ledger attested synced writes that the replayed log no longer holds.</summary>
+    internal static void RecordLostSyncedWrites() => LostSyncedWrites.Add(1);
 
     // One measurement per open WAL with a block cache.
     private static List<Measurement<long>> MeasureCache(Func<Solarium.Cache, long> read)

@@ -14,6 +14,17 @@ public sealed class WriteBatch
     /// <summary>The number of operations in the batch.</summary>
     public int Count => Operations.Count;
 
+    /// <summary>
+    /// The sequence number the database gave the batch's first operation, set when
+    /// <see cref="SolariumDb.Write"/> returns: its operations hold <c>Sequence</c> to
+    /// <c>Sequence + Count - 1</c>. 0 for a batch that was never written; a later write of the batch
+    /// sets it again. RocksDB writes the same number into a batch's header during the write
+    /// (<c>WriteBatchInternal::Sequence</c>), and its C API exposes it through <c>rocksdb_writebatch_data</c>.
+    /// With <see cref="WriteOptions.Sync"/>, every sequence number at or below the batch's last is
+    /// durable when the write returns, so a caller can record what a synced write made durable.
+    /// </summary>
+    public long Sequence { get; internal set; }
+
     /// <summary>Set <paramref name="key"/> to <paramref name="value"/>. Null family: the default one.</summary>
     public WriteBatch Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ColumnFamily? family = null)
     {
