@@ -3220,7 +3220,8 @@ public sealed class SolariumDb : IDisposable
         return ([.. byLevel[0]], levels);
     }
 
-    // SST files that no manifest lists (a flush that crashed before the manifest update), and temporary files.
+    // SST files that no manifest lists (a flush that crashed before the manifest update), and the database's own
+    // temporary files. An application's temporary file is not one: it may be mid-replacement while a reopen runs.
     private void DeleteOrphanFiles()
     {
         HashSet<long> live = [.. _manifest.ColumnFamilies.SelectMany(f => f.Tables).Select(t => t.Number)];
@@ -3229,7 +3230,7 @@ public sealed class SolariumDb : IDisposable
                 TryDelete(_environment, TablePath(number));
 
         foreach (string name in _environment.GetChildren(_directory))
-            if (name.EndsWith(".tmp", StringComparison.Ordinal))
+            if (name.EndsWith(".tmp", StringComparison.Ordinal) && !IsApplicationFile(name))
                 TryDelete(_environment, Path.Combine(_directory, name));
 
         long highest = Math.Max(FilesWithExtension(".sst").DefaultIfEmpty().Max(), FilesWithExtension(".log").DefaultIfEmpty().Max());

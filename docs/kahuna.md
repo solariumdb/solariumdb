@@ -206,7 +206,11 @@ an identity row that does not decode are refused; and it checks the identity, th
 as-of image and a merge carry no identity. `TestStorageCorruptionNode` runs a whole embedded node on a Solarium
 store and WAL: a damaged block answers the first read with `StorageCorrupt` and takes the node out of
 consensus, and a single node whose store directory was lost under a surviving log reports it as replaced and
-rebuilds it from the log. A three-node cluster with a wiped store is not tested here.
+rebuilds it from the log. When the log was compacted below a checkpoint first, the store's floor of 0 falls below
+the log's compaction floor: a single node refuses the replay, reports `ApplicationFloorBelowCompaction` and never
+leads, so it answers no read with a missing key, and in a three-node cluster the follower that lost its store is
+rebuilt whole from the leader's snapshot before it leads. Both fail when the store declares no floors, as before
+the storage-damage contract.
 
 End to end, a Kahuna server loaded the published extension, took writes over REST on `--storage solarium
 --wal-storage solarium`, and read every key back after a SIGKILL and a restart, as the same run did on
