@@ -2,7 +2,7 @@
 
 A write-ahead log for [Kommander](https://github.com/kahunakv/kommander), the Raft library, on Solarium: an embedded key-value store for .NET, written in C#, whose API and semantics follow RocksDB's. `SolariumWAL` implements Kommander's `IWAL`, so a node passes it to `RaftManager` where it passes `RocksDbWAL`, with no change to Kommander and no native library to ship.
 
-It targets Kommander 1.12.0 and .NET 10. The on-disk format may still change before version 1.0.
+It targets Kommander 1.13.2 and .NET 10. The on-disk format may still change before version 1.0.
 
 ## Use
 
@@ -38,7 +38,11 @@ io_uring matches the default environment on synced writes, whose fsync does not 
 
 - `syncWrites: true` (the default): a write is flushed to the disk before `Write` returns, so it survives a power loss.
 - `syncWrites: false`: a write reaches the operating system before `Write` returns, so it survives a process crash but not a power loss.
-- Hard state (the term and the vote) goes through `SetMetaData`, which is not synced, as in `RocksDbWAL`; Kommander's `IWAL` documents that choice.
+- Hard state (the term and the vote) goes through `SetMetaData`, which writes with the same options as the log: under `syncWrites`, it is flushed before `PersistHardState` returns, and so before a vote reply leaves. It is also appended to the hard-state ledger, `.kommander-hard-state`, which restores a term or vote that the database lost.
+- After every synced write, the sync ledger, `.kommander-sync-ledger`, records the last sequence written. A database that opens behind its ledger, such as a WAL file cut after its fsync, reports lost synced writes (`GetLostSyncedWritesReason`), and Kommander quarantines its partitions until a leader repairs them.
+- Damage to the files (`SolariumException.IsCorruption`) fail-stops the WAL: every later write is refused, the WAL never reopens, its files stay as they are, and `GetFailStopReason` names the damage.
+
+The two ledgers live in the WAL directory. Moving the directory aside to rebuild a node from its peers moves them too, as with `RocksDbWAL`.
 
 Crash tests cut a WAL at random storage operations of a random Kommander workload, with power losses that keep only flushed bytes and process crashes that keep everything. After every crash, the reopened WAL reads as it did after some operation at or past the last durable one.
 
