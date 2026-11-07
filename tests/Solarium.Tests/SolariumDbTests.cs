@@ -1133,6 +1133,33 @@ public sealed class SolariumDbTests : IDisposable
         Assert.Equal("value", S(reopened.Get(B("key"))));
     }
 
+    // A file whose name starts with '.' belongs to the application that keeps it beside the database, a temporary
+    // one included: an application replaces its own records through name + ".tmp" as the database does, and an
+    // open that deleted that file under it, as it deletes its own leftover temporaries, would fail the
+    // application's rename. A first open into a directory that holds only such files starts a new database.
+    [Theory]
+    [MemberData(nameof(Environments.Available), MemberType = typeof(Environments))]
+    public void An_open_neither_reads_nor_deletes_the_files_of_the_application_beside_the_database(string environment)
+    {
+        using EnvironmentScope scope = Environments.Create(environment);
+        Directory.CreateDirectory(DbPath);
+        string ledger = Path.Combine(DbPath, ".app-ledger");
+        string replacement = Path.Combine(DbPath, ".app-ledger.tmp");
+        File.WriteAllBytes(ledger, [1, 2, 3]);
+        File.WriteAllBytes(replacement, [4, 5, 6]);
+
+        using (SolariumDb db = SolariumDb.Open(DbPath, scope.Options()))
+            db.Put(B("key"), B("value"));
+
+        File.WriteAllBytes(Path.Combine(DbPath, "MANIFEST.tmp"), [7]);
+        using (SolariumDb reopened = SolariumDb.Open(DbPath, scope.Options()))
+            Assert.Equal("value", S(reopened.Get(B("key"))));
+
+        Assert.False(File.Exists(Path.Combine(DbPath, "MANIFEST.tmp")));
+        Assert.Equal([1, 2, 3], File.ReadAllBytes(ledger));
+        Assert.Equal([4, 5, 6], File.ReadAllBytes(replacement));
+    }
+
     // A data block whose checksum is valid but whose entry runs out of bytes before its kind: every
     // read path reports the table as corrupt.
     [Theory]

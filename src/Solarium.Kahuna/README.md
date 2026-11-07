@@ -41,10 +41,17 @@ and `--storage-shared-memtable-budget-mb` one `WriteBufferManager` for their mem
 when both are set. 0, the default for each, keeps them apart. Size the budget above 256 MiB, two of the WAL's
 shard memtables, or the WAL warns at open.
 
-It needs Kahuna 1.14.4 or later: 1.13.4 brought the public storage contract (`IPersistenceBackend`,
+It needs Kahuna 1.15.4 or later: 1.13.4 brought the public storage contract (`IPersistenceBackend`,
 `IPersistenceBackendProvider`, `IWalProvider`), 1.14.1 the two compaction settings, 1.14.2 the shared
-cache and memtable budget, and 1.14.4 the `--extension-option` settings. The server's `Kahuna.Core` must be
-at least the version this package references.
+cache and memtable budget, 1.14.4 the `--extension-option` settings, 1.15.3 the storage-damage contract, and
+1.15.4 Kommander 1.13.2. The server's `Kahuna.Core` must be at least the version this package references.
+
+The store implements Kahuna's storage-damage contract, as the RocksDB backend does. Damage to its files
+(`SolariumException.IsCorruption`) fail-stops it: every later operation throws `StorageCorruptionException`,
+which Kahuna answers with `StorageCorrupt`, the store never reopens, and `GetFailStopReason` names the damage.
+It keeps the durability floors it is given (`KeepsDurabilityFloors`), and stamps itself with the node's
+identity, so Kahuna refuses a store stamped by another node and reports a wiped one.
+
 The tables keep their index and filter blocks in a 256 MiB cache that every store of the process shares unless
 the node shares one with its WAL, as the RocksDB backend's block cache, enough for about 12 GB of tables (6 GB
 with LZ4); data blocks are not cached. RocksDB tuning (direct reads, statistics, the shared block cache) does
