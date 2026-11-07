@@ -4,8 +4,9 @@ using Microsoft.Win32.SafeHandles;
 namespace Solarium.Storage;
 
 /// <summary>
-/// Durable metadata operations: a directory flush, a hard link and the writeback of a range, which the
-/// BCL does not offer, and an atomic replace and a whole read of a small file through an environment.
+/// Durable file operations the BCL does not offer: a directory flush, a data flush (<c>fdatasync</c>), a hard
+/// link and the writeback of a range, and an atomic replace and a whole read of a small file through an
+/// environment.
 /// </summary>
 internal static partial class DurableFiles
 {
@@ -123,6 +124,29 @@ internal static partial class DurableFiles
             throw Errno("sync_file_range");
     }
 
+    /// <summary>
+    /// Make the data and the length of the file durable: <c>fdatasync</c> on Linux, as RocksDB flushes by
+    /// default (<c>use_fsync</c> off) and as the io_uring environment does, and
+    /// <see cref="RandomAccess.FlushToDisk"/> elsewhere (<c>F_FULLFSYNC</c> on macOS, <c>FlushFileBuffers</c>
+    /// on Windows). fdatasync commits a changed length but not a changed timestamp alone, so a write in place
+    /// over allocated blocks, such as a slot of a small ledger, costs one device flush and no journal commit;
+    /// nothing in the engine reads a timestamp back.
+    /// </summary>
+    /// <exception cref="IOException">The system call failed.</exception>
+    /// <exception cref="ObjectDisposedException">The handle is closed.</exception>
+    public static void Flush(SafeFileHandle handle)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            RandomAccess.FlushToDisk(handle);
+            return;
+        }
+
+        ObjectDisposedException.ThrowIf(handle.IsClosed, handle);
+        if (fdatasync((int)handle.DangerousGetHandle()) != 0)
+            throw Errno("fdatasync");
+    }
+
     private static IOException Errno(string operation)
     {
         int errno = Marshal.GetLastPInvokeError();
@@ -159,6 +183,9 @@ internal static partial class DurableFiles
 
     [LibraryImport("libc", SetLastError = true)]
     private static partial int fsync(int fd);
+
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int fdatasync(int fd);
 
     [LibraryImport("libc", SetLastError = true)]
     private static partial int sync_file_range(int fd, long offset, long length, uint flags);

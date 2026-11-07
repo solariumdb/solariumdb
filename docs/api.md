@@ -9,6 +9,7 @@ Solarium's public API follows RocksDB's names and semantics. This table maps eac
 | `Put`, `Delete`, `DeleteRange` | the same; a range whose end comes before its begin throws `ArgumentException` when added to the batch, where RocksDB fails the write with `InvalidArgument`, and an empty range writes nothing |
 | `Write(WriteBatch, WriteOptions)` | `Write`, with `WriteOptions.Sync` |
 | `WriteBatch.Sequence` | the sequence in the batch's header, which RocksDB fills in during the write (`WriteBatchInternal::Sequence`, `rocksdb_writebatch_data` in the C API): the batch's first sequence number, set when `Write` returns |
+| `WriteBatch.GroupLastSequence` | none: the last sequence number of the write group that carried the batch, which RocksDB keeps in `WriteThread::WriteGroup::last_sequence` and does not expose. A synced group is flushed whole before any of its writers returns, so with `WriteOptions.Sync` every number at or below it is durable when `Write` returns, and the writers of a group can record one number between them |
 | `NewIterator(family, ReadOptions)` | `NewIterator`, with `iterate_upper_bound` and `fill_cache` |
 | `ReadOptions.FillCache` (default true) | `fill_cache`: a data block, or an index and filter read again after an eviction, is not cached |
 | `Iterator`: `Seek`, `SeekToFirst`, `SeekToLast`, `Next`, `Prev`, `Valid`, `Key`, `Value` | the same |

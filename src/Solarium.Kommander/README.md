@@ -39,7 +39,7 @@ io_uring matches the default environment on synced writes, whose fsync does not 
 - `syncWrites: true` (the default): a write is flushed to the disk before `Write` returns, so it survives a power loss.
 - `syncWrites: false`: a write reaches the operating system before `Write` returns, so it survives a process crash but not a power loss.
 - Hard state (the term and the vote) goes through `SetMetaData`, which writes with the same options as the log: under `syncWrites`, it is flushed before `PersistHardState` returns, and so before a vote reply leaves. It is also appended to the hard-state ledger, `.kommander-hard-state`, which restores a term or vote that the database lost.
-- After every synced write, the sync ledger, `.kommander-sync-ledger`, records the last sequence written. A database that opens behind its ledger, such as a WAL file cut after its fsync, reports lost synced writes (`GetLostSyncedWritesReason`), and Kommander quarantines its partitions until a leader repairs them.
+- After every synced write, the sync ledger, `.kommander-sync-ledger`, records the last sequence of the write group that carried it, one flush per group. A database that opens behind its ledger, such as a WAL file cut after its fsync, reports lost synced writes (`GetLostSyncedWritesReason`), and Kommander quarantines its partitions until a leader repairs them.
 - Damage to the files (`SolariumException.IsCorruption`) fail-stops the WAL: every later write is refused, the WAL never reopens, its files stay as they are, and `GetFailStopReason` names the damage.
 
 The two ledgers live in the WAL directory. Moving the directory aside to rebuild a node from its peers moves them too, as with `RocksDbWAL`.

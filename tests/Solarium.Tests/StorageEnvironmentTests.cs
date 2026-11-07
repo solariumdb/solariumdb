@@ -40,6 +40,41 @@ public sealed class StorageEnvironmentTests
         }
     }
 
+    // Slots overwritten in place, as a ledger writes them: each flush lands the bytes and keeps the length.
+    [Theory]
+    [MemberData(nameof(Environments.Available), MemberType = typeof(Environments))]
+    public void A_flush_after_an_overwrite_in_place_lands_the_bytes_and_keeps_the_length(string environment)
+    {
+        using EnvironmentScope scope = Environments.Create(environment);
+        using TempDirectory directory = new();
+        string path = directory.Combine("slots.dat");
+        byte[] first = new byte[512];
+        Array.Fill(first, (byte)1);
+        byte[] second = new byte[512];
+        Array.Fill(second, (byte)2);
+
+        using (IStorageFile file = scope.Environment.OpenFile(path))
+        {
+            file.Write(new byte[1024], 0);
+            file.Flush();
+            file.Write(first, 0);
+            file.Flush();
+            file.Write(second, 512);
+            file.Flush();
+            file.Write(second, 0);
+            file.Flush();
+            Assert.Equal(1024, file.GetLength());
+        }
+
+        using (IStorageFile file = scope.Environment.OpenFile(path))
+        {
+            Assert.Equal(1024, file.GetLength());
+            byte[] buffer = new byte[1024];
+            Assert.Equal(1024, file.Read(buffer, 0));
+            Assert.All(buffer, b => Assert.Equal(2, b));
+        }
+    }
+
     // The writeback of a range starts and returns; the bytes read back, and a range past the end is allowed.
     [Theory]
     [MemberData(nameof(Environments.Available), MemberType = typeof(Environments))]

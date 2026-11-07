@@ -18,23 +18,26 @@ namespace Solarium.Kommander;
 /// opens as if the lost records had never been written. Every proof kept inside that WAL (the
 /// acknowledged-presence watermark, the term and the vote) is cut with the rows it protects, so what survives
 /// is consistent and the loss is invisible. The proof has to live in a file the truncation cannot reach.</para>
-/// <para>What it records. One number: the last sequence of a batch, after the database's synced write of
-/// that batch returned (<see cref="WriteBatch.Sequence"/>). A synced write makes every sequence at or below
-/// its batch's last durable, so at open the WAL compares the attested sequence with the one the database
-/// replayed (<see cref="SolariumDb.LatestSequenceNumber"/>), and a replay that stops short lost synced writes.
-/// One number covers the rows of every partition, the watermarks, the hard state, the frontiers and the
-/// floors.</para>
-/// <para>No false positive. The ledger is written only after the synced write returned, with that batch's
-/// own sequence, never the database's latest, which a concurrent unsynced write may have raised. A crash
-/// between the two leaves the ledger behind, which is harmless; it is never ahead of what was flushed.</para>
+/// <para>What it records. One number: the last sequence of the write group that carried a batch, after the
+/// database's synced write of that batch returned (<see cref="WriteBatch.GroupLastSequence"/>). The group
+/// was flushed whole before the write returned, so every sequence at or below that number is durable, and
+/// at open the WAL compares the attested sequence with the one the database replayed
+/// (<see cref="SolariumDb.LatestSequenceNumber"/>): a replay that stops short lost synced writes. One number
+/// covers the rows of every partition, the watermarks, the hard state, the frontiers and the floors.</para>
+/// <para>No false positive. The ledger is written only after the synced write returned, with the last
+/// sequence of that write's group, whose flush the write waited for, never the database's latest, which a
+/// later unsynced group may have raised. A crash between the two leaves the ledger behind, which is harmless;
+/// it is never ahead of what was flushed.</para>
 /// <para>Its own durability. Two 512-byte slots, written alternately and each flushed before the next write
 /// begins, so at most one slot is ever torn and the other holds the previous attestation. A torn slot (bad
 /// checksum) is skipped; both unreadable is treated as no ledger, with a warning, because a crash cannot
 /// leave that shape and a loss is reported only on evidence. Each record carries the database's identity, so
 /// a ledger copied from another directory is reset instead of believed. The file is preallocated and written
 /// in place: an attestation is one sector write and one flush, and a full disk cannot refuse it.</para>
-/// <para>Cost. One flush per synced write, grouped: concurrent writers raise a shared target, and the first
-/// one through the gate writes it for all of them.</para>
+/// <para>Cost. At most one flush per write group: the writers of a group attest the same number, the first
+/// through the gate writes it and the rest find it attested; writers of concurrent groups raise a shared
+/// target, which the first through the gate writes for all of them. <see cref="FlushCount"/> counts the
+/// flushes, against <see cref="SolariumDb.WriteGroupCount"/>.</para>
 /// <para>Thread-safety. <see cref="Attest"/> is safe from any thread. <see cref="Open"/>, <see cref="Adopt"/>
 /// and <see cref="Initialize"/> run on the WAL's constructor before any writer exists.</para>
 /// </remarks>
@@ -58,6 +61,7 @@ internal sealed class SolariumSyncLedger : IDisposable
     private long _generation;
     private long _attested = -1;
     private long _pending = -1;
+    private long _flushes;
     private bool _disposed;
 
     private SolariumSyncLedger(IStorageFile file, string filePath)
@@ -90,6 +94,9 @@ internal sealed class SolariumSyncLedger : IDisposable
 
     /// <summary>The highest sequence this ledger attests as durable; -1 before the first attestation.</summary>
     public long AttestedSequence => Volatile.Read(ref _attested);
+
+    /// <summary>The records written and flushed so far, one per attestation that reached the device.</summary>
+    public long FlushCount => Interlocked.Read(ref _flushes);
 
     /// <summary>
     /// Opens the ledger in <paramref name="directory"/> through <paramref name="environment"/>, creating and
@@ -204,6 +211,7 @@ internal sealed class SolariumSyncLedger : IDisposable
 
         _file.Write(_slot, (long)slot * SlotSize);
         _file.Flush();
+        Interlocked.Increment(ref _flushes);
         _generation = next;
     }
 

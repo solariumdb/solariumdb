@@ -105,6 +105,11 @@ public static class SolariumWalMetrics
             static () => Measure(static wal => wal.GetAliveWriteAheadLogBytes()),
             unit: "By",
             description: "Bytes of write-ahead .log files alive in the Raft-log engine directory, which a restart replays. Bounded by SolariumWalOptions.MaxTotalWalSizeFlushUnits.");
+
+        Meter.CreateObservableCounter(
+            "raft.wal.sync_ledger_flushes_total",
+            static () => Measure(static wal => wal.GetSyncLedgerFlushes()),
+            description: "Flushes of the sync ledger beside the Raft-log engine: one per attestation written, at most one per WAL write group, each a small write and a device flush after the group's own.");
     }
 
     /// <summary>Adds <paramref name="wal"/> to the WALs the gauges read; the constructor calls it once the WAL is open.</summary>

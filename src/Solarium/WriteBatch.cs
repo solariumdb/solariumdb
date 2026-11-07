@@ -25,6 +25,20 @@ public sealed class WriteBatch
     /// </summary>
     public long Sequence { get; internal set; }
 
+    /// <summary>
+    /// The last sequence number of the write group that carried the batch, set with <see cref="Sequence"/>
+    /// when <see cref="SolariumDb.Write"/> returns: the group's batches hold the first one's <c>Sequence</c>
+    /// through this number, and a batch alone in its group holds <c>Sequence + Count - 1</c>. A group is
+    /// appended to the WAL in one write and, when any batch of it is synced, flushed in one flush before any
+    /// of its writers returns, so with <see cref="WriteOptions.Sync"/> every sequence number at or below it is
+    /// durable when the write returns: a caller that records what a synced write made durable can record
+    /// this number, and the writers of a group then record one number between them. It is never the
+    /// database's latest sequence, which a later unsynced group may have raised. 0 for a batch that was never
+    /// written. RocksDB keeps the number in its write group (<c>WriteThread::WriteGroup::last_sequence</c>)
+    /// and does not expose it.
+    /// </summary>
+    public long GroupLastSequence { get; internal set; }
+
     /// <summary>Set <paramref name="key"/> to <paramref name="value"/>. Null family: the default one.</summary>
     public WriteBatch Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ColumnFamily? family = null)
     {

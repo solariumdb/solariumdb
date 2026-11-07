@@ -14,7 +14,7 @@ public sealed class MetricsTests : IDisposable
 {
     private const int Partition = 1;
 
-    private static readonly string[] Gauges =
+    private static readonly string[] Instruments =
     [
         "raft.wal.alive_log_bytes",
         "raft.wal.delayed_write_rate",
@@ -22,6 +22,7 @@ public sealed class MetricsTests : IDisposable
         "raft.wal.shard_l0_files",
         "raft.wal.shard_l6_files",
         "raft.wal.shard_live_sst_bytes",
+        "raft.wal.sync_ledger_flushes_total",
         "raft.wal.table_readers_memory",
         "raft.wal.write_stalled",
     ];
@@ -53,8 +54,8 @@ public sealed class MetricsTests : IDisposable
             Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, Logs.CommittedRange(41, 50, Logs.Incompressible(1024)))]));
 
             observed = recorder.Observe();
-            Assert.Equal(Gauges, observed.Keys.Where(name => Gauges.Contains(name)).Order(StringComparer.Ordinal));
-            foreach (string name in Gauges)
+            Assert.Equal(Instruments, observed.Keys.Where(name => Instruments.Contains(name)).Order(StringComparer.Ordinal));
+            foreach (string name in Instruments)
                 Assert.Single(observed[name]);
 
             Assert.Equal(wal.GetAliveWriteAheadLogBytes(), observed["raft.wal.alive_log_bytes"][0]);
@@ -65,6 +66,7 @@ public sealed class MetricsTests : IDisposable
             Assert.Equal(wal.GetShardLiveSstBytes(), observed["raft.wal.shard_live_sst_bytes"][0]);
             Assert.Equal(wal.GetTableReadersMemoryBytes(), observed["raft.wal.table_readers_memory"][0]);
             Assert.Equal(wal.GetIsWriteStopped(), observed["raft.wal.write_stalled"][0]);
+            Assert.Equal(wal.GetSyncLedgerFlushes(), observed["raft.wal.sync_ledger_flushes_total"][0]);
 
             // The readers report the engine, not zeros: the flushed rows are in an SSTable, the rest in a memtable and the WAL file.
             Assert.True(observed["raft.wal.shard_live_sst_bytes"][0] > 40 * 1024);
@@ -73,6 +75,9 @@ public sealed class MetricsTests : IDisposable
             Assert.True(observed["raft.wal.table_readers_memory"][0] > 0);
             Assert.True(observed["raft.wal.alive_log_bytes"][0] > 10 * 1024);
             Assert.Equal(0, observed["raft.wal.write_stalled"][0]);
+
+            // The open bound the ledger with one record; with syncWrites off nothing is attested after it.
+            Assert.Equal(1, observed["raft.wal.sync_ledger_flushes_total"][0]);
         }
         finally
         {
@@ -80,7 +85,7 @@ public sealed class MetricsTests : IDisposable
         }
 
         observed = recorder.Observe();
-        foreach (string name in Gauges)
+        foreach (string name in Instruments)
             Assert.Empty(observed.GetValueOrDefault(name) ?? []);
     }
 

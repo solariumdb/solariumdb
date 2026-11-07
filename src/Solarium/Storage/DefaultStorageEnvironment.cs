@@ -4,7 +4,9 @@ namespace Solarium.Storage;
 
 /// <summary>
 /// The environment for every platform: <see cref="RandomAccess"/> over a <see cref="SafeFileHandle"/>,
-/// which is pread/pwrite on Linux and macOS and positional ReadFile/WriteFile on Windows.
+/// which is pread/pwrite on Linux and macOS and positional ReadFile/WriteFile on Windows. A flush is
+/// <c>fdatasync</c> on Linux, as in RocksDB, and <see cref="RandomAccess.FlushToDisk"/> elsewhere
+/// (<see cref="DurableFiles.Flush"/>).
 /// </summary>
 public sealed class DefaultStorageEnvironment : IStorageEnvironment
 {
@@ -37,7 +39,7 @@ public sealed class DefaultStorageEnvironment : IStorageEnvironment
 
         public void Write(ReadOnlySpan<byte> buffer, long offset) => RandomAccess.Write(handle, buffer, offset);
 
-        public void Flush() => RandomAccess.FlushToDisk(handle);
+        public void Flush() => DurableFiles.Flush(handle);
 
         public void SyncRange(long offset, long length) => DurableFiles.SyncRange(handle, offset, length);
 

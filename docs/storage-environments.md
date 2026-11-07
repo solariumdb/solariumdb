@@ -11,10 +11,10 @@ using SolariumDb db = SolariumDb.Open("./data", new DbOptions { Environment = en
 
 | Environment | I/O | Flush |
 | --- | --- | --- |
-| `DefaultStorageEnvironment` (all platforms) | `RandomAccess` (pread / pwrite) | `RandomAccess.FlushToDisk` |
+| `DefaultStorageEnvironment` (all platforms) | `RandomAccess` (pread / pwrite) | `fdatasync` on Linux; `RandomAccess.FlushToDisk` elsewhere (`F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows) |
 | `IoUringStorageEnvironment` (Linux) | writes: `IORING_OP_WRITE` on one ioxide reactor thread; reads: pread on the calling thread; batch reads: `preadv2(RWF_NOWAIT)` on the calling thread, then `IORING_OP_READ` for what the page cache misses | `fdatasync` on the calling thread |
 
-ioxide has no fsync operation in its API, so the io_uring environment flushes with `fdatasync` on the calling thread, not through the ring. Every read and write is a hand-off to the reactor thread, and that hand-off costs more than the system call it replaces. Measured on Linux 6.1 with ext4 on an NVMe drive:
+Both environments flush with `fdatasync` on Linux, as RocksDB does by default: it makes the data and the length durable and skips the journal commit that a changed timestamp alone needs with `fsync`, which a write in place over allocated blocks, such as a slot of Kommander's sync ledger, would otherwise pay at every flush. ioxide has no fsync operation in its API, so the io_uring environment flushes on the calling thread, not through the ring. Every read and write is a hand-off to the reactor thread, and that hand-off costs more than the system call it replaces. Measured on Linux 6.1 with ext4 on an NVMe drive:
 
 - A 4 KB read from the page cache takes 2.6 µs instead of 0.4 µs. The kernel completes it inline, so the extra cost is the hand-off alone, about 2.3 µs.
 - A 4 KB write takes 6.9 µs instead of 1.5 µs, and a 64 KB write 29 µs instead of 20 µs. On this kernel, io_uring cannot complete a buffered ext4 write inline and passes it to one of its worker threads (`iou-wrk`). The extra cost is the hand-off plus that second hop, and it grows with the size of the write.

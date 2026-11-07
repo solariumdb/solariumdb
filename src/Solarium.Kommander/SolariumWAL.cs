@@ -2700,24 +2700,28 @@ public sealed class SolariumWAL : IWAL
     // inside the WAL (the acknowledged-presence watermark, the term and the vote) is cut with the rows it was
     // meant to protect: a node then reports itself healthy after losing acknowledged entries, and can grant a
     // second vote in a term it already voted in. Two files beside the database keep the proofs outside the
-    // WAL. The sync ledger attests, after every synced write and before it is reported successful, the batch's
-    // last sequence; at open, a ledger ahead of what the database replayed is a persisted verdict that
-    // quarantines every partition (GetLostSyncedWritesReason) until a leader has reconciled it. The
-    // hard-state ledger holds the last term and vote of each partition and is merged back at open where it is
-    // ahead, so no quarantine lift can let the node vote twice. The database keeps running: its files are
-    // consistent, only stale, and the repair is replication from a leader, which is why this is a quarantine
-    // and not the fail-stop (replication repairs a lost tail, not a damaged block).
+    // WAL. The sync ledger attests, after every synced write and before it is reported successful, the last
+    // sequence of the write group that carried the batch; at open, a ledger ahead of what the database
+    // replayed is a persisted verdict that quarantines every partition (GetLostSyncedWritesReason) until a
+    // leader has reconciled it. The hard-state ledger holds the last term and vote of each partition and is
+    // merged back at open where it is ahead, so no quarantine lift can let the node vote twice. The database
+    // keeps running: its files are consistent, only stale, and the repair is replication from a leader, which
+    // is why this is a quarantine and not the fail-stop (replication repairs a lost tail, not a damaged block).
 
-    // Writes the batch, and when the write is synced, attests its last sequence before returning. Every database
-    // write goes through here or PutAttested, so no synced write escapes the ledger. A ledger failure throws
-    // IOException, which the write cores report as a failed write: the rows are on the device, but the promise
-    // they would back is not covered, so the caller must not make it, as after a crash between the flush and the
-    // reply.
+    // Writes the batch, and when the write is synced, attests the last sequence of the write group that carried
+    // it before returning. The engine appends a group in one write and, when any writer of it is synced, flushes
+    // it in one flush before any writer returns, so the group's last sequence is durable for every writer of the
+    // group, and they attest one number between them: the first through the ledger's gate writes it, the rest
+    // find it attested. It is the group's number, never the database's latest, which a later unsynced group may
+    // have raised past the flush. Every database write goes through here or PutAttested, so no synced write
+    // escapes the ledger. A ledger failure throws IOException, which the write cores report as a failed write:
+    // the rows are on the device, but the promise they would back is not covered, so the caller must not make
+    // it, as after a crash between the flush and the reply.
     private void WriteAttested(WriteBatch batch, WriteOptions options)
     {
         _db.Write(batch, options);
         if (options.Sync && _syncLedgerReady && batch.Count > 0)
-            _syncLedger.Attest(batch.Sequence + batch.Count - 1);
+            _syncLedger.Attest(batch.GroupLastSequence);
     }
 
     private void PutAttested(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ColumnFamily family, WriteOptions options) =>
@@ -2943,6 +2947,12 @@ public sealed class SolariumWAL : IWAL
 
     /// <summary>For tests: the sequence the sync ledger attests as durable.</summary>
     internal long SyncLedgerAttestedSequence => _syncLedger.AttestedSequence;
+
+    /// <summary>
+    /// The sync ledger's flushes so far, one per attestation written, for the <c>raft.wal.sync_ledger_flushes_total</c>
+    /// counter and for tests, against the engine's write groups. Never throws.
+    /// </summary>
+    internal long GetSyncLedgerFlushes() => _syncLedger.FlushCount;
 
     /// <summary>For tests: the sync ledger's path.</summary>
     internal string SyncLedgerPath => _syncLedger.FilePath;

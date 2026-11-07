@@ -15,7 +15,10 @@ public interface IStorageFile : IDisposable
     /// <summary>Write all of <paramref name="buffer"/> at <paramref name="offset"/>, or throw.</summary>
     void Write(ReadOnlySpan<byte> buffer, long offset);
 
-    /// <summary>Return when every write before it is durable on the device.</summary>
+    /// <summary>
+    /// Return when every write before it, and the file's length, are durable on the device. The timestamps
+    /// need not be: <c>fdatasync</c>, as RocksDB flushes by default, not <c>fsync</c>.
+    /// </summary>
     void Flush();
 
     /// <summary>

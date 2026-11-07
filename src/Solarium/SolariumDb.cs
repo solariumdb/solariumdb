@@ -958,6 +958,7 @@ public sealed class SolariumDb : IDisposable
             {
                 writer.ThrowIfFailed();
                 batch.Sequence = writer.FirstSequence;
+                batch.GroupLastSequence = writer.GroupLastSequence;
                 return;
             }
         }
@@ -1016,6 +1017,7 @@ public sealed class SolariumDb : IDisposable
             CommitInMemTableStage(group, writer, range, leadsMemTableStage);
             writer.ThrowIfFailed();
             batch.Sequence = writer.FirstSequence;
+            batch.GroupLastSequence = writer.GroupLastSequence;
             return;
         }
 
@@ -1024,6 +1026,7 @@ public sealed class SolariumDb : IDisposable
 
         writer.ThrowIfFailed();
         batch.Sequence = writer.FirstSequence;
+        batch.GroupLastSequence = writer.GroupLastSequence;
     }
 
     /// <summary>
@@ -1615,6 +1618,7 @@ public sealed class SolariumDb : IDisposable
             records = owned.AsSpan(0, writer.RecordLength);
             WriteAheadLog.CompleteRecord(owned.AsSpan(0, writer.RecordLength), first, durable);
             sequence += writer.OperationCount;
+            writer.GroupLastSequence = sequence;
             sync = writer.Sync;
         }
         else
@@ -1632,6 +1636,11 @@ public sealed class SolariumDb : IDisposable
                 sequence += writer.OperationCount;
                 sync |= writer.Sync;
             }
+
+            // The group's last for every writer: a synced group is flushed whole, so it is what each
+            // writer's synced write made durable.
+            foreach (Writer writer in group)
+                writer.GroupLastSequence = sequence;
 
             records = _records.WrittenSpan;
         }
@@ -3525,6 +3534,12 @@ public sealed class SolariumDb : IDisposable
         /// append, and read by the writer after <see cref="LaunchInsert"/>.
         /// </summary>
         public long FirstSequence { get; set; }
+
+        /// <summary>
+        /// The last sequence number of the writer's group, set by the leader with <see cref="FirstSequence"/>
+        /// and read by the writer when its write completes: what a synced write of the group made durable.
+        /// </summary>
+        public long GroupLastSequence { get; set; }
 
         /// <summary>
         /// Tell the writer to insert its batch into the memtables. The leader calls it after the WAL
