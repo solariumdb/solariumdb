@@ -8,12 +8,13 @@ things a Kahuna node stores, so a node runs with no native RocksDB library:
 | `--storage solarium` | `SolariumPersistenceBackendProvider` | the key-value and lock data, through `SolariumPersistenceBackend` |
 | `--wal-storage solarium` | `SolariumWalProvider` | the Raft log, through `SolariumWAL` (`Solarium.Kommander`) |
 
-It needs Kahuna 1.15.4 or later. 1.13.4 brought the public storage contract: `IPersistenceBackend` with
+It needs Kahuna 1.16.4 or later. 1.13.4 brought the public storage contract: `IPersistenceBackend` with
 immutable rows, and the `StorageProviders` registry of `IPersistenceBackendProvider` and `IWalProvider`.
 1.14.1 brought the storage settings that pace the compactions, 1.14.2 the memory that the WAL and the store
 share (below), 1.14.4 the `--extension-option` settings and the System.IO.Hashing version this package
-uses, 1.15.3, with Kommander 1.13.1, the storage-damage contract of the store and the WAL (below), and 1.15.4
-Kommander 1.13.2, whose snapshot installs no longer flood a follower with appends it cannot apply.
+uses, 1.15.3, with Kommander 1.13.1, the storage-damage contract of the store and the WAL (below), 1.15.4
+Kommander 1.13.2, whose snapshot installs no longer flood a follower with appends it cannot apply, and 1.16.4
+`RevisionPruneResult.DeleteRecordsReleased`, the count of deleted keys whose rows the prune released (below).
 
 ## Use it
 
@@ -110,7 +111,12 @@ environment changes how the files are read and written, not what they hold.
 - the keys: `{key}~CURRENT` for the current row, `{key}~{revision}` for each retained revision, and
   `{key}~NOREV` for the no-revision provenance;
 - the tilde-key registry, the durability floors, and the pruned-history floor with its legacy key;
-- revision pruning, with its memo, its sweep and its quiescence proof;
+- revision pruning, with its memo, its sweep and its quiescence proof. A deleted key is released once age
+  retention has passed its delete record and no snapshot hold is older than it: every row of the key goes
+  except its current row, which holds the revision that the key's next write continues from. The prune
+  writes its deletes in shared batches of up to 2,048 rows, not synced (a batch that a power loss takes
+  takes its pruned-history floor with it, and the next pass deletes the rows again), and asks for a flush
+  of the kv family, without a wait, when a sweep cycle ends;
 - the scans, including the snapshot prefix scan and the seek over a deep revision run;
 - the storage-failure recovery: close and reopen in place, behind a swap fence;
 - checkpoints: plain, exact as-of, key-filtered, and the merge of one node's share into another;
@@ -177,6 +183,11 @@ Kahuna 1.15 added a storage-damage contract to `IPersistenceBackend`, with defau
   whole-partition purge before a snapshot install deletes 256 keys a call; with a delete per row, a call on a
   store with millions of history rows built them all on the managed heap at once, where the RocksDB backend's
   batch is native memory.
+- **No compaction that starts from deletes.** The RocksDB backend marks a kv table for compaction when half
+  of its entries are deletes (RocksDB's `CompactOnDeletionCollector`), so the prune's deletes travel down to
+  the rows they cover with no other writes. Solarium picks compactions by level size only, so on a store with
+  no other writes, the deletes of a released key space stay in a table above the rows they cover, and the
+  store does not give back the space until writes push them down.
 - **Batched reads go one family per call.** Solarium's `MultiGet` reads one column family per call; every
   batched read here reads the kv family only.
 
@@ -191,7 +202,7 @@ the extension. Raise the reference only to a Kahuna release the servers that loa
 
 `tests/Solarium.Kahuna.Tests` holds the behavior tests of Kahuna's RocksDB backend, ported to
 `SolariumPersistenceBackend`: the backend tests of `TestPersistenceBackends`, revision pruning (memo, sweep
-quiescence, time budget, snapshot floor), as-of reads (revision at or before, probes, run seeks, prefix
+quiescence, time budget, snapshot floor, the release of deleted keys), as-of reads (revision at or before, probes, run seeks, prefix
 scans, batched gets, the monotonic current head, no-revision writes), checkpoints (as-of, the pruned-history
 floor, key-filtered composition and merge) and the storage-failure recovery. The tests of Kahuna's memory
 and SQLite backends, its background writer and its backup driver stay in Kahuna. A recovery test injects a
@@ -210,7 +221,16 @@ rebuilds it from the log. When the log was compacted below a checkpoint first, t
 the log's compaction floor: a single node refuses the replay, reports `ApplicationFloorBelowCompaction` and never
 leads, so it answers no read with a missing key, and in a three-node cluster the follower that lost its store is
 rebuilt whole from the leader's snapshot before it leads. Both fail when the store declares no floors, as before
-the storage-damage contract.
+the storage-damage contract. `TestDeletedKeyDiskRelease` runs a node whose prune releases a deleted key with no
+further write, then restarts it and writes the key again above its delete record. `TestPruneWriteFailure` fails
+the first batch of a sweep through `HookedEnvironment`, on both environments: no row and no floor moves, the pass
+after the recovery releases every key, and a reopen keeps the result.
+
+Three ported tests are skipped. The two cases of `DeletedKeySpace_GivesItsDiskSpaceBack_WithNoOtherWrites`
+need the compaction that starts from deletes (above).
+`DeleteRecordInsideTheRetentionAge_KeepsItsHistoryRow_UntilTheAgePassesIt` needs age retention to count a
+revision's age from the commit of the revision that replaced it. This store and the released RocksDB backend
+count it from the revision's own commit.
 
 End to end, a Kahuna server loaded the published extension, took writes over REST on `--storage solarium
 --wal-storage solarium`, and read every key back after a SIGKILL and a restart, as the same run did on
