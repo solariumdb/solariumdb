@@ -16,7 +16,8 @@ namespace Solarium.Engine;
 /// value. The links are addresses, which never change, since the arena never moves or frees a node while the
 /// memtable lives. The garbage collector sees none of it: an entry is no object, so no collection copies or marks
 /// it, and its bytes count against no heap limit. The key and the value are copied in from the caller's arrays,
-/// and a read copies them out into new arrays (<see cref="Entry"/>), as a read of an SSTable does.</para>
+/// and a read copies them out into new arrays (<see cref="Entry"/>), as a read of an SSTable does; a point lookup
+/// copies out the value only (<see cref="EntryVersion"/>).</para>
 /// <para>The arena is freed when no reader can reach the memtable: each <see cref="FamilyVersion"/> that lists it
 /// counts a reference (<see cref="AddReference"/>, <see cref="Release"/>), and a reader is counted in a version for
 /// as long as it reads, so the last reference goes after the last reader leaves.</para>
@@ -419,11 +420,11 @@ internal sealed unsafe class MemTable : IEntrySource
     // ── Reader side: any thread, no lock ─────────────────────────────────────────────────────────
 
     /// <inheritdoc />
-    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out Entry entry)
+    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry)
     {
         byte* node = Seek(key, snapshot);
         bool found = node is not null && KeyOf(node).SequenceEqual(key);
-        entry = found ? ToEntry(node) : default;
+        entry = found ? ToVersion(node) : default;
         GC.KeepAlive(this);
         return found;
     }
@@ -483,6 +484,33 @@ internal sealed unsafe class MemTable : IEntrySource
             if (sweep.Covering(entry.Key) < entry.Sequence)
                 yield return entry;
         }
+    }
+
+    /// <summary>
+    /// Adds to <paramref name="builder"/> the entries that <see cref="FlushEntries(long, IReadOnlyList{RangeTombstone})"/>
+    /// gives for <paramref name="snapshot"/> and <paramref name="tombstones"/>, in the same order and by the same
+    /// rule, with each key and value read in place from the memtable's memory: a flush copies them once, into the
+    /// table's block. Safe while writers insert, as that method is.
+    /// </summary>
+    public void AddFlushEntries(TableBuilder builder, long snapshot, IReadOnlyList<RangeTombstone> tombstones)
+    {
+        TombstoneSweep sweep = new(tombstones);
+        byte* previous = null;
+        for (byte* node = (byte*)First(); node is not null; node = (byte*)Volatile.Read(ref Link(node, 0)))
+        {
+            // The first version at or below the snapshot of each key is its newest.
+            long sequence = SequenceOf(node);
+            ReadOnlySpan<byte> key = KeyOf(node);
+            if (sequence > snapshot || (previous is not null && key.SequenceEqual(KeyOf(previous))))
+                continue;
+
+            previous = node;
+            if (sweep.Covering(key) < sequence)
+                builder.Add(key, sequence, (OperationKind)node[KindOffset], ValueOf(node));
+        }
+
+        // The spans point into the arena, which lives as long as a holder references the memtable.
+        GC.KeepAlive(this);
     }
 
     /// <summary>The range tombstones a read at <paramref name="snapshot"/> sees, in the order they were added.</summary>
@@ -586,6 +614,15 @@ internal sealed unsafe class MemTable : IEntrySource
         return new Entry(key, SequenceOf(node), (OperationKind)node[KindOffset], value);
     }
 
+    // What a lookup takes from a node: its value copied into a new array, and no copy of its key.
+    private static EntryVersion ToVersion(byte* node)
+    {
+        int valueLength = *(int*)(node + ValueLengthOffset);
+        byte* data = node + LinksOffset + (node[HeightOffset] * sizeof(long)) + *(int*)(node + KeyLengthOffset);
+        byte[]? value = valueLength < 0 ? null : new ReadOnlySpan<byte>(data, valueLength).ToArray();
+        return new EntryVersion(SequenceOf(node), (OperationKind)node[KindOffset], value);
+    }
+
     private static int Compare(byte* node, ReadOnlySpan<byte> key, long sequence) =>
         InternalKey.Compare(KeyOf(node), SequenceOf(node), key, sequence);
 
@@ -654,6 +691,11 @@ internal sealed unsafe class MemTable : IEntrySource
         public void Seek(ReadOnlySpan<byte> key) => Move((nint)table.Seek(key, long.MaxValue));
 
         public void Next() => Move(Volatile.Read(ref Link((byte*)_node, 0)));
+
+        // The cursor holds no buffer: the memtable's memory is its version's.
+        public void Dispose()
+        {
+        }
 
         private void Move(nint node)
         {

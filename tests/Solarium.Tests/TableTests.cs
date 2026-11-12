@@ -267,7 +267,7 @@ public sealed class TableTests : IDisposable
 
     private static string? Newest(TableReader table, string key, long snapshot)
     {
-        if (!table.TryGetNewest(B(key), snapshot, true, out Entry entry))
+        if (!table.TryGetNewest(B(key), snapshot, true, out EntryVersion entry))
             return null;
 
         return entry.Kind == OperationKind.Delete ? "delete" : S(entry.Value);

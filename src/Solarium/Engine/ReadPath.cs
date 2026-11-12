@@ -27,7 +27,7 @@ internal static class ReadPath
         {
             covering = Math.Max(covering, source.CoveringTombstone(key, snapshot));
 
-            if (source.TryGetNewest(key, snapshot, fillCache, out Entry entry))
+            if (source.TryGetNewest(key, snapshot, fillCache, out EntryVersion entry))
             {
                 if (entry.Kind == OperationKind.Put && covering < entry.Sequence)
                 {
@@ -163,7 +163,7 @@ internal static class ReadPath
                 }
 
                 bool found;
-                Entry entry;
+                EntryVersion entry;
                 try
                 {
                     found = table.TryGetFromEntries(cached.Span, handle, key, snapshot, out entry);
@@ -184,7 +184,7 @@ internal static class ReadPath
             }
 
             // A sorted level with no file for the key has no version of it; a memtable answers at once.
-            if (source is not SortedLevel && source.TryGetNewest(key, snapshot, fillCache, out Entry newest))
+            if (source is not SortedLevel && source.TryGetNewest(key, snapshot, fillCache, out EntryVersion newest))
             {
                 value = Value(newest, covering);
                 return false;
@@ -225,7 +225,7 @@ internal static class ReadPath
             {
                 int k = waiting[w];
                 int b = blockOf[w];
-                if (blocks[b].Table.TryGetFromEntries(entries[b].AsSpan(0, lengths[b]), blocks[b].Handle, keys[k], snapshot, out Entry entry))
+                if (blocks[b].Table.TryGetFromEntries(entries[b].AsSpan(0, lengths[b]), blocks[b].Handle, keys[k], snapshot, out EntryVersion entry))
                     values[k] = Value(entry, covering[k]);
                 else
                     pending.Add(k);
@@ -246,6 +246,6 @@ internal static class ReadPath
 
     // The value a version gives, as TryGet decides it: a Put that no newer range tombstone covers. Every source
     // copies the value into a new array.
-    private static byte[]? Value(Entry entry, long covering) =>
+    private static byte[]? Value(EntryVersion entry, long covering) =>
         entry.Kind != OperationKind.Put || covering >= entry.Sequence ? null : entry.Value;
 }

@@ -87,7 +87,7 @@ public sealed class MemTableTests
         // bottom one makes it miss the entry it looks for.
         foreach (Entry entry in entries)
         {
-            Assert.True(table.TryGetNewest(entry.Key, entry.Sequence, true, out Entry found));
+            Assert.True(table.TryGetNewest(entry.Key, entry.Sequence, true, out EntryVersion found));
             Assert.Equal(entry.Sequence, found.Sequence);
             Assert.Equal($"{entry.Sequence}", S(found.Value));
         }

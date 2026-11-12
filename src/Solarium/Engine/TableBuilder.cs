@@ -42,8 +42,10 @@ internal sealed class TableBuilder : IDisposable
     private long _minSequence = long.MaxValue;
     private long _maxSequence;
     private byte[]? _smallest;
-    private byte[]? _largest;
-    private Entry _lastInBlock;
+    private byte[]? _largest;          // set at Finish: the last key, or a range tombstone's end above it
+    private byte[] _lastKey = new byte[64];   // the key of the last entry added, in a buffer the builder reuses
+    private int _lastKeyLength;
+    private long _lastSequence;
     private int _lastInBlockOffset;   // where the open block's last entry starts among its entries
     private byte[] _compressed = [];   // the size prefix and the LZ4 bytes of the last data block, reused
 
@@ -92,31 +94,54 @@ internal sealed class TableBuilder : IDisposable
         return builder.Finish(tombstones);
     }
 
+    /// <summary>
+    /// Write as a whole table what a flush of <paramref name="memTable"/> keeps of a read at
+    /// <paramref name="snapshot"/> (<see cref="MemTable.AddFlushEntries"/>), with <paramref name="tombstones"/>,
+    /// and flush the file. The entries go from the memtable's memory into the table's blocks with no array between.
+    /// </summary>
+    public static TableProperties Build(IStorageFile file, MemTable memTable, long snapshot, IReadOnlyList<RangeTombstone> tombstones,
+        CompressionType compression = CompressionType.None, TablePacing pacing = default)
+    {
+        using TableBuilder builder = new(file, compression, pacing);
+        memTable.AddFlushEntries(builder, snapshot, tombstones);
+        return builder.Finish(tombstones);
+    }
+
     /// <summary>Add an entry; it must come after every entry added before it, in internal key order.</summary>
-    public void Add(Entry entry)
+    public void Add(Entry entry) => Add(entry.Key, entry.Sequence, entry.Kind, entry.Value);
+
+    /// <summary>
+    /// Add an entry from its parts; it must come after every entry added before it, in internal key order. The
+    /// builder copies <paramref name="key"/> and <paramref name="value"/> before it returns, so they may point
+    /// into a buffer that the caller reuses. A delete has an empty <paramref name="value"/>.
+    /// </summary>
+    public void Add(ReadOnlySpan<byte> key, long sequence, OperationKind kind, ReadOnlySpan<byte> value)
     {
         // Each partition's filter holds every user key in its blocks: a key whose versions continue into the
         // next partition goes into its filter too, as the first key there.
-        if (_largest is null || _partitionHashes.Count == 0 || !entry.Key.AsSpan().SequenceEqual(_largest))
-            _partitionHashes.Add(XxHash3.HashToUInt64(entry.Key));
+        if (_entryCount == 0 || _partitionHashes.Count == 0 || !key.SequenceEqual(_lastKey.AsSpan(0, _lastKeyLength)))
+            _partitionHashes.Add(XxHash3.HashToUInt64(key));
 
-        _smallest ??= entry.Key;
-        _largest = entry.Key;
-        NoteSequence(entry.Sequence);
+        _smallest ??= key.ToArray();
+        if (_lastKey.Length < key.Length)
+            _lastKey = new byte[Math.Max(key.Length, 2 * _lastKey.Length)];
+
+        key.CopyTo(_lastKey);
+        _lastKeyLength = key.Length;
+        _lastSequence = sequence;
+        NoteSequence(sequence);
         _entryCount++;
 
-        int valueLength = entry.Value?.Length ?? 0;
         _lastInBlockOffset = _block.WrittenCount;
-        Span<byte> span = _block.GetSpan(4 + entry.Key.Length + 13 + valueLength);
-        WriteInt32LittleEndian(span, entry.Key.Length);
-        entry.Key.CopyTo(span[4..]);
-        int position = 4 + entry.Key.Length;
-        WriteInt64LittleEndian(span[position..], entry.Sequence);
-        span[position + 8] = (byte)entry.Kind;
-        WriteInt32LittleEndian(span[(position + 9)..], valueLength);
-        entry.Value?.CopyTo(span[(position + 13)..]);
-        _block.Advance(position + 13 + valueLength);
-        _lastInBlock = entry;
+        Span<byte> span = _block.GetSpan(4 + key.Length + 13 + value.Length);
+        WriteInt32LittleEndian(span, key.Length);
+        key.CopyTo(span[4..]);
+        int position = 4 + key.Length;
+        WriteInt64LittleEndian(span[position..], sequence);
+        span[position + 8] = (byte)kind;
+        WriteInt32LittleEndian(span[(position + 9)..], value.Length);
+        value.CopyTo(span[(position + 13)..]);
+        _block.Advance(position + 13 + value.Length);
 
         if (_block.WrittenCount >= TableFormat.BlockSize)
             FinishDataBlock();
@@ -135,7 +160,8 @@ internal sealed class TableBuilder : IDisposable
             CutPartition();
 
         // Range tombstone block. The last entry's key, before a tombstone's end can raise the largest bound.
-        byte[]? lastKey = _largest;
+        byte[]? lastKey = _entryCount == 0 ? null : _lastKey.AsSpan(0, _lastKeyLength).ToArray();
+        _largest = lastKey;
         foreach (RangeTombstone tombstone in tombstones)
         {
             NoteSequence(tombstone.Sequence);
@@ -213,8 +239,8 @@ internal sealed class TableBuilder : IDisposable
         (long offset, int size) = WriteDataBlock(_block.WrittenSpan);
         _block.ResetWrittenCount();
 
-        WriteBytes(_partitionIndex, _lastInBlock.Key);
-        WriteInt64(_partitionIndex, _lastInBlock.Sequence);
+        WriteBytes(_partitionIndex, _lastKey.AsSpan(0, _lastKeyLength));
+        WriteInt64(_partitionIndex, _lastSequence);
         WriteInt64(_partitionIndex, offset);
         WriteInt32(_partitionIndex, size);
         _partitionBlocks++;
@@ -229,7 +255,7 @@ internal sealed class TableBuilder : IDisposable
         byte[] index = new byte[sizeof(int) + _partitionIndex.WrittenCount];
         WriteInt32LittleEndian(index, _partitionBlocks);
         _partitionIndex.WrittenSpan.CopyTo(index.AsSpan(sizeof(int)));
-        _partitions.Add(new Partition(_lastInBlock.Key, _lastInBlock.Sequence, index, BloomFilter.Build(_partitionHashes)));
+        _partitions.Add(new Partition(_lastKey.AsSpan(0, _lastKeyLength).ToArray(), _lastSequence, index, BloomFilter.Build(_partitionHashes)));
 
         _partitionIndex.ResetWrittenCount();
         _partitionHashes.Clear();
@@ -365,7 +391,7 @@ internal sealed class TableBuilder : IDisposable
         output.Advance(8);
     }
 
-    private static void WriteBytes(IBufferWriter<byte> output, byte[] bytes)
+    private static void WriteBytes(IBufferWriter<byte> output, ReadOnlySpan<byte> bytes)
     {
         WriteInt32(output, bytes.Length);
         output.Write(bytes);

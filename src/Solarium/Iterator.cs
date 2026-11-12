@@ -123,7 +123,7 @@ public sealed class Iterator : IDisposable
     /// <summary>Move to the previous key. Throws <see cref="InvalidOperationException"/> when the iterator is not <see cref="Valid"/>.</summary>
     public void Prev() => FindBackward(_valid ? CurrentKey.ToArray() : throw NotPositioned());
 
-    /// <summary>Invalidate the iterator and release its snapshot's SSTables. Later calls do nothing.</summary>
+    /// <summary>Invalidate the iterator and release its snapshot's SSTables and the data blocks it holds. Later calls do nothing.</summary>
     public void Dispose()
     {
         if (_disposed)
@@ -131,6 +131,11 @@ public sealed class Iterator : IDisposable
 
         _disposed = true;
         _valid = false;
+
+        // Before the version: a table's cursor holds a data block of a table that the version keeps open.
+        foreach (IEntryCursor cursor in _cursors)
+            cursor.Dispose();
+
         _version.Leave(_slot);
     }
 

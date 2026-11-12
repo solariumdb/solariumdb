@@ -95,7 +95,7 @@ public sealed class VersionTests : IDisposable
                         {
                             if (version.Level0.Length == 1)
                             {
-                                Assert.True(version.Level0[0].TryGetNewest(B("k"), long.MaxValue, true, out Entry entry));
+                                Assert.True(version.Level0[0].TryGetNewest(B("k"), long.MaxValue, true, out EntryVersion entry));
                                 Assert.Equal("value", S(entry.Value));
                                 Interlocked.Increment(ref reads);
                             }

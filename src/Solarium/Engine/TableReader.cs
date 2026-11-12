@@ -28,6 +28,19 @@ internal sealed class TableReader : IEntrySource, IDisposable
     private const int FilterHandle = 1;
     private const int IndexHandle = 3;
 
+    /// <summary>The bytes that the first read ahead of a cursor takes, as RocksDB's initial auto readahead size.</summary>
+    public const int InitialReadahead = 8 * 1024;
+
+    /// <summary>The most bytes that a cursor reads ahead by itself, as RocksDB's <c>max_auto_readahead_size</c>.</summary>
+    public const int MaxReadahead = 256 * 1024;
+
+    /// <summary>
+    /// The bytes that each read of a compaction's cursor takes, from its first read. RocksDB's
+    /// <c>compaction_readahead_size</c> is 2 MB; a window of that size, one for each input, is larger than a
+    /// processor's cache, and a merge of tables in the OS page cache took a quarter longer with it than with this one.
+    /// </summary>
+    public const int CompactionReadahead = 256 * 1024;
+
     private readonly IStorageFile _file;
     private readonly long _blocksEnd;   // where the footer starts: no block handle reaches past it
     private readonly ulong _id;         // the table id in the footer, bound into every block's checksum; 0 before version 5
@@ -212,13 +225,13 @@ internal sealed class TableReader : IEntrySource, IDisposable
     }
 
     /// <inheritdoc />
-    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out Entry entry)
+    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry)
     {
         entry = default;
         if (!TryLocate(key, snapshot, fillCache, out DataBlockHandle handle))
             return false;
 
-        // Only the value is copied out of the block; the entry's key is the key looked up.
+        // Only the value is copied out of the block.
         using BlockBuffer block = DataBlock(handle, fillCache);
         return TryGetFromEntries(block.Entries, handle, key, snapshot, out entry);
     }
@@ -322,17 +335,16 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
     /// <summary>
     /// The newest version of <paramref name="key"/> at or below <paramref name="snapshot"/> in a data block's
-    /// <paramref name="entries"/> (<see cref="DecodeReadBlock"/>). The entry's key is <paramref name="key"/>, and
-    /// its value a new array.
+    /// <paramref name="entries"/> (<see cref="DecodeReadBlock"/>). Its value is a new array.
     /// </summary>
     /// <exception cref="SolariumException">The entries do not decode.</exception>
-    public bool TryGetFromEntries(ReadOnlySpan<byte> entries, DataBlockHandle handle, ReadOnlySpan<byte> key, long snapshot, out Entry entry)
+    public bool TryGetFromEntries(ReadOnlySpan<byte> entries, DataBlockHandle handle, ReadOnlySpan<byte> key, long snapshot, out EntryVersion entry)
     {
         entry = default;
         if (!FindVersion(entries, key, snapshot, handle, out long sequence, out OperationKind kind, out ReadOnlySpan<byte> value))
             return false;
 
-        entry = new Entry(key.ToArray(), sequence, kind, kind == OperationKind.Put ? value.ToArray() : null);
+        entry = new EntryVersion(sequence, kind, kind == OperationKind.Put ? value.ToArray() : null);
         return true;
     }
 
@@ -409,7 +421,19 @@ internal sealed class TableReader : IEntrySource, IDisposable
     }
 
     /// <inheritdoc />
-    public IEntryCursor NewCursor(bool fillCache) => new Cursor(this, fillCache);
+    /// <remarks>
+    /// The cursor reads ahead once its reads of the file follow one another, as RocksDB's iterators do: from the
+    /// third data block in a row, a read takes <see cref="InitialReadahead"/> bytes, and each read after it twice
+    /// as many, up to <see cref="MaxReadahead"/>. A seek to another place starts again with single blocks.
+    /// </remarks>
+    public IEntryCursor NewCursor(bool fillCache) => new Cursor(this, fillCache, readahead: 0);
+
+    /// <summary>
+    /// A cursor as <see cref="NewCursor(bool)"/> gives, whose every read of the file takes
+    /// <paramref name="readahead"/> bytes, from the first one: for a reader that takes every entry, as a
+    /// compaction does with <see cref="CompactionReadahead"/>. 0 reads ahead as <see cref="NewCursor(bool)"/> does.
+    /// </summary>
+    public IEntryCursor NewCursor(bool fillCache, int readahead) => new Cursor(this, fillCache, readahead);
 
     /// <summary>
     /// Writes the table file's bytes, all <see cref="TableProperties.Size"/> of them, to the start of
@@ -539,34 +563,6 @@ internal sealed class TableReader : IEntrySource, IDisposable
         return new BlockBuffer(inserted);
     }
 
-    // Decode every entry of block `block` of partition `partition`, whose index is `index`, into entries (cleared
-    // first). Keys and values are copied out.
-    private void DecodeDataBlock(TableIndex index, int partition, int block, bool fillCache, List<Entry> entries)
-    {
-        entries.Clear();
-        BlockBuffer buffer = DataBlock(new DataBlockHandle(index, partition, block), fillCache);
-        try
-        {
-            SpanReader reader = new(buffer.Entries);
-            while (!reader.AtEnd)
-            {
-                byte[] key = reader.Bytes();
-                long sequence = reader.Int64();
-                OperationKind kind = reader.EntryKind();
-                byte[] value = reader.Bytes();
-                entries.Add(new Entry(key, sequence, kind, kind == OperationKind.Put ? value : null));
-            }
-        }
-        catch (ArgumentOutOfRangeException e)
-        {
-            throw DataBlockCorrupt(block, index.Offset(block), e);
-        }
-        finally
-        {
-            buffer.Dispose();
-        }
-    }
-
     // A data block's entries in a pooled buffer, checksum verified and decompressed; they are the
     // first length bytes. The caller returns the buffer to ArrayPool<byte>.Shared.
     private byte[] RentDataBlock(DataBlockHandle handle, out int length)
@@ -604,6 +600,28 @@ internal sealed class TableReader : IEntrySource, IDisposable
             if (!ReferenceEquals(entries, raw))
                 ArrayPool<byte>.Shared.Return(entries);
 
+            throw;
+        }
+    }
+
+    // The entries of the data block whose bytes, checksum included, are raw, checked as the DecodeBlock of an array
+    // checks them: a part of raw when the block is not compressed, and rented is null; else the first bytes of
+    // rented, a buffer from ArrayPool<byte>.Shared that the caller returns. A cursor decodes a block so where it
+    // lies in the cursor's readahead window.
+    private ReadOnlySpan<byte> DecodeBlock(ReadOnlySpan<byte> raw, DataBlockHandle handle, out byte[]? rented)
+    {
+        ReadOnlySpan<byte> entries = DecompressBlock(raw, handle, out rented, out int lastEntry);
+        try
+        {
+            CheckBounds(entries, handle, lastEntry);
+            return entries;
+        }
+        catch
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+
+            rented = null;
             throw;
         }
     }
@@ -684,18 +702,28 @@ internal sealed class TableReader : IEntrySource, IDisposable
     // decompressed, as DecodeBlock returns them.
     private byte[] DecompressBlock(byte[] raw, DataBlockHandle handle, out int length, out int lastEntry)
     {
+        ReadOnlySpan<byte> entries = DecompressBlock(raw.AsSpan(0, handle.Size), handle, out byte[]? rented, out lastEntry);
+        length = entries.Length;
+
+        // The entries of a block that is not compressed start where the block does.
+        return rented ?? raw;
+    }
+
+    // The entries of the data block whose bytes, checksum included, are raw, handle.Size of them, verified and
+    // decompressed: the first bytes of raw when the block is not compressed, and rented is null; else the first
+    // bytes of rented, a buffer from ArrayPool<byte>.Shared that the caller returns.
+    private ReadOnlySpan<byte> DecompressBlock(ReadOnlySpan<byte> raw, DataBlockHandle handle, out byte[]? rented, out int lastEntry)
+    {
+        rented = null;
         int size = handle.Size;
         long offset = handle.Offset;
         int block = handle.Block;
-        if (TableFormat.BlockChecksum(raw.AsSpan(0, size - 4), _id, offset) != ReadUInt32LittleEndian(raw.AsSpan(size - 4)))
+        if (TableFormat.BlockChecksum(raw[..(size - 4)], _id, offset) != ReadUInt32LittleEndian(raw[(size - 4)..]))
             throw Corrupt(Number, $"the block at offset {offset} has a bad checksum");
 
         lastEntry = -1;
         if (!_typedBlocks)
-        {
-            length = size - 4;
-            return raw;
-        }
+            return raw[..(size - 4)];
 
         int trailer = _lastEntryOffsets ? TableFormat.DataTrailerSize : TableFormat.DataTrailerSize4;
         if (size < trailer)
@@ -706,16 +734,13 @@ internal sealed class TableReader : IEntrySource, IDisposable
         byte type = raw[size - 5];
         if (_lastEntryOffsets)
         {
-            lastEntry = ReadInt32LittleEndian(raw.AsSpan(payload));
+            lastEntry = ReadInt32LittleEndian(raw[payload..]);
             if (lastEntry < 0)
                 throw Corrupt(Number, $"data block {block} at offset {offset} names its last entry at {lastEntry}");
         }
 
         if (type == TableFormat.RawBlock)
-        {
-            length = payload;
-            return raw;
-        }
+            return raw[..payload];
 
         if (type != TableFormat.Lz4Block)
             throw Corrupt(Number, $"data block {block} at offset {offset} has type {type}");
@@ -727,14 +752,14 @@ internal sealed class TableReader : IEntrySource, IDisposable
             throw Corrupt(Number, $"data block {block} at offset {offset} has a raw size of {rawSize} for {payload} compressed bytes");
 
         byte[] entries = ArrayPool<byte>.Shared.Rent(rawSize);
-        if (LZ4Codec.Decode(raw.AsSpan(sizeof(int), payload - sizeof(int)), entries.AsSpan(0, rawSize)) != rawSize)
+        if (LZ4Codec.Decode(raw.Slice(sizeof(int), payload - sizeof(int)), entries.AsSpan(0, rawSize)) != rawSize)
         {
             ArrayPool<byte>.Shared.Return(entries);
             throw Corrupt(Number, $"data block {block} at offset {offset} does not decompress to its {rawSize} bytes");
         }
 
-        length = rawSize;
-        return entries;
+        rented = entries;
+        return entries.AsSpan(0, rawSize);
     }
 
     // The newest version of key at or below snapshot in a block's decoded entries; value is a slice of entries.
@@ -948,28 +973,65 @@ internal sealed class TableReader : IEntrySource, IDisposable
         return SolariumException.Corruption($"SSTable {TableFormat.FileName(Number)} is corrupt: data block {block} at offset {offset} has a valid checksum but does not decode: {cause.Message}", cause);
     }
 
-    // Holds one decoded block at a time, in a list it reuses, and the index of the partition it reads, which it
-    // keeps until it moves to another partition, as RocksDB's iterators keep the index block they read.
-    private sealed class Cursor(TableReader table, bool fillCache) : IEntryCursor
+    // Reads the entries of one data block at a time in place, with no copy of a key or a value: the block is the
+    // cache's, which the cursor holds a reference on, or bytes in a buffer of the cursor's own. It keeps the index of
+    // the partition it reads until it moves to another partition, as RocksDB's iterators keep the index block they
+    // read. One thread at a time.
+    //
+    // A block that the cache does not hold comes from the file: alone, into a pooled buffer, or out of the window,
+    // a pooled buffer that one read fills with the block and the bytes after it, so the blocks that follow cost no
+    // read. The entries of a block that is not compressed are read where they lie in the window, which is filled
+    // again only when the cursor moves to a block outside it.
+    private sealed class Cursor(TableReader table, bool fillCache, int readahead) : IEntryCursor
     {
-        private readonly List<Entry> _entries = [];
         private TableIndex? _partitionIndex;
         private int _loadedPartition = -1;
         private int _partition;
         private int _block;
+
+        // The block's entries: the cached block, or _length bytes of _bytes from _start, where _bytes is _pooled
+        // (a block read alone, or a decompressed one) or _window.
+        private NativeBlock? _cached;
+        private byte[]? _pooled;
+        private byte[]? _bytes;
+        private int _start;
+        private int _length;
+
+        // Where each entry of the block starts among its entries, in an array that the cursor reuses.
+        private int[] _offsets = new int[64];
+        private int _count;
         private int _index;
 
-        public bool Valid => _index < _entries.Count;
+        // The entry at _index, decoded once per position.
+        private int _keyStart;
+        private int _keyLength;
+        private int _valueStart;
+        private int _valueLength;
+        private long _sequence;
+        private OperationKind _kind;
+        private Entry? _current;
 
-        public Entry Current => _entries[_index];
+        // The window holds the _windowLength bytes of the file from _windowOffset. _nextOffset is where the last
+        // block the cursor loaded ends, and _sequentialReads the reads of the file in a row that started there.
+        private byte[]? _window;
+        private long _windowOffset;
+        private int _windowLength;
+        private long _nextOffset = -1;
+        private int _sequentialReads;
 
-        public ReadOnlySpan<byte> CurrentKey => _entries[_index].Key;
+        public bool Valid => _index < _count;
 
-        public long CurrentSequence => _entries[_index].Sequence;
+        public Entry Current => _current ??= new Entry(CurrentKey.ToArray(), _sequence, _kind, _kind == OperationKind.Put ? CurrentValue.ToArray() : null);
 
-        public OperationKind CurrentKind => _entries[_index].Kind;
+        public ReadOnlySpan<byte> CurrentKey => Entries.Slice(_keyStart, _keyLength);
 
-        public ReadOnlySpan<byte> CurrentValue => _entries[_index].Value;
+        public long CurrentSequence => _sequence;
+
+        public OperationKind CurrentKind => _kind;
+
+        public ReadOnlySpan<byte> CurrentValue => Entries.Slice(_valueStart, _valueLength);
+
+        private ReadOnlySpan<byte> Entries => _cached is not null ? _cached.Span : _bytes.AsSpan(_start, _length);
 
         public void SeekToFirst() => Load(0, 0);
 
@@ -984,14 +1046,44 @@ internal sealed class TableReader : IEntrySource, IDisposable
             }
 
             Load(partition, PartitionIndex(partition).FindBlock(key, long.MaxValue));
-            while (_index < _entries.Count && InternalKey.Compare(_entries[_index].Key, _entries[_index].Sequence, key, long.MaxValue) < 0)
-                _index++;
+
+            // The first entry at or after the key's first version, by a binary search over the entries' offsets.
+            ReadOnlySpan<byte> entries = Entries;
+            int low = 0, high = _count;
+            while (low < high)
+            {
+                int middle = (low + high) / 2;
+                int at = _offsets[middle];
+                int keyLength = ReadInt32LittleEndian(entries[at..]);
+                if (InternalKey.Compare(entries.Slice(at + 4, keyLength), ReadInt64LittleEndian(entries[(at + 4 + keyLength)..]), key, long.MaxValue) < 0)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+
+            if (low == 0)
+                return;
+
+            // The index sent the cursor to a block whose last entry is at or after the key, so the entry is here.
+            _index = low;
+            if (low < _count)
+                Position(low);
+            else
+                Load(_partition, _block + 1);
         }
 
         public void Next()
         {
-            if (++_index == _entries.Count)
+            if (++_index < _count)
+                Position(_index);
+            else
                 Load(_partition, _block + 1);
+        }
+
+        public void Dispose()
+        {
+            ReleaseBlock();
+            ReleaseWindow();
         }
 
         private TableIndex PartitionIndex(int partition)
@@ -1005,10 +1097,11 @@ internal sealed class TableReader : IEntrySource, IDisposable
             return _partitionIndex!;
         }
 
-        // The block at (partition, block), or the first block of the partitions after it once a partition ends.
+        // The first entry of the block at (partition, block), or of the first block of the partitions after it once
+        // a partition ends. Past the last block the cursor is not valid, and holds no buffer.
         private void Load(int partition, int block)
         {
-            _index = 0;
+            ReleaseBlock();
             TablePartitions partitions = table._partitions;
             while (partition < partitions.Count)
             {
@@ -1017,7 +1110,8 @@ internal sealed class TableReader : IEntrySource, IDisposable
                 {
                     _partition = partition;
                     _block = block;
-                    table.DecodeDataBlock(index, partition, block, fillCache, _entries);
+                    LoadBlock(new DataBlockHandle(index, partition, block));
+                    Position(0);
                     return;
                 }
 
@@ -1027,7 +1121,172 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
             _partition = partition;
             _block = 0;
-            _entries.Clear();
+            ReleaseWindow();
+        }
+
+        // The block's entries, from the cache, the window or the file, and the offset of each. Every entry is
+        // decoded here once, so a block that does not decode fails before the cursor gives any of its entries, and
+        // the steps over it read its fields with no check of their own.
+        private void LoadBlock(DataBlockHandle handle)
+        {
+            if (table.TryGetCachedBlock(handle, out NativeBlock? cached))
+                _cached = cached;
+            else
+                ReadBlock(handle);
+
+            _nextOffset = handle.Offset + handle.Size;
+            int count = 0;
+            try
+            {
+                SpanReader reader = new(Entries);
+                while (!reader.AtEnd)
+                {
+                    if (count == _offsets.Length)
+                        Array.Resize(ref _offsets, 2 * count);
+
+                    _offsets[count] = reader.Position;
+                    reader.Span();
+                    reader.Int64();
+                    reader.EntryKind();
+                    reader.Span();
+                    count++;
+                }
+            }
+            catch (ArgumentOutOfRangeException e)
+            {
+                ReleaseBlock();
+                throw table.DataBlockCorrupt(handle.Block, handle.Offset, e);
+            }
+
+            // Every block that reaches a cursor passed CheckBounds, which refuses a block with no entry.
+            if (count == 0)
+            {
+                ReleaseBlock();
+                throw Corrupt(table.Number, $"data block {handle.Block} at offset {handle.Offset} has no entries");
+            }
+
+            _count = count;
+        }
+
+        // The block from the window, or from the file: with the bytes after it when the cursor reads ahead, else alone.
+        private void ReadBlock(DataBlockHandle handle)
+        {
+            long offset = handle.Offset;
+            int size = handle.Size;
+            byte[] source;
+            int at;
+            if (_window is not null && offset >= _windowOffset && offset + size <= _windowOffset + _windowLength)
+            {
+                source = _window;
+                at = (int)(offset - _windowOffset);
+            }
+            else
+            {
+                // No block handle reaches past the footer's start, so a read up to it never meets the end of the file.
+                int ahead = (int)Math.Min(ReadaheadAt(offset), table._blocksEnd - offset);
+                if (ahead > size)
+                {
+                    if (_window is null || _window.Length < ahead)
+                    {
+                        ReleaseWindow();
+                        _window = ArrayPool<byte>.Shared.Rent(ahead);
+                    }
+
+                    // Not a window until the read fills it: a failed read leaves bytes of another place.
+                    _windowLength = 0;
+                    ReadExactly(table._file, _window.AsSpan(0, ahead), offset, table.Number);
+                    _windowOffset = offset;
+                    _windowLength = ahead;
+                    source = _window;
+                }
+                else
+                {
+                    _pooled = ArrayPool<byte>.Shared.Rent(size);
+                    ReadExactly(table._file, _pooled.AsSpan(0, size), offset, table.Number);
+                    source = _pooled;
+                }
+
+                at = 0;
+            }
+
+            ReadOnlySpan<byte> entries = table.DecodeBlock(source.AsSpan(at, size), handle, out byte[]? decompressed);
+            if (decompressed is not null)
+            {
+                if (_pooled is not null)
+                    ArrayPool<byte>.Shared.Return(_pooled);
+
+                _pooled = decompressed;
+                _bytes = decompressed;
+                _start = 0;
+            }
+            else
+            {
+                _bytes = source;
+                _start = at;
+            }
+
+            _length = entries.Length;
+
+            // A read that fills the cache leaves the block there, and the cursor reads the cache's copy.
+            if (fillCache && table.CacheBlockAndKeep(handle, entries) is { } inserted)
+            {
+                ReleaseBlock();
+                _cached = inserted;
+            }
+        }
+
+        // The bytes that a read of the file at offset takes: the cursor's fixed readahead, or one that starts once
+        // two reads in a row followed the block before them and doubles with each read after that; 0 for the block alone.
+        private int ReadaheadAt(long offset)
+        {
+            if (readahead > 0)
+                return readahead;
+
+            _sequentialReads = offset == _nextOffset ? _sequentialReads + 1 : 0;
+            if (_sequentialReads < 2)
+                return 0;
+
+            return Math.Min(MaxReadahead, InitialReadahead << Math.Min(_sequentialReads - 2, 16));
+        }
+
+        // The fields of entry `index` of the block, which LoadBlock decoded once already.
+        private void Position(int index)
+        {
+            ReadOnlySpan<byte> entries = Entries;
+            int at = _offsets[index];
+            _keyLength = ReadInt32LittleEndian(entries[at..]);
+            _keyStart = at + 4;
+            at = _keyStart + _keyLength;
+            _sequence = ReadInt64LittleEndian(entries[at..]);
+            _kind = (OperationKind)entries[at + 8];
+            _valueLength = ReadInt32LittleEndian(entries[(at + 9)..]);
+            _valueStart = at + 13;
+            _current = null;
+        }
+
+        // Lets the block go: the cursor is on no entry until the next block is loaded.
+        private void ReleaseBlock()
+        {
+            _index = 0;
+            _count = 0;
+            _current = null;
+            _cached?.Release();
+            _cached = null;
+            if (_pooled is not null)
+                ArrayPool<byte>.Shared.Return(_pooled);
+
+            _pooled = null;
+            _bytes = null;
+            _length = 0;
+        }
+
+        private void ReleaseWindow()
+        {
+            if (_window is not null)
+                ArrayPool<byte>.Shared.Return(_window);
+
+            _window = null;
+            _windowLength = 0;
         }
     }
 

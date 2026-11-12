@@ -1548,7 +1548,7 @@ public sealed class SolariumDb : IDisposable
 
         written.Add(path);
         using IStorageFile file = _environment.OpenFile(path);
-        return TableBuilder.Build(file, memTable.FlushEntries(snapshot, tombstones), tombstones, compression);
+        return TableBuilder.Build(file, memTable, snapshot, tombstones, compression);
     }
 
     // A table of the checkpoint under its own number: a link to the source's file, which no one
@@ -2343,7 +2343,7 @@ public sealed class SolariumDb : IDisposable
         TableReader table;
         try
         {
-            TableBuilder.Build(file, memTable.FlushEntries(), memTable.Tombstones, family.Options.Compression, _flushPacing);
+            TableBuilder.Build(file, memTable, long.MaxValue, memTable.Tombstones, family.Options.Compression, _flushPacing);
             table = TableReader.Open(number, file, Caching(family.Options, level: 0));
         }
         catch
@@ -2815,7 +2815,7 @@ public sealed class SolariumDb : IDisposable
         try
         {
             // Replay runs inside Open, with no write to share the drive with, so it is not paced.
-            TableBuilder.Build(file, memTable.FlushEntries(), memTable.Tombstones, family.Options.Compression);
+            TableBuilder.Build(file, memTable, long.MaxValue, memTable.Tombstones, family.Options.Compression);
             table = TableReader.Open(number, file, Caching(family.Options, level: 0));
         }
         catch

@@ -171,11 +171,30 @@ Solarium allocated 560 to 580 B of managed memory per synced `Put`, and RocksDB'
 
 | | Time | Allocated |
 | --- | ---: | ---: |
-| `Get` | 799 ns | 208 B |
+| `Get` | 799 ns | 152 B |
 | `IteratorNext` | 19.9 ns | 0 B |
-| `IteratorPrev` | 296 ns | 320 B |
+| `IteratorPrev` | 296 ns | 264 B |
 
-A memtable node and its key are one place in its native arena, so each step of a search reads one place where a managed node, its links and its key were three objects. `Prev` copies the key of each source at each step. The iterator copies each position into buffers it reuses, so `Next` allocates nothing, and `Key()` and `Value()` are valid until the iterator moves, as in RocksDB.
+A memtable node and its key are one place in its native arena, so each step of a search reads one place where a managed node, its links and its key were three objects. `Prev` copies the key of each source at each step. The iterator copies each position into buffers it reuses, so `Next` allocates nothing, and `Key()` and `Value()` are valid until the iterator moves, as in RocksDB. A `Get` allocates its value and no copy of its key.
+
+`TableReadBenchmarks` reads the same 921,600 entries from one SSTable that a flush wrote: `Get` of keys that are there, `GetMissing` of keys inside the table's range that are not, which the Bloom filter answers, and `IteratorNext` over 65,536 rows. `Blocks` selects where the data blocks come from: the file, or a block cache that holds the whole table (`CacheDataBlocks`). On a development machine (macOS, Apple silicon, the file in the OS page cache), not the machine of the other tables:
+
+| | Time, file | Time, cached | Allocated |
+| --- | ---: | ---: | ---: |
+| `Get` | 1,115 ns | 371 ns | 152 B |
+| `GetMissing` | 97 ns | 89 ns | 0 B |
+| `IteratorNext` | 44 ns | 31 ns | 0 B |
+
+A table cursor reads each key and value in place in its data block, and reads the file ahead once its reads follow one another, so a step of a scan allocates nothing. When the cursor copied each entry of a block into new arrays and read one block at a time, a step took 69 ns from the file and 44 ns from the cache, and allocated 208 B.
+
+`CompactRangeBenchmarks` times one manual compaction and one flush, each on a store that its iteration builds: 1,000,000 `Put`s of a 31-byte key and a 128-byte value, keys drawn at random from 500,000, in four level 0 tables that the compaction merges; the flush writes the last quarter of them. On the same development machine, the median of 10 runs, which include the flush of the output to the drive:
+
+| | Time, no compression | Time, LZ4 | Allocated |
+| --- | ---: | ---: | ---: |
+| `CompactRange` | 103 ms | 99 ms | 7.4 MB |
+| `Flush` | 45 ms | 46 ms | 2.8 MB |
+
+The merge and the flush take each entry from the input's block or the memtable's memory into the output's block with no array between. With an array for each key and value, the compaction took 113 ms and 109 ms and allocated 163 MB, and the flush 53 ms and 52 ms and 42 MB. A compaction's cursor reads 256 KiB of its file at a time: with RocksDB's 2 MiB, the merge without compression took 144 ms, since four windows of that size do not fit a processor's cache. The whole-workload scenario `compaction random` showed no difference outside its noise: its time is the writers'.
 
 `RangeTombstoneReadBenchmarks`, live keys beside range tombstones that the memtable or the table keeps fragmented:
 

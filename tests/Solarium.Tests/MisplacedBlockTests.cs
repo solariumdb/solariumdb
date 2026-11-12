@@ -235,7 +235,7 @@ public sealed class MisplacedBlockTests : IDisposable
                 cursor.Next();
         }).Message);
 
-        Assert.True(table.TryGetNewest(B("a0005"), long.MaxValue, true, out Entry entry));
+        Assert.True(table.TryGetNewest(B("a0005"), long.MaxValue, true, out EntryVersion entry));
         Assert.Equal(Value("a", 5), S(entry.Value));
     }
 

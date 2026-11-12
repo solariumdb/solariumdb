@@ -46,7 +46,7 @@ internal sealed class SortedLevel : IEntrySource
     }
 
     /// <inheritdoc />
-    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out Entry entry)
+    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry)
     {
         TableReader? table = TableFor(key);
         if (table is null)
@@ -82,7 +82,14 @@ internal sealed class SortedLevel : IEntrySource
     }
 
     /// <inheritdoc />
-    public IEntryCursor NewCursor(bool fillCache) => new Cursor(this, fillCache);
+    public IEntryCursor NewCursor(bool fillCache) => new Cursor(this, fillCache, readahead: 0);
+
+    /// <summary>
+    /// A cursor as <see cref="NewCursor(bool)"/> gives, whose reads of each file take <paramref name="readahead"/>
+    /// bytes at a time from the first one (<see cref="TableReader.NewCursor(bool, int)"/>), for a reader that takes
+    /// every entry, as a compaction does.
+    /// </summary>
+    public IEntryCursor NewCursor(bool fillCache, int readahead) => new Cursor(this, fillCache, readahead);
 
     /// <summary>The file whose key range holds <paramref name="key"/>, the only one that can have a version of it; null when none does.</summary>
     public TableReader? TableFor(ReadOnlySpan<byte> key)
@@ -123,8 +130,8 @@ internal sealed class SortedLevel : IEntrySource
         return low;
     }
 
-    // One file's cursor at a time; it moves to the next file when the current one ends.
-    private sealed class Cursor(SortedLevel level, bool fillCache) : IEntryCursor
+    // One file's cursor at a time; it moves to the next file when the current one ends, and disposes the one it leaves.
+    private sealed class Cursor(SortedLevel level, bool fillCache, int readahead) : IEntryCursor
     {
         private IEntryCursor? _current;
         private int _file;
@@ -171,10 +178,17 @@ internal sealed class SortedLevel : IEntrySource
             }
         }
 
+        public void Dispose()
+        {
+            _current?.Dispose();
+            _current = null;
+        }
+
         private void Open(int file)
         {
+            _current?.Dispose();
             _file = file;
-            _current = file < level._tables.Length ? level._tables[file].NewCursor(fillCache) : null;
+            _current = file < level._tables.Length ? level._tables[file].NewCursor(fillCache, readahead) : null;
         }
     }
 }

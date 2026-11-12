@@ -21,7 +21,7 @@ internal sealed class TombstoneSweep
     /// The highest sequence number of a tombstone that covers <paramref name="key"/>, or 0. Each key
     /// must be at or after the key of the call before.
     /// </summary>
-    public long Covering(byte[] key)
+    public long Covering(ReadOnlySpan<byte> key)
     {
         while (_next < _byBegin.Length && _byBegin[_next].Begin.AsSpan().SequenceCompareTo(key) <= 0)
             _active.Add(_byBegin[_next++]);

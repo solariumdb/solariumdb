@@ -62,54 +62,54 @@ internal sealed class CompactionMerge
     {
         // Level 0 tables can overlap, one cursor each; the tables of a sorted level share no key, so
         // one cursor walks them all. A compaction reads every input once, so it fills no cache, as
-        // RocksDB's compaction reads with fill_cache off.
+        // RocksDB's compaction reads with fill_cache off, and each read of a file takes the bytes after the
+        // block too, as RocksDB's compaction_readahead_size.
         List<IEntryCursor> cursors = new(compaction.Inputs.Length + 1);
         List<RangeTombstone> tombstones = [];
-        if (compaction.StartLevel == 0)
-            foreach (TableReader table in compaction.Inputs)
-                cursors.Add(table.NewCursor(fillCache: false));
-        else
-            cursors.Add(new SortedLevel(compaction.Inputs).NewCursor(fillCache: false));
-
-        if (compaction.OutputLevelInputs.Length > 0)
-            cursors.Add(new SortedLevel(compaction.OutputLevelInputs).NewCursor(fillCache: false));
-
-        foreach (TableReader table in compaction.AllInputs)
-            tombstones.AddRange(table.Tombstones);
-
-        foreach (IEntryCursor cursor in cursors)
-            cursor.SeekToFirst();
-
-        SortedLevel[] below = compaction.Below;
-        TombstoneSweep sweep = new(tombstones);
-        KeptTombstones kept = new(tombstones, below);
         List<TableReader> outputs = [];
         Output? output = null;
-        bool full = false;
         try
         {
+            if (compaction.StartLevel == 0)
+                foreach (TableReader table in compaction.Inputs)
+                    cursors.Add(table.NewCursor(fillCache: false, TableReader.CompactionReadahead));
+            else
+                cursors.Add(new SortedLevel(compaction.Inputs).NewCursor(fillCache: false, TableReader.CompactionReadahead));
+
+            if (compaction.OutputLevelInputs.Length > 0)
+                cursors.Add(new SortedLevel(compaction.OutputLevelInputs).NewCursor(fillCache: false, TableReader.CompactionReadahead));
+
+            foreach (TableReader table in compaction.AllInputs)
+                tombstones.AddRange(table.Tombstones);
+
+            foreach (IEntryCursor cursor in cursors)
+                cursor.SeekToFirst();
+
+            SortedLevel[] below = compaction.Below;
+            TombstoneSweep sweep = new(tombstones);
+            KeptTombstones kept = new(tombstones, below);
+            bool full = false;
+
+            // The key of the step, copied out of its cursor: the cursors' keys are read in place, and a cursor's
+            // key is gone once the cursor moves past it.
+            byte[] keyBuffer = new byte[64];
             long keys = 0;
             while (true)
             {
                 // The smallest key under any cursor, and its newest version: the first entry of the key
                 // in each cursor is that cursor's newest version.
-                Entry newest = default;
-                bool found = false;
+                IEntryCursor? newest = null;
                 foreach (IEntryCursor cursor in cursors)
                 {
                     if (!cursor.Valid)
                         continue;
 
-                    Entry current = cursor.Current;
-                    int order = found ? current.Key.AsSpan().SequenceCompareTo(newest.Key) : -1;
-                    if (order < 0 || (order == 0 && current.Sequence > newest.Sequence))
-                    {
-                        newest = current;
-                        found = true;
-                    }
+                    int order = newest is null ? -1 : cursor.CurrentKey.SequenceCompareTo(newest.CurrentKey);
+                    if (order < 0 || (order == 0 && cursor.CurrentSequence > newest!.CurrentSequence))
+                        newest = cursor;
                 }
 
-                if (!found)
+                if (newest is null)
                     break;
 
                 if (++keys % StopCheckInterval == 0 && _stop.IsCancellationRequested)
@@ -118,27 +118,37 @@ internal sealed class CompactionMerge
                     return null;
                 }
 
-                bool keep = sweep.Covering(newest.Key) < newest.Sequence
-                    && (newest.Kind == OperationKind.Put || MayExistBelow(below, newest.Key));
+                int keyLength = newest.CurrentKey.Length;
+                if (keyBuffer.Length < keyLength)
+                    keyBuffer = new byte[Math.Max(keyLength, 2 * keyBuffer.Length)];
+
+                newest.CurrentKey.CopyTo(keyBuffer);
+                ReadOnlySpan<byte> key = keyBuffer.AsSpan(0, keyLength);
+                long sequence = newest.CurrentSequence;
+                OperationKind kind = newest.CurrentKind;
+
+                bool keep = sweep.Covering(key) < sequence
+                    && (kind == OperationKind.Put || MayExistBelow(below, key));
                 if (keep)
                 {
                     // A full table ends before this key, with the tombstones below it.
                     if (full)
                     {
-                        outputs.Add(output!.Finish(kept.Take(newest.Key)));
+                        outputs.Add(output!.Finish(kept.Take(key.ToArray())));
                         output = null;
                         full = false;
                     }
 
+                    // The value goes from the input's block into the output's with no array between.
                     output ??= Start();
-                    output.Builder.Add(newest);
+                    output.Builder.Add(key, sequence, kind, newest.CurrentValue);
 
                     // Each key is written once, so the table can end after any of them.
                     full = output.Builder.EstimatedSize >= _targetFileSize;
                 }
 
                 foreach (IEntryCursor cursor in cursors)
-                    while (cursor.Valid && cursor.Current.Key.AsSpan().SequenceEqual(newest.Key))
+                    while (cursor.Valid && cursor.CurrentKey.SequenceEqual(key))
                         cursor.Next();
             }
 
@@ -158,9 +168,15 @@ internal sealed class CompactionMerge
             Discard(outputs, output);
             throw;
         }
+        finally
+        {
+            // Each cursor gives back the data block and the readahead window it holds.
+            foreach (IEntryCursor cursor in cursors)
+                cursor.Dispose();
+        }
     }
 
-    private static bool MayExistBelow(SortedLevel[] below, byte[] key)
+    private static bool MayExistBelow(SortedLevel[] below, ReadOnlySpan<byte> key)
     {
         foreach (SortedLevel level in below)
             if (level.MayContain(key))

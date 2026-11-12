@@ -10,11 +10,12 @@ namespace Solarium.Engine;
 internal interface IEntrySource
 {
     /// <summary>
-    /// The newest version of <paramref name="key"/> at or below <paramref name="snapshot"/>. An SSTable that reads
+    /// The newest version of <paramref name="key"/> at or below <paramref name="snapshot"/>, its value in a new
+    /// array and its key not copied. An SSTable that reads
     /// its index and filter again on a cache miss caches them unless <paramref name="fillCache"/> is false
     /// (<see cref="ReadOptions.FillCache"/>).
     /// </summary>
-    bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out Entry entry);
+    bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry);
 
     /// <summary>The highest sequence number of a range tombstone at or below <paramref name="snapshot"/> that covers <paramref name="key"/>, or 0.</summary>
     long CoveringTombstone(ReadOnlySpan<byte> key, long snapshot);
