@@ -20,6 +20,7 @@ public sealed class Iterator : IDisposable
     private readonly FamilyVersion _version;
     private readonly int _slot;
     private readonly IEntrySource[] _sources;
+    private readonly IEntrySource[] _tombstoneSources;   // the sources that hold a range tombstone at the snapshot
     private readonly IEntryCursor[] _cursors;
     private readonly long _snapshot;
     private readonly byte[]? _upperBound;
@@ -50,6 +51,16 @@ public sealed class Iterator : IDisposable
         _cursors = new IEntryCursor[_sources.Length];
         for (int i = 0; i < _sources.Length; i++)
             _cursors[i] = _sources[i].NewCursor(fillCache);
+
+        // Read after the snapshot was taken, once for each source: every range tombstone at or below the snapshot
+        // is in its source by now, and one that a memtable gains later is above it. Most stores hold none, and a
+        // forward step then asks no source.
+        List<IEntrySource>? withTombstones = null;
+        foreach (IEntrySource source in _sources)
+            if (source.HasTombstones)
+                (withTombstones ??= new List<IEntrySource>(_sources.Length)).Add(source);
+
+        _tombstoneSources = withTombstones is null ? [] : [.. withTombstones];
 
         _snapshot = snapshot;
         _upperBound = upperBound;
@@ -171,7 +182,7 @@ public sealed class Iterator : IDisposable
                     newest = cursor;
             }
 
-            if (newest is { CurrentKind: OperationKind.Put } && ReadPath.CoveringTombstone(_sources, key, _snapshot) < newest.CurrentSequence)
+            if (newest is { CurrentKind: OperationKind.Put } && ReadPath.CoveringTombstone(_tombstoneSources, key, _snapshot) < newest.CurrentSequence)
             {
                 Copy(newest.CurrentValue, ref _value, out _valueLength);
                 _valid = true;

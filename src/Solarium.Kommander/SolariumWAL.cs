@@ -469,8 +469,8 @@ public sealed class SolariumWAL : IWAL
         try
         {
             using EngineLease lease = AcquireEngine();
-            using Iterator iterator = _db.NewIterator(Shard(partitionId));
-            SeekToLastPartitionKey(iterator, partitionId);
+            using Iterator iterator = NewPartitionBoundedIterator(Shard(partitionId), partitionId);
+            iterator.SeekToLast();
             if (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId)
                 && ParseLogIdFromKey(iterator.Key()) >= GetCompactionFloor(partitionId))
             {
@@ -1604,8 +1604,8 @@ public sealed class SolariumWAL : IWAL
         if (!long.TryParse(_db.GetProperty("rocksdb.num-entries-active-mem-table", family), NumberStyles.None, CultureInfo.InvariantCulture, out long activeEntries))
             return long.MaxValue;
 
-        using Iterator iterator = _db.NewIterator(family);
-        SeekToLastPartitionKey(iterator, partitionId);
+        using Iterator iterator = NewPartitionBoundedIterator(family, partitionId);
+        iterator.SeekToLast();
         if (!iterator.Valid() || !KeyBelongsToPartition(iterator.Key(), partitionId))
             return long.MaxValue;
 
@@ -1929,8 +1929,8 @@ public sealed class SolariumWAL : IWAL
     private long ScanHighestCheckpointAtMost(int partitionId, ColumnFamily family, long upperIdInclusive)
     {
         long floor = GetCompactionFloor(partitionId);
-        using Iterator iterator = _db.NewIterator(family);
-        SeekToLastPartitionKey(iterator, partitionId);
+        using Iterator iterator = NewPartitionBoundedIterator(family, partitionId);
+        iterator.SeekToLast();
         for (; iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId); iterator.Prev())
         {
             long id = ParseLogIdFromKey(iterator.Key());
@@ -1954,8 +1954,8 @@ public sealed class SolariumWAL : IWAL
     // row. Not clamped at the floor. Runs where no append or truncation interleaves.
     private long ScanMaxLogId(int partitionId)
     {
-        using Iterator iterator = _db.NewIterator(Shard(partitionId));
-        SeekToLastPartitionKey(iterator, partitionId);
+        using Iterator iterator = NewPartitionBoundedIterator(Shard(partitionId), partitionId);
+        iterator.SeekToLast();
         return iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId) ? ParseLogIdFromKey(iterator.Key()) : 0;
     }
 
@@ -2346,17 +2346,6 @@ public sealed class SolariumWAL : IWAL
         return id;
     }
 
-    private static void SeekToLastPartitionKey(Iterator iterator, int partitionId)
-    {
-        Span<byte> upperBound = stackalloc byte[PartitionIdWidth + 1];
-        BuildPartitionUpperBoundKey(upperBound, partitionId);
-        iterator.Seek(upperBound);
-        if (iterator.Valid())
-            iterator.Prev();
-        else
-            iterator.SeekToLast();
-    }
-
     // Fixed-width decimal, left-padded with '0', so keys sort by number.
     private static void ToDecimalBytes(Span<byte> result, long value)
     {
@@ -2382,6 +2371,8 @@ public sealed class SolariumWAL : IWAL
     }
 
     // An iterator that stops at the end of the partition, never walking into the next one of a shared shard.
+    // Its SeekToLast lands on the last row below that end, the partition's last row when it has one, with one
+    // backward search: a Seek to the end and a Prev would also place a cursor in every source first.
     // See NewBoundedIterator for fillCache.
     private Iterator NewPartitionBoundedIterator(ColumnFamily family, int partitionId, bool fillCache = true)
     {

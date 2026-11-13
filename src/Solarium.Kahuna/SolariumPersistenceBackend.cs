@@ -2018,30 +2018,51 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
 
     /// <summary>
     /// True when a registered tilde prefix could cover a logical key that starts with
-    /// "<paramref name="blockKey"/>~" — a sibling key whose row block can sort between a
+    /// "<paramref name="blockKeyUtf8"/>~" — a sibling key whose row block can sort between a
     /// revision row of this block and the block's ~CURRENT row. When this returns false and
     /// the registry is authoritative, no such sibling exists in the store, so a seek from a
     /// revision row of the block straight to its ~CURRENT row cannot jump over any row of
     /// another key. Prefix families overlap exactly when one string is a prefix of the other.
     /// </summary>
-    private bool TildeRegistryBlocksSkip(string blockKey)
+    private bool TildeRegistryBlocksSkip(ReadOnlySpan<byte> blockKeyUtf8)
     {
         string[] snapshot = tildePrefixes;
 
-        for (int i = 0; i < snapshot.Length; i++)
-        {
-            string prefix = snapshot[i];
+        // A store with no tilde key, the usual one, answers before the key is decoded.
+        if (snapshot.Length == 0)
+            return false;
 
-            if (prefix.Length > blockKey.Length)
+        // The prefixes are strings, so the key is compared as chars: decoded into a buffer, not a new string.
+        int maxChars = Encoding.UTF8.GetMaxCharCount(blockKeyUtf8.Length);
+        char[]? rented = null;
+        Span<char> buffer = maxChars <= KeyStackThreshold
+            ? stackalloc char[KeyStackThreshold]
+            : (rented = ArrayPool<char>.Shared.Rent(maxChars));
+
+        try
+        {
+            ReadOnlySpan<char> blockKey = buffer[..Encoding.UTF8.GetChars(blockKeyUtf8, buffer)];
+
+            for (int i = 0; i < snapshot.Length; i++)
             {
-                if (prefix.AsSpan(0, blockKey.Length).SequenceEqual(blockKey) && prefix[blockKey.Length] == '~')
+                string prefix = snapshot[i];
+
+                if (prefix.Length > blockKey.Length)
+                {
+                    if (prefix.AsSpan(0, blockKey.Length).SequenceEqual(blockKey) && prefix[blockKey.Length] == '~')
+                        return true;
+                }
+                else if (blockKey[..prefix.Length].SequenceEqual(prefix))
                     return true;
             }
-            else if (blockKey.AsSpan(0, prefix.Length).SequenceEqual(prefix))
-                return true;
-        }
 
-        return false;
+            return false;
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<char>.Shared.Return(rented);
+        }
     }
 
     /// <summary>
@@ -2069,7 +2090,7 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
 
         ReadOnlySpan<byte> blockKeyBytes = rawKey[..lastTilde];
 
-        if (TildeRegistryBlocksSkip(Encoding.UTF8.GetString(blockKeyBytes)))
+        if (TildeRegistryBlocksSkip(blockKeyBytes))
             return false;
 
         int targetLen = lastTilde + CurrentMarkerUtf8.Length;
@@ -2584,6 +2605,25 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     /// </summary>
     private ReadOnlyKeyValueEntry?[] GetKeyValueRevisionsFenced(string keyName, ReadOnlySpan<long> revisions)
     {
+        byte[]?[] values = GetKeyValueRevisionRowsFenced(keyName, revisions);
+
+        ReadOnlyKeyValueEntry?[] results = new ReadOnlyKeyValueEntry?[revisions.Length];
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (values[i] is { } value)
+                results[i] = DecodeRevisionRow(value);
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// The serialized rows that <see cref="GetKeyValueRevisionsFenced"/> decodes, index-aligned, null where no
+    /// such row exists: for a caller that keeps one row of them, and reads the ordering fields of the others
+    /// without their payloads (<see cref="DecodeKeyValueOrdering"/>). Must run under the swap fence.
+    /// </summary>
+    private byte[]?[] GetKeyValueRevisionRowsFenced(string keyName, ReadOnlySpan<long> revisions)
+    {
         int keyLen = Encoding.UTF8.GetByteCount(keyName);
         byte[][] keys = new byte[revisions.Length][];
 
@@ -2600,16 +2640,7 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
             keys[i] = key;
         }
 
-        byte[]?[] values = db.MultiGet(keys, columnFamilyKeys);
-
-        ReadOnlyKeyValueEntry?[] results = new ReadOnlyKeyValueEntry?[revisions.Length];
-        for (int i = 0; i < values.Length; i++)
-        {
-            if (values[i] is { } value)
-                results[i] = DecodeRevisionRow(value);
-        }
-
-        return results;
+        return db.MultiGet(keys, columnFamilyKeys);
     }
 
     /// <summary>
@@ -2725,19 +2756,23 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
                 while (count < RevisionProbeBatch && next >= 0)
                     probe[count++] = next--;
 
-                ReadOnlyKeyValueEntry?[] rows = GetKeyValueRevisionsFenced(keyName, probe[..count]);
+                byte[]?[] rows = GetKeyValueRevisionRowsFenced(keyName, probe[..count]);
 
                 bool anyPresent = false;
                 for (int i = 0; i < count; i++)
                 {
-                    ReadOnlyKeyValueEntry? row = rows[i];
+                    byte[]? row = rows[i];
                     if (row is null)
                         continue;
 
                     anyPresent = true;
                     tally.RevisionRowsExamined++;
-                    if (row.LastModified.CompareTo(readTimestamp) <= 0)
-                        return row;
+
+                    // The commit timestamp alone picks the row, so only the row picked is decoded with its payload.
+                    StoredKeyValueOrdering ordering = DecodeKeyValueOrdering(row);
+                    HLCTimestamp lastModified = new(ordering.LastModifiedNode, ordering.LastModifiedPhysical, ordering.LastModifiedCounter);
+                    if (lastModified.CompareTo(readTimestamp) <= 0)
+                        return DecodeRevisionRow(row);
                 }
 
                 walkCeiling = probe[count - 1] - 1;
@@ -2811,11 +2846,13 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
 
                 if (revision <= maxRevision)
                 {
-                    RocksDbKeyValueMessage message = UnserializeKeyValueMessage(iterator.Value(), shell);
-                    HLCTimestamp lastModified = new(message.LastModifiedNode, message.LastModifiedPhysical, message.LastModifiedCounter);
+                    // The ordering fields decide whether the row is the best so far; its payload is copied only then.
+                    StoredKeyValueOrdering ordering = DecodeKeyValueOrdering(iterator.Value());
+                    HLCTimestamp lastModified = new(ordering.LastModifiedNode, ordering.LastModifiedPhysical, ordering.LastModifiedCounter);
 
                     if (lastModified.CompareTo(readTimestamp) <= 0 && revision > bestRevision)
                     {
+                        RocksDbKeyValueMessage message = UnserializeKeyValueMessage(iterator.Value(), shell);
                         byte[]? messageValue = ByteStringPayload.GetArrayOrNull(message.HasValue, message.Value);
 
                         best = new(
@@ -3053,8 +3090,10 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
                     continue;
                 }
 
-                RocksDbKeyValueMessage message = UnserializeKeyValueMessage(iterator.Value(), shell);
-                HLCTimestamp lastModified = new(message.LastModifiedNode, message.LastModifiedPhysical, message.LastModifiedCounter);
+                // A row committed after the read timestamp is not a candidate: its ordering fields show
+                // that, so its payload is never copied.
+                StoredKeyValueOrdering ordering = DecodeKeyValueOrdering(iterator.Value());
+                HLCTimestamp lastModified = new(ordering.LastModifiedNode, ordering.LastModifiedPhysical, ordering.LastModifiedCounter);
 
                 if (lastModified.CompareTo(readTimestamp) <= 0)
                 {
@@ -3062,12 +3101,12 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
                     {
                         revisionAccumulator.Second = revisionAccumulator.Best;
                         revisionAccumulator.SecondRevision = revisionAccumulator.BestRevision;
-                        revisionAccumulator.Best = DecodeReadOnlyKeyValue(message);
+                        revisionAccumulator.Best = DecodeReadOnlyKeyValue(UnserializeKeyValueMessage(iterator.Value(), shell));
                         revisionAccumulator.BestRevision = revision;
                     }
                     else if (revisionAccumulator.Second is null || revision > revisionAccumulator.SecondRevision)
                     {
-                        revisionAccumulator.Second = DecodeReadOnlyKeyValue(message);
+                        revisionAccumulator.Second = DecodeReadOnlyKeyValue(UnserializeKeyValueMessage(iterator.Value(), shell));
                         revisionAccumulator.SecondRevision = revision;
                     }
                 }

@@ -17,6 +17,13 @@ internal interface IEntrySource
     /// </summary>
     bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry);
 
+    /// <summary>
+    /// False when the source holds no range tombstone, so <see cref="CoveringTombstone"/> is 0 for every key. A
+    /// memtable can gain one later, with a sequence number above every snapshot taken before this was read; an
+    /// SSTable and a sorted level never change.
+    /// </summary>
+    bool HasTombstones { get; }
+
     /// <summary>The highest sequence number of a range tombstone at or below <paramref name="snapshot"/> that covers <paramref name="key"/>, or 0.</summary>
     long CoveringTombstone(ReadOnlySpan<byte> key, long snapshot);
 

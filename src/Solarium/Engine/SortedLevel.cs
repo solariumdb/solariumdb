@@ -20,7 +20,10 @@ internal sealed class SortedLevel : IEntrySource
     {
         _tables = tables;
         foreach (TableReader table in tables)
+        {
             Size += table.Properties.Size;
+            HasTombstones |= table.HasTombstones;
+        }
     }
 
     /// <summary>The files of the level, in key order.</summary>
@@ -58,12 +61,31 @@ internal sealed class SortedLevel : IEntrySource
         return table.TryGetNewest(key, snapshot, fillCache, out entry);
     }
 
+    /// <summary>
+    /// <see cref="TryGetNewest(ReadOnlySpan{byte}, long, bool, out EntryVersion)"/> with the key's filter hash
+    /// (<see cref="TableReader.FilterHash"/>), for a lookup that computed it once for all its sources.
+    /// </summary>
+    public bool TryGetNewest(ReadOnlySpan<byte> key, ulong hash, long snapshot, bool fillCache, out EntryVersion entry)
+    {
+        TableReader? table = TableFor(key);
+        if (table is null)
+        {
+            entry = default;
+            return false;
+        }
+
+        return table.TryGetNewest(key, hash, snapshot, fillCache, out entry);
+    }
+
     /// <inheritdoc />
     /// <remarks>
     /// A file's key range covers its range tombstones, so only the file whose range holds the key can
     /// have a tombstone that covers it.
     /// </remarks>
-    public long CoveringTombstone(ReadOnlySpan<byte> key, long snapshot) => TableFor(key)?.CoveringTombstone(key, snapshot) ?? 0;
+    public bool HasTombstones { get; }
+
+    /// <inheritdoc />
+    public long CoveringTombstone(ReadOnlySpan<byte> key, long snapshot) => HasTombstones ? TableFor(key)?.CoveringTombstone(key, snapshot) ?? 0 : 0;
 
     /// <inheritdoc />
     public byte[]? LastKeyBefore(byte[]? limit, bool fillCache)

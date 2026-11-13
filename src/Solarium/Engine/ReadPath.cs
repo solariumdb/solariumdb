@@ -23,11 +23,33 @@ internal static class ReadPath
         value = null;
         long covering = 0;
 
+        // The hash that the tables' filters take, computed at the first table: a key that a memtable answers
+        // is never hashed, and a key that several tables search is hashed once.
+        ulong hash = 0;
+        bool hashed = false;
+
         foreach (IEntrySource source in sources)
         {
             covering = Math.Max(covering, source.CoveringTombstone(key, snapshot));
 
-            if (source.TryGetNewest(key, snapshot, fillCache, out EntryVersion entry))
+            bool found;
+            EntryVersion entry;
+            if (source is MemTable)
+                found = source.TryGetNewest(key, snapshot, fillCache, out entry);
+            else
+            {
+                if (!hashed)
+                {
+                    hash = TableReader.FilterHash(key);
+                    hashed = true;
+                }
+
+                found = source is SortedLevel level
+                    ? level.TryGetNewest(key, hash, snapshot, fillCache, out entry)
+                    : ((TableReader)source).TryGetNewest(key, hash, snapshot, fillCache, out entry);
+            }
+
+            if (found)
             {
                 if (entry.Kind == OperationKind.Put && covering < entry.Sequence)
                 {
@@ -60,6 +82,7 @@ internal static class ReadPath
         byte[]?[] values = new byte[]?[count];
         int[] next = new int[count];          // the source each key searches next
         long[] covering = new long[count];    // the highest range tombstone over the sources it searched
+        ulong[] hashes = new ulong[count];    // the hash for the tables' filters, 0 until the key reaches a table
         int capacity = Math.Min(count, MaxBatchKeys);
         List<int> pending = new(capacity);
 
@@ -76,7 +99,7 @@ internal static class ReadPath
             for (int i = start; i < Math.Min(count, start + MaxBatchKeys); i++)
                 pending.Add(i);
 
-            rounds += ReadBatch(sources, keys, snapshot, fillCache, environment, values, next, covering, pending, waiting, blockOf, blocks, distinct);
+            rounds += ReadBatch(sources, keys, snapshot, fillCache, environment, values, next, covering, hashes, pending, waiting, blockOf, blocks, distinct);
         }
 
         return values;
@@ -84,7 +107,7 @@ internal static class ReadPath
 
     // The rounds of one batch of keys, the pending ones, until each is settled; returns the rounds that read blocks.
     private static int ReadBatch(IEntrySource[] sources, IReadOnlyList<byte[]> keys, long snapshot, bool fillCache, IStorageEnvironment environment,
-        byte[]?[] values, int[] next, long[] covering, List<int> pending, List<int> waiting, List<int> blockOf,
+        byte[]?[] values, int[] next, long[] covering, ulong[] hashes, List<int> pending, List<int> waiting, List<int> blockOf,
         List<(TableReader Table, DataBlockHandle Handle)> blocks, Dictionary<(TableReader, long), int> distinct)
     {
         int rounds = 0;
@@ -96,7 +119,7 @@ internal static class ReadPath
             distinct.Clear();
             foreach (int k in pending)
             {
-                if (!Advance(sources, keys[k], snapshot, fillCache, ref next[k], ref covering[k], out values[k], out TableReader? table, out DataBlockHandle handle))
+                if (!Advance(sources, keys[k], snapshot, fillCache, ref next[k], ref covering[k], ref hashes[k], out values[k], out TableReader? table, out DataBlockHandle handle))
                     continue;
 
                 if (!distinct.TryGetValue((table!, handle.Offset), out int block))
@@ -134,7 +157,7 @@ internal static class ReadPath
     // Search key's sources from next, adding each one's covering tombstone, until one decides the key or a table
     // must read a data block that its cache does not hold. Returns true with the table and block to read, next
     // past that table; false with the key's value settled.
-    private static bool Advance(IEntrySource[] sources, byte[] key, long snapshot, bool fillCache, ref int next, ref long covering,
+    private static bool Advance(IEntrySource[] sources, byte[] key, long snapshot, bool fillCache, ref int next, ref long covering, ref ulong hash,
         out byte[]? value, out TableReader? table, out DataBlockHandle handle)
     {
         value = null;
@@ -153,7 +176,12 @@ internal static class ReadPath
 
             if (table is not null)
             {
-                if (!table.TryLocate(key, snapshot, fillCache, out handle))
+                // Computed at the key's first table and kept for the others, in this round and the next ones. A
+                // hash of 0 is computed again at each table, which costs only the time.
+                if (hash == 0)
+                    hash = TableReader.FilterHash(key);
+
+                if (!table.TryLocate(key, hash, snapshot, fillCache, out handle))
                     continue;
 
                 if (!table.TryGetCachedBlock(handle, out NativeBlock? cached))

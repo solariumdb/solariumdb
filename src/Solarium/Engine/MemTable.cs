@@ -430,6 +430,9 @@ internal sealed unsafe class MemTable : IEntrySource
     }
 
     /// <inheritdoc />
+    public bool HasTombstones => Volatile.Read(ref _tombstones).Count > 0;
+
+    /// <inheritdoc />
     public long CoveringTombstone(ReadOnlySpan<byte> key, long snapshot) => Volatile.Read(ref _tombstones).Covering(key, snapshot);
 
     /// <inheritdoc />

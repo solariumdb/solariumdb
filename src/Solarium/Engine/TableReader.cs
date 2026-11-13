@@ -225,10 +225,17 @@ internal sealed class TableReader : IEntrySource, IDisposable
     }
 
     /// <inheritdoc />
-    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry)
+    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry) =>
+        TryGetNewest(key, FilterHash(key), snapshot, fillCache, out entry);
+
+    /// <summary>
+    /// <see cref="TryGetNewest(ReadOnlySpan{byte}, long, bool, out EntryVersion)"/> with the key's
+    /// <see cref="FilterHash"/> as <paramref name="hash"/>, for a lookup that computed it once for all its sources.
+    /// </summary>
+    public bool TryGetNewest(ReadOnlySpan<byte> key, ulong hash, long snapshot, bool fillCache, out EntryVersion entry)
     {
         entry = default;
-        if (!TryLocate(key, snapshot, fillCache, out DataBlockHandle handle))
+        if (!TryLocate(key, hash, snapshot, fillCache, out DataBlockHandle handle))
             return false;
 
         // Only the value is copied out of the block.
@@ -242,7 +249,20 @@ internal sealed class TableReader : IEntrySource, IDisposable
     /// version of the key at or below the snapshot. See <see cref="IEntrySource.TryGetNewest"/> for
     /// <paramref name="fillCache"/>.
     /// </summary>
-    public bool TryLocate(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out DataBlockHandle handle)
+    public bool TryLocate(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out DataBlockHandle handle) =>
+        TryLocate(key, FilterHash(key), snapshot, fillCache, out handle);
+
+    /// <summary>
+    /// The hash of <paramref name="key"/> that every table's Bloom filter is built from and probed with. A lookup
+    /// computes it once and gives it to each table it searches.
+    /// </summary>
+    public static ulong FilterHash(ReadOnlySpan<byte> key) => XxHash3.HashToUInt64(key);
+
+    /// <summary>
+    /// <see cref="TryLocate(ReadOnlySpan{byte}, long, bool, out DataBlockHandle)"/> with the key's
+    /// <see cref="FilterHash"/> as <paramref name="hash"/>.
+    /// </summary>
+    public bool TryLocate(ReadOnlySpan<byte> key, ulong hash, long snapshot, bool fillCache, out DataBlockHandle handle)
     {
         handle = default;
         int partition = _partitions.Index.FindBlock(key, snapshot);
@@ -252,7 +272,7 @@ internal sealed class TableReader : IEntrySource, IDisposable
         // The partition's last entry is at or after (key, snapshot), so the first entry at or after it is in
         // the partition, and the partition's filter has the key if that entry is a version of it.
         IndexAndFilter blocks = Partition(partition, fillCache);
-        if (!blocks.Filter.MayContain(XxHash3.HashToUInt64(key)))
+        if (!blocks.Filter.MayContain(hash))
             return false;
 
         // The block's last entry is at or after (key, snapshot), so the first entry at or after it is in this block.
@@ -347,6 +367,9 @@ internal sealed class TableReader : IEntrySource, IDisposable
         entry = new EntryVersion(sequence, kind, kind == OperationKind.Put ? value.ToArray() : null);
         return true;
     }
+
+    /// <inheritdoc />
+    public bool HasTombstones => _tombstones.Length > 0;
 
     /// <inheritdoc />
     public long CoveringTombstone(ReadOnlySpan<byte> key, long snapshot)

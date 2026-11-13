@@ -183,9 +183,9 @@ A memtable node and its key are one place in its native arena, so each step of a
 | --- | ---: | ---: | ---: |
 | `Get` | 1,115 ns | 371 ns | 152 B |
 | `GetMissing` | 97 ns | 89 ns | 0 B |
-| `IteratorNext` | 44 ns | 31 ns | 0 B |
+| `IteratorNext` | 38 ns | 26 ns | 0 B |
 
-A table cursor reads each key and value in place in its data block, and reads the file ahead once its reads follow one another, so a step of a scan allocates nothing. When the cursor copied each entry of a block into new arrays and read one block at a time, a step took 69 ns from the file and 44 ns from the cache, and allocated 208 B.
+A table cursor reads each key and value in place in its data block, and reads the file ahead once its reads follow one another, so a step of a scan allocates nothing. An iterator asks only the sources that hold a range tombstone whether one covers a key, so in a store with none a step asks no source: with a question to every source, a step took 44 ns and 31 ns. When the cursor copied each entry of a block into new arrays and read one block at a time, a step took 69 ns from the file and 44 ns from the cache, and allocated 208 B.
 
 `CompactRangeBenchmarks` times one manual compaction and one flush, each on a store that its iteration builds: 1,000,000 `Put`s of a 31-byte key and a 128-byte value, keys drawn at random from 500,000, in four level 0 tables that the compaction merges; the flush writes the last quarter of them. On the same development machine, the median of 10 runs, which include the flush of the output to the drive:
 
