@@ -638,6 +638,15 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     }
 
     /// <summary>
+    /// Test seam: how many flushes and compactions the engine runs now. After the engine stops its writes for
+    /// a failure it starts no new one, but one that ran at the failure still ends, and a flush still saves the
+    /// manifest; a test that compares the store's files waits for 0 first.
+    /// </summary>
+    internal long RunningBackgroundJobsForTesting() =>
+        long.Parse(db.GetProperty("rocksdb.num-running-flushes")!, System.Globalization.CultureInfo.InvariantCulture)
+        + long.Parse(db.GetProperty("rocksdb.num-running-compactions")!, System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
     /// Test seam: flushes the key-value family's memtable and compacts the whole family into its bottom
     /// level, and waits. The flush comes first because Solarium's <c>CompactRange</c>, unlike RocksDB's,
     /// does not flush a memtable that overlaps the range.

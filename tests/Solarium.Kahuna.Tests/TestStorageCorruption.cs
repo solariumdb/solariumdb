@@ -166,6 +166,8 @@ public sealed class TestStorageCorruption : IDisposable
         Assert.Contains("accepts no more writes after a WAL, flush or compaction failure", backend.GetFailStopReason(), StringComparison.Ordinal);
         Assert.Contains("bad checksum", backend.GetFailStopReason(), StringComparison.Ordinal);
 
+        // A flush that ran when the compaction failed still writes its table and saves the manifest.
+        Assert.True(WaitUntil(() => backend.RunningBackgroundJobsForTesting() == 0));
         foreach (string file in StoreFiles())
             before[Path.GetFileName(file)] = File.ReadAllBytes(file);
 
