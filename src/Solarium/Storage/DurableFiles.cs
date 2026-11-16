@@ -115,13 +115,28 @@ internal static partial class DurableFiles
     /// <c>sync_file_range(SYNC_FILE_RANGE_WRITE)</c> on Linux: start the writeback of the range and do not
     /// wait for it. Nothing elsewhere, and nothing where the file system has no such call (ENOSYS).
     /// </summary>
+    /// <remarks>
+    /// This call and <see cref="Flush"/> hold a reference on the handle while they use its descriptor. A
+    /// <c>Dispose</c> on another thread then cannot close the descriptor, and the system cannot give its number
+    /// to another file, before the call is done.
+    /// </remarks>
     public static void SyncRange(SafeFileHandle handle, long offset, long length)
     {
         if (!OperatingSystem.IsLinux())
             return;
 
-        if (sync_file_range((int)handle.DangerousGetHandle(), offset, length, SyncFileRangeWrite) != 0 && Marshal.GetLastPInvokeError() != LinuxENOSYS)
-            throw Errno("sync_file_range");
+        bool added = false;
+        try
+        {
+            handle.DangerousAddRef(ref added);
+            if (sync_file_range((int)handle.DangerousGetHandle(), offset, length, SyncFileRangeWrite) != 0 && Marshal.GetLastPInvokeError() != LinuxENOSYS)
+                throw Errno("sync_file_range");
+        }
+        finally
+        {
+            if (added)
+                handle.DangerousRelease();
+        }
     }
 
     /// <summary>
@@ -143,8 +158,18 @@ internal static partial class DurableFiles
         }
 
         ObjectDisposedException.ThrowIf(handle.IsClosed, handle);
-        if (fdatasync((int)handle.DangerousGetHandle()) != 0)
-            throw Errno("fdatasync");
+        bool added = false;
+        try
+        {
+            handle.DangerousAddRef(ref added);
+            if (fdatasync((int)handle.DangerousGetHandle()) != 0)
+                throw Errno("fdatasync");
+        }
+        finally
+        {
+            if (added)
+                handle.DangerousRelease();
+        }
     }
 
     private static IOException Errno(string operation)

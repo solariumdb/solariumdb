@@ -78,7 +78,8 @@ internal sealed unsafe class Arena
         if (size > LargeAllocation)
             return AllocateLarge(size);
 
-        Shard shard = _shards[Thread.GetCurrentProcessorId() % _shards.Length];
+        // The processor id is a hint that can exceed the processor count, and no contract says it is not negative.
+        Shard shard = _shards[(uint)Thread.GetCurrentProcessorId() % (uint)_shards.Length];
         while (true)
         {
             // The add claims the bytes of the chunk this thread read, whichever chunk the shard holds by then:

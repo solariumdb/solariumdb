@@ -1214,8 +1214,9 @@ public sealed class SolariumDb : IDisposable
         while (bucket < SpinWaitTickLimits.Length && waited > SpinWaitTickLimits[bucket])
             bucket++;
 
-        // The processor id can be stale, which costs only a shared line now and then; the count is exact.
-        int row = Thread.GetCurrentProcessorId() % Environment.ProcessorCount * WaitTimeStride;
+        // The processor id can be stale, which costs only a shared line now and then; the count is exact. No
+        // contract says the id is not negative.
+        int row = (int)((uint)Thread.GetCurrentProcessorId() % (uint)Environment.ProcessorCount) * WaitTimeStride;
         Interlocked.Increment(ref _spinWaitTimes[row + bucket]);
         return turn;
     }

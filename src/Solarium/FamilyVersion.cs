@@ -126,7 +126,8 @@ internal sealed class FamilyVersion
     /// </summary>
     public int Enter()
     {
-        int slot = Thread.GetCurrentProcessorId() % SlotCount * Stride;
+        // The processor id is a hint, and no contract says it is not negative.
+        int slot = (int)((uint)Thread.GetCurrentProcessorId() % (uint)SlotCount) * Stride;
         Interlocked.Increment(ref _readers[slot]);
         return slot;
     }

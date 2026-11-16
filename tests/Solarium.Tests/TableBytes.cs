@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.IO.Hashing;
 using Solarium.Engine;
 
 namespace Solarium.Tests;
@@ -28,6 +29,22 @@ internal static class TableBytes
     {
         int at = table.Length - TableFormat.FooterSize4 + (handle * 12);
         return ((int)BinaryPrimitives.ReadInt64LittleEndian(table.AsSpan(at)), BinaryPrimitives.ReadInt32LittleEndian(table.AsSpan(at + 8)));
+    }
+
+    /// <summary>
+    /// Points footer handle <paramref name="handle"/> at (<paramref name="offset"/>, <paramref name="size"/>) and writes
+    /// the footer's checksum to match, so only the checks of the handles can find the change. The checksum covers all
+    /// of the footer before it: the table id from version 5, the handles and the version.
+    /// </summary>
+    public static void SetFooterHandle(byte[] table, int handle, long offset, int size)
+    {
+        int at = table.Length - TableFormat.FooterSize4 + (handle * 12);
+        BinaryPrimitives.WriteInt64LittleEndian(table.AsSpan(at), offset);
+        BinaryPrimitives.WriteInt32LittleEndian(table.AsSpan(at + 8), size);
+
+        int footer = table.Length - (Version(table) == TableFormat.Version ? TableFormat.FooterSize : TableFormat.FooterSize4);
+        int checksum = table.Length - 12;
+        BinaryPrimitives.WriteUInt32LittleEndian(table.AsSpan(checksum), Crc32.HashToUInt32(table.AsSpan(footer, checksum - footer)));
     }
 
     /// <summary>

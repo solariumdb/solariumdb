@@ -960,10 +960,12 @@ internal sealed class TableReader : IEntrySource, IDisposable
         }
     }
 
-    // A handle must point inside the file, so a corrupt size cannot cause a huge allocation.
+    // A handle must point inside the file, so a corrupt size cannot cause a huge allocation. The end is compared as
+    // limit - size, which cannot overflow (limit is not negative and size is at least 4): offset + size can, and an
+    // offset near the largest long would then pass with a negative end.
     private static void CheckHandle(long number, long offset, int size, long limit)
     {
-        if (offset < 0 || size < 4 || offset + size > limit)
+        if (offset < 0 || size < 4 || offset > limit - size)
             throw Corrupt(number, $"a block handle ({offset}, {size}) points outside the file");
     }
 

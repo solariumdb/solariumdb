@@ -108,7 +108,9 @@ internal sealed class WriteAheadLog : IDisposable
                 continue;
             }
 
-            if (result == ParseResult.NeedMore && !endOfFile)
+            // A record that reaches past the end of the file is torn: the buffer does not grow for it, so a damaged
+            // length cannot cost an allocation that the bytes of the file do not back.
+            if (result == ParseResult.NeedMore && !endOfFile && recordOffset + size <= fileLength)
             {
                 // Move the partial record to the front, grow the buffer if it cannot fit, read more.
                 int partial = filled - start;
@@ -443,11 +445,21 @@ internal sealed class WriteAheadLog : IDisposable
     // past it, which proves the damaged bytes had been flushed; or -1 when there is none. Records
     // start anywhere, so every offset is tried; a candidate must be a later batch, with a durable
     // offset between the damage and its own start, before its checksum is computed.
+    //
+    // Candidates can overlap, so a file with one every few bytes would make the checksums cost the square of its
+    // length. The records of a real file do not overlap, and their checksums cost no more than the bytes after the
+    // damage. So the scan checks at most four times those bytes and 64 MiB more, and counts each candidate as one
+    // read at least. Past that, it cannot tell whether the damage had been flushed, and the open fails rather than
+    // drop the data after it.
     private static long DurableOffsetAfter(IStorageFile file, long damaged, long fileLength, long lastSequence)
     {
         const int Window = 1 << 20;
+        const int ReadCost = 4096;
         int prefix = HeaderSize + BatchHeaderSize(Version);
+        long budget = (4 * (fileLength - damaged)) + (64 << 20);
         byte[] chunk = new byte[Window + prefix];
+        byte[]? payload = null;   // a candidate's payload, a window at a time
+        Crc32 crc = new();
         for (long chunkOffset = damaged + 1; chunkOffset + prefix <= fileLength; chunkOffset += Window)
         {
             int read = ReadFully(file, chunk.AsSpan(0, (int)Math.Min(chunk.Length, fileLength - chunkOffset)), chunkOffset);
@@ -464,14 +476,38 @@ internal sealed class WriteAheadLog : IDisposable
                 if (firstSequence <= lastSequence || durableOffset <= damaged || durableOffset > offset)
                     continue;
 
-                byte[] payload = new byte[payloadLength];
-                if (ReadFully(file, payload, offset + HeaderSize) == payload.Length
-                    && Crc32.HashToUInt32(payload) == ReadUInt32LittleEndian(candidate[4..]))
+                budget -= Math.Max(payloadLength, ReadCost);
+                if (budget < 0)
+                    throw SolariumException.Corruption(
+                        $"The WAL is corrupt at offset {damaged}, and the {fileLength - damaged} bytes after it hold more records with bad checksums than a crash leaves, " +
+                        "too many to check for an intact one that shows the damage had been flushed. The database refuses to open rather than drop the data after it.");
+
+                payload ??= new byte[Window];
+                if (HasChecksum(file, offset + HeaderSize, payloadLength, ReadUInt32LittleEndian(candidate[4..]), payload, crc))
                     return offset;
             }
         }
 
         return -1;
+    }
+
+    // Whether the length bytes of the file at offset are all there and have the CRC-32 checksum, read a buffer at a
+    // time, so a candidate's payload costs no array of its own length.
+    private static bool HasChecksum(IStorageFile file, long offset, long length, uint checksum, byte[] buffer, Crc32 crc)
+    {
+        crc.Reset();
+        while (length > 0)
+        {
+            int read = file.Read(buffer.AsSpan(0, (int)Math.Min(buffer.Length, length)), offset);
+            if (read == 0)
+                return false;
+
+            crc.Append(buffer.AsSpan(0, read));
+            offset += read;
+            length -= read;
+        }
+
+        return crc.GetCurrentHashAsUInt32() == checksum;
     }
 
     private static int ReadFully(IStorageFile file, Span<byte> buffer, long offset)

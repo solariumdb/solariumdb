@@ -167,6 +167,58 @@ public sealed class WriteAheadLogTests : IDisposable
         Assert.Equal([(1, "put 0 a=1")], Replay());
     }
 
+    // A length that reaches past the end of the file can only be a torn record: the open cuts it off without a
+    // buffer of that length, which the bytes of the file do not back.
+    [Fact]
+    public void A_record_length_past_the_end_of_the_file_is_a_torn_tail_that_costs_no_buffer_of_its_length()
+    {
+        Append(1, Put(0, "a", "1"));
+        long intact = new FileInfo(WalPath).Length;
+        byte[] torn = new byte[64];
+        BitConverter.TryWriteBytes(torn.AsSpan(0, 4), 256 * 1024 * 1024);   // the largest length a record may have
+        AppendRaw(torn);
+
+        long allocated = GC.GetAllocatedBytesForCurrentThread();
+        Assert.Equal([(1, "put 0 a=1")], Replay());
+        allocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
+
+        Assert.Equal(intact, new FileInfo(WalPath).Length);
+        Assert.True(allocated < 16 << 20, $"the open cost {allocated} bytes");
+    }
+
+    // After damage, the open looks for an intact record that shows the damage had been flushed. A record can start
+    // at any byte and its checksum covers up to its whole length, so a file with a record header every few bytes
+    // would make the scan cost the square of the file's length. The scan stops at a few times the bytes after the
+    // damage and refuses the open: it cannot tell then whether the damage had been flushed, and it does not drop
+    // data that it cannot show a crash left.
+    [Fact]
+    public void A_damage_scan_with_more_bad_records_than_a_crash_leaves_refuses_to_open()
+    {
+        const int Length = 2 << 20;
+        const int RecordHeader = 28;   // length, checksum, first sequence, durable offset, operation count
+        using (WriteAheadLog.Create(DefaultStorageEnvironment.Instance.OpenFile(WalPath)))
+        {
+        }
+
+        // The damage: a length no record has, at offset 8. From there on, a header every 28 bytes of a later batch
+        // whose durable offset is past the damage, with a length that fits the file and a checksum that fails.
+        byte[] rest = new byte[Length - 8];
+        BitConverter.TryWriteBytes(rest.AsSpan(0, 4), uint.MaxValue);
+        for (int at = 4; at + RecordHeader <= rest.Length; at += RecordHeader)
+        {
+            BitConverter.TryWriteBytes(rest.AsSpan(at, 4), 1 << 20);
+            BitConverter.TryWriteBytes(rest.AsSpan(at + 8, 8), 1L);
+            BitConverter.TryWriteBytes(rest.AsSpan(at + 16, 8), 9L);
+        }
+
+        AppendRaw(rest);
+
+        SolariumException e = Assert.Throws<SolariumException>(Replay);
+        Assert.Contains("The WAL is corrupt at offset 8", e.Message);
+        Assert.Contains("more records with bad checksums than a crash leaves", e.Message);
+        Assert.Equal(Length, new FileInfo(WalPath).Length);
+    }
+
     [Fact]
     public void Records_larger_than_the_read_buffer_replay()
     {

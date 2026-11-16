@@ -192,6 +192,41 @@ public sealed class TableTests : IDisposable
         Assert.Contains("does not decode", Assert.Throws<SolariumException>(cursor.SeekToFirst).Message);
     }
 
+    // A footer handle near the largest offset makes offset + size overflow to a negative end. The check of the
+    // handle must refuse it all the same, before the reader allocates a buffer of its size or reads at its offset:
+    // one crafted handle with its footer checksum made to match must not cost gigabytes or escape as another error.
+    [Fact]
+    public void A_footer_handle_whose_end_overflows_is_refused_before_a_buffer_of_its_size()
+    {
+        MemTable memTable = new();
+        for (int i = 0; i < 100; i++)
+            memTable.Add(B($"key{i:D3}"), i + 1, OperationKind.Put, B("value"));
+
+        memTable.AddRangeTombstone(B("a"), B("b"), 200);
+        string path = _directory.Combine("overflow.sst");
+        using (IStorageFile file = DefaultStorageEnvironment.Instance.OpenFile(path))
+            TableBuilder.Build(file, memTable.Entries(), memTable.Tombstones);
+
+        byte[] original = File.ReadAllBytes(path);
+
+        // Handles 0, 2 and 3: the range tombstones, the properties and the top-level index, which open reads.
+        foreach (int handle in new[] { 0, 2, 3 })
+            foreach ((long offset, int size) in new[] { (long.MaxValue, 1 << 30), (long.MaxValue - 5, int.MaxValue), (long.MaxValue - 3, 4), (-1L, 16) })
+            {
+                byte[] bytes = (byte[])original.Clone();
+                TableBytes.SetFooterHandle(bytes, handle, offset, size);
+                File.WriteAllBytes(path, bytes);
+
+                using IStorageFile damaged = DefaultStorageEnvironment.Instance.OpenFile(path);
+                long allocated = GC.GetAllocatedBytesForCurrentThread();
+                SolariumException e = Assert.Throws<SolariumException>(() => TableReader.Open(1, damaged));
+                allocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
+
+                Assert.Contains($"a block handle ({offset}, {size}) points outside the file", e.Message);
+                Assert.True(allocated < 1 << 20, $"handle {handle} at ({offset}, {size}) cost {allocated} bytes");
+            }
+    }
+
     // The first data block, cut short at every byte with its checksum and its index entry made to
     // match: every read of a data block either reads the entries before the cut or reports the
     // table as corrupt, and never fails with another exception.
