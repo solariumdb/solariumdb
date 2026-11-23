@@ -62,8 +62,8 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     private const int KeyStackThreshold = 256;
 
     /// <summary>
-    /// Keys per MultiGet when the flush path reads current heads, which bounds the row keys and
-    /// values one call holds.
+    /// Keys per MultiGet when the flush path reads current heads, which bounds the row keys one call
+    /// holds.
     /// </summary>
     private const int HeadReadBatchSize = 128;
 
@@ -1649,15 +1649,9 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
                 bool formatted = Utf8Formatter.TryFormat(candidate.Key.Revision, rowKey[(keyLen + 1)..], out int revLen);
                 System.Diagnostics.Debug.Assert(formatted, "Utf8Formatter.TryFormat failed for guarded history row key");
 
-                byte[]? storedRow = db.Get(rowKey[..(keyLen + 1 + revLen)], columnFamilyKeys);
-                if (storedRow is null)
-                {
-                    writeHistory[candidate.Value] = true;
-                    continue;
-                }
-
-                StoredKeyValueOrdering storedOrdering = DecodeKeyValueOrdering(storedRow);
-                if (CompareLastModifiedToStored(in span[candidate.Value], in storedOrdering) > 0)
+                // In place: only the ordering fields are read, so the row's payload is not copied.
+                bool stored = db.TryGet(rowKey[..(keyLen + 1 + revLen)], DecodeKeyValueOrdering, out StoredKeyValueOrdering storedOrdering, columnFamilyKeys);
+                if (!stored || CompareLastModifiedToStored(in span[candidate.Value], in storedOrdering) > 0)
                     writeHistory[candidate.Value] = true;
             }
         }
@@ -2137,7 +2131,7 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
     /// <summary>
     /// Reads the ordering fields of the current row for every key in <paramref name="keys"/>.
     /// Keys with no current row are absent from the result. The lookups go to Solarium as MultiGets of
-    /// <see cref="HeadReadBatchSize"/> keys, which bounds the row keys and values one call holds.
+    /// <see cref="HeadReadBatchSize"/> keys, which bounds the row keys one call holds.
     /// </summary>
     private Dictionary<string, StoredKeyValueOrdering> ReadCurrentHeads(IReadOnlyCollection<string> keys)
     {
@@ -2164,16 +2158,25 @@ internal sealed class SolariumPersistenceBackend : IPersistenceBackend, IDisposa
         return heads;
     }
 
-    // One MultiGet of current rows; records the ordering fields of each one found, and empties both lists.
+    // One MultiGet of current rows; records the ordering fields of each one found, read in place so that no row's
+    // payload is copied, and empties both lists.
     private void ReadHeadBatch(List<string> batchKeys, List<byte[]> rowKeys, Dictionary<string, StoredKeyValueOrdering> heads)
     {
-        byte[]?[] values = db.MultiGet(rowKeys, columnFamilyKeys);
-        for (int i = 0; i < values.Length; i++)
-            if (values[i] is { } value)
-                heads[batchKeys[i]] = DecodeKeyValueOrdering(value);
+        CurrentHeadVisitor visitor = new(batchKeys, heads);
+        db.MultiGet(rowKeys, ref visitor, columnFamilyKeys);
 
         batchKeys.Clear();
         rowKeys.Clear();
+    }
+
+    /// <summary>
+    /// Maps each current row that a MultiGet finds back to its key, by its place in the batch, and records the ordering
+    /// fields, decoded in place.
+    /// </summary>
+    private readonly struct CurrentHeadVisitor(List<string> batchKeys, Dictionary<string, StoredKeyValueOrdering> heads) : IValueVisitor
+    {
+        /// <inheritdoc />
+        public void OnValue(int index, ReadOnlySpan<byte> value) => heads[batchKeys[index]] = DecodeKeyValueOrdering(value);
     }
 
     // Merges a no-revision write's HLC into the key's persisted (earliest, latest) provenance and

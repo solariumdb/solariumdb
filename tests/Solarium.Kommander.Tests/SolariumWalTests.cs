@@ -1,3 +1,4 @@
+using System.Buffers;
 using Kommander.Data;
 using Solarium.Storage;
 using Solarium.Tests;
@@ -175,6 +176,57 @@ public sealed class SolariumWalTests : IDisposable
         RaftLog remaining = Assert.Single(wal.ReadLogsRange(8, 1));
         Assert.Equal(3, remaining.Id);
         Assert.Equal(83, remaining.Term);
+    }
+
+    // The payload of a row can be megabytes, and these paths need a varint or two from its front. A copy of the row
+    // would allocate the payload, as each of these calls did when the store's Get was their only point read.
+    [Theory]
+    [MemberData(nameof(Environments.Available), MemberType = typeof(Environments))]
+    public void Reading_the_term_or_the_header_of_a_row_copies_no_payload(string environment)
+    {
+        const int PayloadSize = 1 << 20;
+        const long Limit = PayloadSize / 4;
+        using EnvironmentScope scope = Environments.Create(environment);
+        using SolariumWAL wal = Wals.Open(scope.Environment, _directory.Path);
+        byte[] payload = Incompressible(PayloadSize);
+        List<RaftLog> rows = [.. Enumerable.Range(1, 10).Select(id => Proposed(id, 4 + id, payload))];
+        Assert.Equal(RaftOperationStatus.Success, wal.Write([(1, rows)]));
+
+        for (int round = 0; round < 2; round++)
+        {
+            // In the memtable first, then in a table, whose blocks go through pooled buffers, one for each row that a
+            // batch reads at once: the pool has them before anything is measured.
+            byte[][] blocks = [.. Enumerable.Range(0, 3).Select(_ => ArrayPool<byte>.Shared.Rent(PayloadSize + 4096))];
+            foreach (byte[] block in blocks)
+                ArrayPool<byte>.Shared.Return(block);
+
+            Assert.InRange(Allocated(() => Assert.Equal(6, wal.GetTermAt(1, 2))), 0, Limit);
+            Assert.Equal(-1, wal.GetTermAt(1, 99));
+
+            // One marker, so the row it commits is probed on its own, and absorbed into the frontier.
+            long id = (4 * round) + 1;
+            Assert.InRange(Allocated(() => Assert.Equal(RaftOperationStatus.Success, wal.Write([(1, [Committed(id, 4 + id)])]))), 0, Limit);
+            Assert.Equal((4 * round) + 1, wal.CommitMarkersAbsorbed);
+            Assert.Equal(3 * round, wal.MarkerHeadersPrefetched);
+
+            // Three markers, so the rows they commit are read in one batch.
+            List<RaftLog> markers = [Committed(id + 1, 5 + id), Committed(id + 2, 6 + id), Committed(id + 3, 7 + id)];
+            Assert.InRange(Allocated(() => Assert.Equal(RaftOperationStatus.Success, wal.Write([(1, markers)]))), 0, Limit);
+            Assert.Equal((4 * round) + 4, wal.CommitMarkersAbsorbed);
+            Assert.Equal((3 * round) + 3, wal.MarkerHeadersPrefetched);
+
+            // The row at the boundary has the boundary's term, so the install keeps the rows above it. It writes a
+            // checkpoint row over the boundary's, so each round has a boundary of its own.
+            Assert.InRange(Allocated(() => Assert.Equal((RaftOperationStatus.Success, false), wal.InstallSnapshotBoundary(1, snapshotIndex: 9 + round, lastIncludedTerm: 13 + round, sync: false))), 0, Limit);
+            wal.FlushMemTablesForTesting(wait: true);
+        }
+
+        static long Allocated(Action action)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            action();
+            return GC.GetAllocatedBytesForCurrentThread() - before;
+        }
     }
 
     // The row encoder leaves out a null log type, and the decoder reads an absent one as the empty

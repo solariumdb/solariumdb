@@ -421,8 +421,9 @@ public sealed class SolariumWAL : IWAL
 
             Span<byte> key = stackalloc byte[LogKeyWidth];
             BuildLogKey(key, partitionId, logIndex);
-            byte[]? value = _db.Get(key, Shard(partitionId));
-            return value is null ? -1 : ReadTermFromWire(value);
+
+            // In place: a copy of the row would copy its payload, which can be megabytes, for one varint near its front.
+            return _db.TryGet(key, ReadTermFromWire, out long term, Shard(partitionId)) ? term : -1;
         }
         catch (Exception e) when (LatchIfCorruption(e))
         {
@@ -1405,8 +1406,7 @@ public sealed class SolariumWAL : IWAL
                 ColumnFamily family = Shard(partitionId);
                 byte[] boundaryKey = new byte[LogKeyWidth];
                 BuildLogKey(boundaryKey, partitionId, snapshotIndex);
-                byte[]? existing = snapshotIndex < GetCompactionFloor(partitionId) ? null : _db.Get(boundaryKey, family);
-                long localTerm = existing is null ? -1 : ReadTermFromWire(existing);
+                long localTerm = snapshotIndex >= GetCompactionFloor(partitionId) && _db.TryGet(boundaryKey, ReadTermFromWire, out long term, family) ? term : -1;
 
                 WriteBatch batch = new();
                 bool suffixTruncated = false;
@@ -1725,11 +1725,13 @@ public sealed class SolariumWAL : IWAL
 
         Span<byte> key = stackalloc byte[LogKeyWidth];
         BuildLogKey(key, partitionId, logId);
-        byte[]? value = _db.Get(key, family);
-        if (value is null)
-            return default;
+        return _db.TryGet(key, ReadRowHeader, out (bool Found, long Term, int Type) row, family) ? row : default;
+    }
 
-        ReadHeaderFromWire(value, out _, out _, out long term, out int type);
+    // The term and the type of a row that is there, read in place: the row's payload is not copied.
+    private static (bool Found, long Term, int Type) ReadRowHeader(ReadOnlySpan<byte> row)
+    {
+        ReadHeaderFromWire(row, out _, out _, out long term, out int type);
         return (true, term, type);
     }
 
@@ -1786,15 +1788,8 @@ public sealed class SolariumWAL : IWAL
                     keys.Add(key);
                 }
 
-                byte[]?[] values = _db.MultiGet(keys, family);
-                for (int i = 0; i < chunk; i++)
-                {
-                    if (values[i] is not { } value)
-                        continue;
-
-                    ReadHeaderFromWire(value, out _, out _, out long term, out int type);
-                    prefetch.Set(start + i, term, type);
-                }
+                MarkerHeaderVisitor visitor = new(prefetch, start);
+                _db.MultiGet(keys, ref visitor, family);
             }
         }
         catch
@@ -3180,6 +3175,20 @@ public sealed class SolariumWAL : IWAL
         public int TimeNode;
         public long TimePhysical;
         public uint TimeCounter;
+    }
+
+    /// <summary>
+    /// Reads the header of each row that a batch of a prefetch finds in place, so that no row's payload is copied, and
+    /// records it at its position in the sorted ids: <paramref name="offset"/> is the position of the batch's first key.
+    /// </summary>
+    private readonly struct MarkerHeaderVisitor(MarkerHeaderPrefetch prefetch, int offset) : IValueVisitor
+    {
+        /// <inheritdoc/>
+        public void OnValue(int index, ReadOnlySpan<byte> value)
+        {
+            ReadHeaderFromWire(value, out _, out _, out long term, out int type);
+            prefetch.Set(offset + index, term, type);
+        }
     }
 
     /// <summary>The headers a prefetch read for a sorted set of ids; an id outside the set is not answered. Owns pooled arrays.</summary>

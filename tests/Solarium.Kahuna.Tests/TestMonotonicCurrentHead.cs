@@ -254,6 +254,73 @@ public class TestMonotonicCurrentHead
 
     [Theory]
     [InlineData("rocksdb")]
+    public void AStaleDuplicateOfAHistoryRowIsDecidedWithoutACopyOfTheStoredPayload(string kind)
+    {
+        // The stored history row holds a large value, and the head a small one: a duplicate at or below the head
+        // compares its commit HLC with the stored row's, and needs none of the row's payload for that.
+        const string key = "mono/large-history";
+        const int valueSize = 4 << 20;
+        string large = new('v', valueSize);
+        IPersistenceBackend backend = CreateBackend(kind);
+        try
+        {
+            Assert.True(backend.StoreKeyValues([Item(key, revision: 1, lastModifiedPhysical: 1_000, value: large)]));
+            Assert.True(backend.StoreKeyValues([Item(key, revision: 2, lastModifiedPhysical: 2_000, value: "head")]));
+
+            // An older record of revision 1, and one as old as the stored one: both leave the stored row as it is.
+            foreach (long physical in new long[] { 900, 1_000 })
+            {
+                long allocated = GC.GetAllocatedBytesForCurrentThread();
+                Assert.True(backend.StoreKeyValues([Item(key, revision: 1, lastModifiedPhysical: physical, value: "stale")]));
+                allocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
+                Assert.InRange(allocated, 0, valueSize / 8);
+                Assert.Equal(large, System.Text.Encoding.UTF8.GetString(backend.GetKeyValueRevision(key, 1)!.Value!));
+            }
+
+            // A newer one replaces it, and the head stays.
+            Assert.True(backend.StoreKeyValues([Item(key, revision: 1, lastModifiedPhysical: 1_100, value: "newer")]));
+            Assert.Equal("newer", System.Text.Encoding.UTF8.GetString(backend.GetKeyValueRevision(key, 1)!.Value!));
+            Assert.Equal("head", System.Text.Encoding.UTF8.GetString(backend.GetKeyValue(key)!.Value!));
+        }
+        finally
+        {
+            (backend as IDisposable)?.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData("rocksdb")]
+    public void AStaleDuplicateIsDecidedWithoutACopyOfTheStoredHeads(string kind)
+    {
+        // The heads hold large values. A store reads the ordering fields of the heads of its keys in one batch, and
+        // needs none of their payloads to see that its records are older.
+        const int valueSize = 1 << 20;
+        string large = new('v', valueSize);
+        string[] keys = ["mono/large-head/0", "mono/large-head/1", "mono/large-head/2"];
+        IPersistenceBackend backend = CreateBackend(kind);
+        try
+        {
+            Assert.True(backend.StoreKeyValues([.. keys.Select(key => Item(key, revision: 5, lastModifiedPhysical: 5_000, value: large))]));
+            long allocated = GC.GetAllocatedBytesForCurrentThread();
+            Assert.True(backend.StoreKeyValues([.. keys.Select(key => Item(key, revision: 4, lastModifiedPhysical: 4_000, value: "stale"))]));
+            allocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
+            Assert.InRange(allocated, 0, valueSize / 4);
+
+            foreach (string key in keys)
+            {
+                Assert.Equal(5, backend.GetKeyValue(key)!.Revision);
+                Assert.Equal(large, System.Text.Encoding.UTF8.GetString(backend.GetKeyValue(key)!.Value!));
+                Assert.Equal("stale", System.Text.Encoding.UTF8.GetString(backend.GetKeyValueRevision(key, 4)!.Value!));
+            }
+        }
+        finally
+        {
+            (backend as IDisposable)?.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData("rocksdb")]
     public void ReplayAfterReopenNeverRegressesTheCurrentRow(string kind)
     {
         // Restart replay re-delivers committed records the durability floor has not certified: an
