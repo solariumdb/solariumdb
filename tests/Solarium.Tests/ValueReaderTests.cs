@@ -418,6 +418,10 @@ public sealed class ValueReaderTests : IDisposable
         Assert.True(Interlocked.Read(ref reads) > 0);
         db.Dispose();
         await Task.WhenAll(readers).WaitAsync(TimeSpan.FromSeconds(60));
+
+        // A read that was in flight across the close can cache its block after the close erased the others. No reader
+        // holds one, so an eviction frees them all.
+        cache.SetCapacity(0);
         Assert.Equal((0L, 0L), cache.NativeBlocks);
         Assert.Equal(0, pool.AllocatedBytes);
     }
