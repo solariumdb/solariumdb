@@ -26,8 +26,10 @@ jobs:
         run: dotnet build -c Release
 
       - name: Test
-        # A test that hangs is stopped after 5 minutes, and the log names it.
-        run: dotnet test -c Release --no-build --logger trx --results-directory TestResults --blame-hang-timeout 5m --blame-hang-dump-type none
+        # A test that hangs is stopped after 5 minutes: the log names it, and a mini dump keeps the stacks of the
+        # threads, which show a blocked call of the engine. The dump has no heap, so it does not show an async method
+        # that waits without a thread; a full dump does, at gigabytes for each process.
+        run: dotnet test -c Release --no-build --logger trx --results-directory TestResults --blame-hang-timeout 5m --blame-hang-dump-type mini
 
       # The packages are built on every run and kept as an artifact; publishing them is a manual step.
       - name: Pack
@@ -42,3 +44,14 @@ jobs:
       - name: Summarize
         if: ${{ !cancelled() }}
         run: python3 .github/scripts/test-summary.py TestResults
+
+      # What a failed run leaves: the results, the sequence of the tests of a stopped run, and the dumps of a hang.
+      # Anyone can download the artifacts of a public repository, and a dump holds the environment of the test
+      # process, so no secret may be in the environment of the Test step.
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: test-results
+          path: TestResults
+          if-no-files-found: ignore
+          retention-days: 7
