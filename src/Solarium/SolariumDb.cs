@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Numerics;
 using System.Text;
@@ -826,12 +827,25 @@ public sealed class SolariumDb : IDisposable
     }
 
     /// <summary>
-    /// Look up several keys at one snapshot: one value per key, in order, null for a key that is absent or deleted.
-    /// The data blocks that each batch of up to 32 keys needs are read together, through
-    /// <see cref="IStorageEnvironment.MultiRead"/>. Of <paramref name="options"/>, only <see cref="ReadOptions.FillCache"/> applies.
+    /// Look up <paramref name="key"/> and give its newest value to <paramref name="reader"/> in place, with no copy, as
+    /// RocksDB's <c>Get</c> into a <c>PinnableSlice</c>: a caller that needs a part of a large value reads only that
+    /// part. Null family: the default one. Of <paramref name="options"/>, only <see cref="ReadOptions.FillCache"/> applies.
     /// </summary>
-    public byte[]?[] MultiGet(IReadOnlyList<byte[]> keys, ColumnFamily? family = null, ReadOptions? options = null)
+    /// <remarks>
+    /// The reader runs once, on the calling thread, under no lock, so it may call the database. Until it returns, the
+    /// read keeps the memtables and the tables of its snapshot, as an open <see cref="Iterator"/> does, and the data
+    /// block that holds the value, so a reader should be short. A static lambda or a static method allocates nothing.
+    /// </remarks>
+    /// <param name="key">The key to look up.</param>
+    /// <param name="reader">Reads the value, which is valid only until the reader returns. An exception it throws reaches the caller.</param>
+    /// <param name="result">What the reader returned, or the default when the key is absent or deleted.</param>
+    /// <param name="family">The column family of the key.</param>
+    /// <param name="options">The options of the read.</param>
+    /// <returns>True when the key has a value; false, with the reader not called, when it is absent or deleted.</returns>
+    /// <exception cref="SolariumException">A table that the lookup searches is damaged; the reader is not called.</exception>
+    public bool TryGet<TResult>(ReadOnlySpan<byte> key, ValueReader<TResult> reader, [MaybeNullWhen(false)] out TResult result, ColumnFamily? family = null, ReadOptions? options = null)
     {
+        ArgumentNullException.ThrowIfNull(reader);
         ColumnFamily target = Resolve(family);
         ThrowIfDisposed();
 
@@ -841,16 +855,74 @@ public sealed class SolariumDb : IDisposable
             // The version first, then the snapshot, as in Get.
             _afterReadVersion?.Invoke();
             long snapshot = LatestSequenceNumber;
-            byte[]?[] values = ReadPath.GetMany(version.Sources, keys, snapshot, options?.FillCache ?? true, _environment, out int rounds);
-            if (rounds > 0)
-                Interlocked.Add(ref _multiGetRounds, rounds);
-
-            return values;
+            return ReadPath.TryGet(version.Sources, key, snapshot, options?.FillCache ?? true, reader, out result);
         }
         finally
         {
             version.Leave(slot);
         }
+    }
+
+    /// <summary>
+    /// Look up several keys at one snapshot: one value per key, in order, null for a key that is absent or deleted.
+    /// The data blocks that each batch of up to 32 keys needs are read together, through
+    /// <see cref="IStorageEnvironment.MultiRead"/>. Of <paramref name="options"/>, only <see cref="ReadOptions.FillCache"/> applies.
+    /// </summary>
+    public byte[]?[] MultiGet(IReadOnlyList<byte[]> keys, ColumnFamily? family = null, ReadOptions? options = null)
+    {
+        ValueCopies copies = new(new byte[]?[keys.Count]);
+        MultiGet(keys, ref copies, family, options);
+        return copies.Values;
+    }
+
+    /// <summary>
+    /// Look up several keys at one snapshot and give each value to <paramref name="visitor"/> in place, with no copy, as
+    /// RocksDB's <c>MultiGet</c> into <c>PinnableSlice</c>s: <see cref="TryGet{TResult}"/> for many keys. It reads the
+    /// data blocks as <see cref="MultiGet(IReadOnlyList{byte[]}, ColumnFamily?, ReadOptions?)"/> does. Null family: the
+    /// default one. Of <paramref name="options"/>, only <see cref="ReadOptions.FillCache"/> applies.
+    /// </summary>
+    /// <remarks>
+    /// <para>The visitor runs on the calling thread, under no lock, so it may call the database. It runs once for each
+    /// of <paramref name="keys"/> that has a value, a key listed twice included, and in no set order: a key that a
+    /// memtable or a cached block answers comes before the keys whose blocks the call reads with it.</para>
+    /// <para>Until the call returns, it keeps the memtables and the tables of its snapshot, as an open
+    /// <see cref="Iterator"/> does, and a batch of up to 32 keys keeps the blocks it read, so a visitor should be
+    /// short.</para>
+    /// </remarks>
+    /// <param name="keys">The keys to look up, which must not change during the call.</param>
+    /// <param name="visitor">Reads each value, which is valid only until <see cref="IValueVisitor.OnValue"/> returns.</param>
+    /// <param name="family">The column family of the keys.</param>
+    /// <param name="options">The options of the read.</param>
+    /// <exception cref="SolariumException">A table that the lookup searches is damaged; the visitor may have run for other keys.</exception>
+    public void MultiGet<TVisitor>(IReadOnlyList<byte[]> keys, ref TVisitor visitor, ColumnFamily? family = null, ReadOptions? options = null)
+        where TVisitor : struct, IValueVisitor
+    {
+        ArgumentNullException.ThrowIfNull(keys);
+        ColumnFamily target = Resolve(family);
+        ThrowIfDisposed();
+
+        FamilyVersion version = target.EnterVersion(out int slot);
+        try
+        {
+            // The version first, then the snapshot, as in Get.
+            _afterReadVersion?.Invoke();
+            long snapshot = LatestSequenceNumber;
+            int rounds = ReadPath.GetMany(version.Sources, keys, snapshot, options?.FillCache ?? true, _environment, ref visitor);
+            if (rounds > 0)
+                Interlocked.Add(ref _multiGetRounds, rounds);
+        }
+        finally
+        {
+            version.Leave(slot);
+        }
+    }
+
+    // Copies each value into a new array: the caller's to keep and change.
+    private readonly struct ValueCopies(byte[]?[] values) : IValueVisitor
+    {
+        public byte[]?[] Values => values;
+
+        public void OnValue(int index, ReadOnlySpan<byte> value) => values[index] = value.ToArray();
     }
 
     /// <summary>

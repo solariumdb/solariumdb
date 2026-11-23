@@ -17,7 +17,7 @@ namespace Solarium.Engine;
 /// memtable lives. The garbage collector sees none of it: an entry is no object, so no collection copies or marks
 /// it, and its bytes count against no heap limit. The key and the value are copied in from the caller's arrays,
 /// and a read copies them out into new arrays (<see cref="Entry"/>), as a read of an SSTable does; a point lookup
-/// copies out the value only (<see cref="EntryVersion"/>).</para>
+/// reads the value where it lies (<see cref="TryFind"/>), and copies it only for a caller that keeps it.</para>
 /// <para>The arena is freed when no reader can reach the memtable: each <see cref="FamilyVersion"/> that lists it
 /// counts a reference (<see cref="AddReference"/>, <see cref="Release"/>), and a reader is counted in a version for
 /// as long as it reads, so the last reference goes after the last reader leaves.</para>
@@ -419,12 +419,21 @@ internal sealed unsafe class MemTable : IEntrySource
 
     // ── Reader side: any thread, no lock ─────────────────────────────────────────────────────────
 
-    /// <inheritdoc />
-    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry)
+    /// <summary>
+    /// The newest version of <paramref name="key"/> at or below <paramref name="snapshot"/>: its sequence number, its
+    /// kind, and its value where it lies in the arena, empty for a delete. False when the memtable has none.
+    /// </summary>
+    /// <remarks>
+    /// The caller may read <paramref name="value"/> for as long as it is counted in a version that lists the memtable
+    /// and keeps the memtable reachable: until then, the arena stays.
+    /// </remarks>
+    public bool TryFind(ReadOnlySpan<byte> key, long snapshot, out long sequence, out OperationKind kind, out ReadOnlySpan<byte> value)
     {
         byte* node = Seek(key, snapshot);
         bool found = node is not null && KeyOf(node).SequenceEqual(key);
-        entry = found ? ToVersion(node) : default;
+        sequence = found ? SequenceOf(node) : 0;
+        kind = found ? (OperationKind)node[KindOffset] : default;
+        value = found ? ValueOf(node) : default;
         GC.KeepAlive(this);
         return found;
     }
@@ -615,15 +624,6 @@ internal sealed unsafe class MemTable : IEntrySource
         byte[] key = new ReadOnlySpan<byte>(data, keyLength).ToArray();
         byte[]? value = valueLength < 0 ? null : new ReadOnlySpan<byte>(data + keyLength, valueLength).ToArray();
         return new Entry(key, SequenceOf(node), (OperationKind)node[KindOffset], value);
-    }
-
-    // What a lookup takes from a node: its value copied into a new array, and no copy of its key.
-    private static EntryVersion ToVersion(byte* node)
-    {
-        int valueLength = *(int*)(node + ValueLengthOffset);
-        byte* data = node + LinksOffset + (node[HeightOffset] * sizeof(long)) + *(int*)(node + KeyLengthOffset);
-        byte[]? value = valueLength < 0 ? null : new ReadOnlySpan<byte>(data, valueLength).ToArray();
-        return new EntryVersion(SequenceOf(node), (OperationKind)node[KindOffset], value);
     }
 
     private static int Compare(byte* node, ReadOnlySpan<byte> key, long sequence) =>

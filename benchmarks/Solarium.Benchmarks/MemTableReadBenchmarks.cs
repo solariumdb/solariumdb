@@ -4,8 +4,8 @@ using BenchmarkDotNet.Attributes;
 namespace Solarium.Benchmarks;
 
 /// <summary>
-/// Reads from a full memtable: <c>Get</c> of keys that are there, and iterator steps forward and
-/// backward. The memtable holds one iteration of the unsynced <c>Put</c> benchmark (921,600 entries of
+/// Reads from a full memtable: <c>Get</c> and <c>TryGet</c> of keys that are there, and iterator steps forward
+/// and backward. The memtable holds one iteration of the unsynced <c>Put</c> benchmark (921,600 entries of
 /// a 31-byte key and a 128-byte value, in 16 partitions written in turn), and no flush runs, so the
 /// reads measure the memtable's layout, not SSTables.
 /// </summary>
@@ -61,6 +61,18 @@ public class MemTableReadBenchmarks
         long bytes = 0;
         foreach (byte[] key in _lookups)
             bytes += _db.Get(key)!.Length;
+
+        return bytes;
+    }
+
+    // The lookups of Get, with each value read in place.
+    [Benchmark(OperationsPerInvoke = Lookups)]
+    public long TryGet()
+    {
+        long bytes = 0;
+        foreach (byte[] key in _lookups)
+            if (_db.TryGet(key, static value => value.Length, out int length))
+                bytes += length;
 
         return bytes;
     }

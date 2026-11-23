@@ -275,6 +275,15 @@ public sealed class MultiGetTests : IDisposable
         Assert.Equal(probes.Count, values.Length);
         for (int i = 0; i < probes.Count; i++)
             Assert.Equal(S(db.Get(probes[i])), S(values[i]));
+
+        // The same values in place, each key that has one visited once.
+        string?[] visited = new string?[probes.Count];
+        db.MultiGet(probes, (index, value) =>
+        {
+            Assert.Null(visited[index]);
+            visited[index] = S(value);
+        });
+        Assert.Equal(values.Select(S), visited);
     }
 
     /// <summary>Forwards to an environment, and records the number of requests of each batch read.</summary>

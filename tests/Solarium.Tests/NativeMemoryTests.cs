@@ -60,7 +60,7 @@ public sealed class NativeMemoryTests : IDisposable
         Assert.Equal(written.Count, table.EntryCount);
         foreach ((byte[] key, byte[]? value, long version) in written)
         {
-            Assert.True(table.TryGetNewest(key, version, fillCache: true, out EntryVersion found));
+            Assert.True(table.TryGetNewest(key, version, out EntryVersion found));
             Assert.Equal(version, found.Sequence);
             Assert.Equal(value is null ? OperationKind.Delete : OperationKind.Put, found.Kind);
             Assert.Equal(value, found.Value);

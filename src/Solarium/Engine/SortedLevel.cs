@@ -49,35 +49,6 @@ internal sealed class SortedLevel : IEntrySource
     }
 
     /// <inheritdoc />
-    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry)
-    {
-        TableReader? table = TableFor(key);
-        if (table is null)
-        {
-            entry = default;
-            return false;
-        }
-
-        return table.TryGetNewest(key, snapshot, fillCache, out entry);
-    }
-
-    /// <summary>
-    /// <see cref="TryGetNewest(ReadOnlySpan{byte}, long, bool, out EntryVersion)"/> with the key's filter hash
-    /// (<see cref="TableReader.FilterHash"/>), for a lookup that computed it once for all its sources.
-    /// </summary>
-    public bool TryGetNewest(ReadOnlySpan<byte> key, ulong hash, long snapshot, bool fillCache, out EntryVersion entry)
-    {
-        TableReader? table = TableFor(key);
-        if (table is null)
-        {
-            entry = default;
-            return false;
-        }
-
-        return table.TryGetNewest(key, hash, snapshot, fillCache, out entry);
-    }
-
-    /// <inheritdoc />
     /// <remarks>
     /// A file's key range covers its range tombstones, so only the file whose range holds the key can
     /// have a tombstone that covers it.

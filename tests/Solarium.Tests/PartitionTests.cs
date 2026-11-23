@@ -39,7 +39,7 @@ public sealed class PartitionTests : IDisposable
         {
             foreach (long snapshot in new long[] { 1, 150, 300, 450, 700, 900, long.MaxValue })
             {
-                bool inModel = model.TryGetNewest(B(probe), snapshot, true, out EntryVersion expected);
+                bool inModel = model.TryGetNewest(B(probe), snapshot, out EntryVersion expected);
                 bool inTable = table.TryGetNewest(B(probe), snapshot, true, out EntryVersion actual);
                 Assert.Equal(inModel, inTable);
                 if (inModel)

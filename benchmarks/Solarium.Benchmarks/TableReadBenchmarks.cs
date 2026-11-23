@@ -4,8 +4,8 @@ using BenchmarkDotNet.Attributes;
 namespace Solarium.Benchmarks;
 
 /// <summary>
-/// Reads from one SSTable: <c>Get</c> of keys that are there, <c>Get</c> of keys that are not, which the
-/// Bloom filter answers, and a forward scan. The table holds what <see cref="MemTableReadBenchmarks"/> holds in
+/// Reads from one SSTable: <c>Get</c> and <c>TryGet</c> of keys that are there, <c>Get</c> of keys that are not,
+/// which the Bloom filter answers, and a forward scan. The table holds what <see cref="MemTableReadBenchmarks"/> holds in
 /// its memtable (921,600 entries of a 31-byte key and a 128-byte value, in 16 partitions), written by one flush,
 /// and the memtable is empty, so the reads measure the table's index, filter and data blocks.
 /// </summary>
@@ -86,6 +86,18 @@ public class TableReadBenchmarks
         long bytes = 0;
         foreach (byte[] key in _lookups)
             bytes += _db.Get(key)!.Length;
+
+        return bytes;
+    }
+
+    // The lookups of Get, with each value read in place.
+    [Benchmark(OperationsPerInvoke = Lookups)]
+    public long TryGet()
+    {
+        long bytes = 0;
+        foreach (byte[] key in _lookups)
+            if (_db.TryGet(key, static value => value.Length, out int length))
+                bytes += length;
 
         return bytes;
     }

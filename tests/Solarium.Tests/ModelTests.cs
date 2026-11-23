@@ -336,7 +336,14 @@ public sealed class ModelTests : IDisposable
         {
             string key = keyAt(i);
             Assert.Equal(model.GetValueOrDefault(key), S(db.Get(B(key))));
+            Assert.Equal(model.ContainsKey(key), db.TryGet(B(key), static value => S(value), out string? inPlace));
+            Assert.Equal(model.GetValueOrDefault(key), inPlace);
         }
+
+        // The same point reads in one batch, in place.
+        string?[] batch = new string?[400];
+        db.MultiGet([.. Enumerable.Range(0, 400).Select(i => B(keyAt(i)))], (index, value) => batch[index] = S(value));
+        Assert.Equal(Enumerable.Range(0, 400).Select(i => model.GetValueOrDefault(keyAt(i))), batch);
 
         // Full scans in both directions.
         using (Iterator iterator = db.NewIterator())

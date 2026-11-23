@@ -224,29 +224,10 @@ internal sealed class TableReader : IEntrySource, IDisposable
         }
     }
 
-    /// <inheritdoc />
-    public bool TryGetNewest(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out EntryVersion entry) =>
-        TryGetNewest(key, FilterHash(key), snapshot, fillCache, out entry);
-
-    /// <summary>
-    /// <see cref="TryGetNewest(ReadOnlySpan{byte}, long, bool, out EntryVersion)"/> with the key's
-    /// <see cref="FilterHash"/> as <paramref name="hash"/>, for a lookup that computed it once for all its sources.
-    /// </summary>
-    public bool TryGetNewest(ReadOnlySpan<byte> key, ulong hash, long snapshot, bool fillCache, out EntryVersion entry)
-    {
-        entry = default;
-        if (!TryLocate(key, hash, snapshot, fillCache, out DataBlockHandle handle))
-            return false;
-
-        // Only the value is copied out of the block.
-        using BlockBuffer block = DataBlock(handle, fillCache);
-        return TryGetFromEntries(block.Entries, handle, key, snapshot, out entry);
-    }
-
     /// <summary>
     /// The data block that holds the first entry at or after (<paramref name="key"/>, <paramref name="snapshot"/>)
     /// when the partition's Bloom filter may have the key, without reading it; false when the table has no
-    /// version of the key at or below the snapshot. See <see cref="IEntrySource.TryGetNewest"/> for
+    /// version of the key at or below the snapshot. See <see cref="IEntrySource.LastKeyBefore"/> for
     /// <paramref name="fillCache"/>.
     /// </summary>
     public bool TryLocate(ReadOnlySpan<byte> key, long snapshot, bool fillCache, out DataBlockHandle handle) =>
@@ -354,18 +335,40 @@ internal sealed class TableReader : IEntrySource, IDisposable
     }
 
     /// <summary>
-    /// The newest version of <paramref name="key"/> at or below <paramref name="snapshot"/> in a data block's
-    /// <paramref name="entries"/> (<see cref="DecodeReadBlock"/>). Its value is a new array.
+    /// The newest version of <paramref name="key"/> at or below <paramref name="snapshot"/> in the decoded
+    /// <paramref name="entries"/> of the data block <paramref name="handle"/> names (<see cref="DataBlock"/>,
+    /// <see cref="DecodeReadBlock"/>): its sequence number, its kind, and its value, a slice of the entries, empty for a
+    /// delete. False when the block has none.
     /// </summary>
     /// <exception cref="SolariumException">The entries do not decode.</exception>
-    public bool TryGetFromEntries(ReadOnlySpan<byte> entries, DataBlockHandle handle, ReadOnlySpan<byte> key, long snapshot, out EntryVersion entry)
+    public bool TryFind(ReadOnlySpan<byte> entries, DataBlockHandle handle, ReadOnlySpan<byte> key, long snapshot,
+        out long sequence, out OperationKind kind, out ReadOnlySpan<byte> value)
     {
-        entry = default;
-        if (!FindVersion(entries, key, snapshot, handle, out long sequence, out OperationKind kind, out ReadOnlySpan<byte> value))
-            return false;
+        try
+        {
+            // The first entry at or after (key, snapshot) decides: it is the newest version at or below the
+            // snapshot when it is a version of the key.
+            SpanReader reader = new(entries);
+            while (!reader.AtEnd)
+            {
+                ReadOnlySpan<byte> entryKey = reader.Span();
+                sequence = reader.Int64();
+                kind = reader.EntryKind();
+                value = reader.Span();
 
-        entry = new EntryVersion(sequence, kind, kind == OperationKind.Put ? value.ToArray() : null);
-        return true;
+                if (InternalKey.Compare(entryKey, sequence, key, snapshot) >= 0)
+                    return entryKey.SequenceEqual(key);
+            }
+
+            sequence = 0;
+            kind = default;
+            value = default;
+            return false;
+        }
+        catch (ArgumentOutOfRangeException e)
+        {
+            throw DataBlockCorrupt(handle.Block, handle.Offset, e);
+        }
     }
 
     /// <inheritdoc />
@@ -559,10 +562,13 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
     private CacheKey BlockKey(long offset) => new(_cacheOwner, Number, offset);
 
-    // A data block's entries: the cache's block, or read from the file and verified, and cached when fillCache is
-    // set and the table caches data blocks. The caller disposes the buffer, which releases the cached block or
-    // returns the pooled array.
-    private BlockBuffer DataBlock(DataBlockHandle handle, bool fillCache)
+    /// <summary>
+    /// The entries of the data block <paramref name="handle"/> names: the cache's block, or read from the file and
+    /// verified, and cached when <paramref name="fillCache"/> is set and the table caches data blocks. The caller
+    /// disposes the buffer when it is done with the entries, which releases the cached block or returns the pooled array.
+    /// </summary>
+    /// <exception cref="SolariumException">The block is damaged.</exception>
+    public BlockBuffer DataBlock(DataBlockHandle handle, bool fillCache)
     {
         if (TryGetCachedBlock(handle, out NativeBlock? cached))
             return new BlockBuffer(cached);
@@ -783,37 +789,6 @@ internal sealed class TableReader : IEntrySource, IDisposable
 
         rented = entries;
         return entries.AsSpan(0, rawSize);
-    }
-
-    // The newest version of key at or below snapshot in a block's decoded entries; value is a slice of entries.
-    private bool FindVersion(ReadOnlySpan<byte> entries, ReadOnlySpan<byte> key, long snapshot, DataBlockHandle handle,
-        out long sequence, out OperationKind kind, out ReadOnlySpan<byte> value)
-    {
-        try
-        {
-            // The first entry at or after (key, snapshot) decides: it is the newest version at or below the
-            // snapshot when it is a version of the key.
-            SpanReader reader = new(entries);
-            while (!reader.AtEnd)
-            {
-                ReadOnlySpan<byte> entryKey = reader.Span();
-                sequence = reader.Int64();
-                kind = reader.EntryKind();
-                value = reader.Span();
-
-                if (InternalKey.Compare(entryKey, sequence, key, snapshot) >= 0)
-                    return entryKey.SequenceEqual(key);
-            }
-
-            sequence = 0;
-            kind = default;
-            value = default;
-            return false;
-        }
-        catch (ArgumentOutOfRangeException e)
-        {
-            throw DataBlockCorrupt(handle.Block, handle.Offset, e);
-        }
     }
 
     // The offset and size of the block that footer handle `handle` names, from the footer's 48 bytes of handles.
@@ -1315,28 +1290,34 @@ internal sealed class TableReader : IEntrySource, IDisposable
         }
     }
 
-    // A data block's entries for one read: a cached native block that the read holds a reference on, or a buffer
-    // rented from ArrayPool<byte>.Shared. Dispose releases the one or returns the other, once.
-    private struct BlockBuffer : IDisposable
+    /// <summary>
+    /// A data block's entries for one read: a cached native block that the read holds a reference on, or a buffer
+    /// rented from <see cref="ArrayPool{T}.Shared"/>. Keep it in one variable: a copy would give it back twice.
+    /// </summary>
+    internal struct BlockBuffer : IDisposable
     {
         private NativeBlock? _cached;
         private byte[]? _pooled;
         private readonly int _length;
 
+        /// <summary>A cached block, with the caller's reference, which becomes the buffer's.</summary>
         public BlockBuffer(NativeBlock cached)
         {
             _cached = cached;
             _length = cached.Length;
         }
 
+        /// <summary>The first <paramref name="length"/> bytes of a rented array, which becomes the buffer's.</summary>
         public BlockBuffer(byte[] pooled, int length)
         {
             _pooled = pooled;
             _length = length;
         }
 
+        /// <summary>The entries, valid until <see cref="Dispose"/>.</summary>
         public readonly ReadOnlySpan<byte> Entries => _cached is not null ? _cached.Span : _pooled.AsSpan(0, _length);
 
+        /// <summary>Releases the cached block or returns the array, once.</summary>
         public void Dispose()
         {
             _cached?.Release();
