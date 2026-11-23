@@ -180,7 +180,7 @@ public sealed class TestStorageCorruptionNode : IDisposable
                 Assert.Equal(KeyValueResponseType.Set, response);
             }
 
-            await first.FlushAsync();
+            await FlushWholeLog(first, DataPartition);
         }
 
         int partition = CompactDataPartitionOfTheLog(scope.Environment, WalPath, writeCheckpoint: true);
@@ -305,6 +305,23 @@ public sealed class TestStorageCorruptionNode : IDisposable
 
     private string MemberWalPath(int index) => Path.Combine(WalPath, $"node-{index + 1}");
 
+    // Flushes until the store's floor covers the last row of the partition's log. A write is acknowledged before its
+    // apply queues it for the store, so one flush can miss the last write. A floor one row short, under a log that is
+    // then compacted past its last row, makes the next start refuse the replay, and the node never leads.
+    private static async Task FlushWholeLog(EmbeddedKahunaNode node, int partition)
+    {
+        IApplicationDurabilityProvider? floors = node.Raft.Configuration.ApplicationDurabilityProvider;
+        Assert.NotNull(floors);
+        await WaitUntil(async () =>
+        {
+            await node.FlushAsync();
+            return floors.GetDurablyAppliedIndex(partition) >= node.Raft.WalAdapter.GetMaxLog(partition);
+        });
+
+        // The floor seen above can be a live one that no flush has stored yet.
+        await node.FlushAsync();
+    }
+
     // With the node stopped, compacts the data partition's log in walDirectory/wal as the node's own checkpoint and
     // compaction would, and returns the partition. With a checkpoint, the floor is a checkpoint row written one past
     // the last row, so no row is left above it; without one, the floor is the last row, which stays, so a follower's
@@ -364,6 +381,9 @@ public sealed class TestStorageCorruptionNode : IDisposable
             // revision sweep stays off, so no background scan reaches the damage before a read does.
             DirtyObjectsWriterDelay = 200,
             CheckpointInterval = TimeSpan.FromHours(1),
+
+            // A start that finds no leader fails its test. By default it waits without end, and the run hangs.
+            StartupLeaderWait = TimeSpan.FromSeconds(60),
         };
     }
 
