@@ -1,25 +1,18 @@
 # Solarium.Kahuna
 
-`Solarium.Kahuna` is a [Kahuna](https://github.com/kahunakv/kahuna) storage engine on Solarium. It holds both
-things a Kahuna node stores, so a node runs with no native RocksDB library:
+`Solarium.Kahuna` is a [Kahuna](https://github.com/kahunakv/kahuna) storage engine on Solarium. It covers both
+things that a Kahuna node stores, and the node does not need the native RocksDB library.
 
 | Kahuna option | Provider | Stores |
 | --- | --- | --- |
-| `--storage solarium` | `SolariumPersistenceBackendProvider` | the key-value and lock data, through `SolariumPersistenceBackend` |
-| `--wal-storage solarium` | `SolariumWalProvider` | the Raft log, through `SolariumWAL` (`Solarium.Kommander`) |
+| `--storage solarium` | `SolariumPersistenceBackendProvider` | The key-value and lock data, through `SolariumPersistenceBackend` |
+| `--wal-storage solarium` | `SolariumWalProvider` | The Raft log, through `SolariumWAL` ([Solarium.Kommander](kommander.md)) |
 
-It needs Kahuna 1.16.4 or later. 1.13.4 brought the public storage contract: `IPersistenceBackend` with
-immutable rows, and the `StorageProviders` registry of `IPersistenceBackendProvider` and `IWalProvider`.
-1.14.1 brought the storage settings that pace the compactions, 1.14.2 the memory that the WAL and the store
-share (below), 1.14.4 the `--extension-option` settings and the System.IO.Hashing version this package
-uses, 1.15.3, with Kommander 1.13.1, the storage-damage contract of the store and the WAL (below), 1.15.4
-Kommander 1.13.2, whose snapshot installs no longer flood a follower with appends it cannot apply, and 1.16.4
-`RevisionPruneResult.DeleteRecordsReleased`, the count of deleted keys whose rows the prune released (below).
+It needs Kahuna 1.16.4 or later.
 
 ## Use it
 
-The Kahuna server loads it as an extension assembly. Publish the package, then point the server at the
-published assembly:
+Publish the package, then point the Kahuna server at the published assembly.
 
 ```sh
 dotnet publish src/Solarium.Kahuna -c Release -o /opt/kahuna/solarium
@@ -29,46 +22,11 @@ kahuna-server --extension-assembly /opt/kahuna/solarium/Solarium.Kahuna.dll \
               --wal-storage solarium --wal-path /var/lib/kahuna/wal
 ```
 
-The published folder holds only what the server lacks: the Solarium assemblies, ioxide, the io_uring
-runtime, and K4os.Compression.LZ4, the tables' LZ4, about 4 MB. Kahuna.Core, Kommander and their
-dependencies are left out, because the server's loader always takes the server's own copy of an assembly the
-server has. Every node of a cluster loads the same artifact; the server logs each file's SHA-256 and the
-engines it registered.
+The published folder is about 4 MB. It leaves out Kahuna.Core, Kommander and their dependencies, since the server
+uses its copies of them. All the nodes of a cluster load the same artifact. The server logs each file's
+SHA-256 and the engines it registered.
 
-Two of Kahuna's storage settings pace the store's compactions. `--storage-compaction-rate-mbps` gives the
-store a `RateLimiter` of that rate for its flush and compaction writes, and runs `max(2, CPUs / 2)`
-compactions at once, as the RocksDB backend does; `--storage-max-background-compactions` sets that count
-instead. With neither, the store runs one compaction at a time and paces nothing. The limiter paces flushes
-too, so its rate must stay above what the store ingests, and below what leaves the disk to the WAL's syncs: on
-a disk whose synced writes took 4 to 8 ms, 50 made the store's synced batches of 64 rows 2.5 times as fast as
-one unpaced compaction, but on the same disk at about 1 ms, the synced batches outran 25 and 50, and flushes
-held them to 0.2 to 0.4 times their unpaced rate (see "Paced background writes" in
-[benchmarks.md](benchmarks.md)). Too low a rate lets level 0 grow until writes slow down.
-
-Two settings give the WAL and the store of a node memory to share; both providers take the node's
-`SharedStorageMemory` and use the same Solarium objects for it:
-
-- `--storage-shared-cache-mb`: one `Cache` for the index and filter blocks of both, pinned at level 0, in place
-  of the store's process-wide cache (below); the WAL, which otherwise keeps them resident, joins it. Size it to
-  hold every index and filter of both, about 2% of their table bytes, 4% with LZ4, plus the memtable budget.
-- `--storage-shared-memtable-budget-mb`: one `WriteBufferManager` that keeps their memtables together under
-  it, as the RocksDB pair's shared write-buffer manager does. When they pass it, the database that writes next
-  flushes its own oldest memtable, never the other's; nothing stalls. With a shared cache, it is charged into
-  the cache, so one size bounds both, as the RocksDB pair's unified budget. Size it above two of the WAL's
-  128 MiB shard memtables, or the WAL warns at open: a smaller budget flushes the WAL's memtables before they
-  fill.
-
-Both are 0 by default. A solarium WAL beside another store, or a solarium store beside another WAL, uses them
-alone.
-
-Neither budget is on the managed heap, as with RocksDB: the memtables' entries are in native arenas, and the
-cache's data blocks (`CacheDataBlocks`) in native memory, so a node sized for RocksDB needs no larger GC heap limit
-(`DOTNET_GCHeapHardLimit*`) for Solarium, and the GC does not copy or mark them. What stays on the heap is the index
-and filter partitions in the cache, about 2% of the table bytes (4% with LZ4), and their managed handles. The arenas'
-chunks are reused from one memtable to the next while they stay within the memtable budget, so the process holds at
-most the budget for memtables, plus up to one partly used 64 KiB chunk per processor and memtable.
-
-An embedded Kahuna node registers the providers in code instead:
+An embedded Kahuna node registers the providers in code.
 
 ```csharp
 using Solarium.Kahuna;
@@ -78,12 +36,41 @@ options.StorageProviders.Register(new SolariumPersistenceBackendProvider());
 options.StorageProviders.Register(new SolariumWalProvider());
 ```
 
-### The storage environment
+## Settings
 
-The parameterless constructors, which the extension loader calls, open the WAL and the store on the
-environment the node chooses with `--extension-option solarium.environment=default|io_uring`, or
-`EmbeddedKahunaOptions.ExtensionOptions` in code. Without it, they use the default environment. `io_uring` needs Linux with io_uring. It is one `IoUringStorageEnvironment` for every Solarium
-database of the process, and it lives as long as the process.
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `--storage-compaction-rate-mbps` | none | Gives the store a `RateLimiter` for its flush and compaction writes, and allows `max(2, CPUs / 2)` compactions at once. |
+| `--storage-max-background-compactions` | 1 if no rate is set | Sets the number of compactions at once. |
+| `--storage-shared-cache-mb` | 0 | One `Cache` for the index and filter blocks of the WAL and the store, pinned at level 0. |
+| `--storage-shared-memtable-budget-mb` | 0 | One `WriteBufferManager` for the memtables of the WAL and the store. |
+| `--extension-option solarium.environment` | `default` | The storage environment: `default` or `io_uring`. |
+
+### Compaction rate
+
+The limiter paces flushes too. Set the rate above what the store ingests and below what would leave the disk no
+room for the WAL's syncs. If it is too low, level 0 grows until writes slow down. On a disk whose synced writes
+took 4 to 8 ms, a rate of 50 made synced batches of 64 rows 2.5 times as fast as one unpaced compaction. On the
+same disk at about 1 ms, rates of 25 and 50 slowed the batches to 0.2 to 0.4 times the unpaced rate (see
+[benchmarks.md](benchmarks.md#paced-background-writes)).
+
+### Shared memory
+
+Size the shared cache to fit all the index and filter blocks of the WAL and the store: about 2% of their table
+bytes, or 4% with LZ4. With a shared cache, the memtable budget is charged into it. Add the
+budget to its size.
+
+When the memtables pass their budget, the database that writes next flushes its oldest memtable. Writes do not
+stall. Size the budget above two of the WAL's 128 MiB shard memtables, or the WAL logs a warning at open and its
+memtables are flushed before they fill. If only the store or only the WAL is Solarium's, it uses the settings
+alone.
+
+Memtable entries and cached data blocks are native memory, as with RocksDB. A node sized for RocksDB does not
+need a larger GC heap limit (`DOTNET_GCHeapHardLimit*`). The index and filter partitions in the cache are on the
+heap. Memtable chunks are reused up to the budget. One partly used 64 KiB chunk per processor and memtable can
+come on top of it.
+
+### Storage environment
 
 ```sh
 kahuna-server --extension-assembly /opt/kahuna/solarium/Solarium.Kahuna.dll \
@@ -91,147 +78,101 @@ kahuna-server --extension-assembly /opt/kahuna/solarium/Solarium.Kahuna.dll \
               --extension-option solarium.environment=io_uring
 ```
 
-Choose io_uring when lookups often miss the page cache. Its batched reads (`MultiGet`, which
-`GetKeyValues` uses) keep the misses in flight together, 1.6 to 2.4 times as fast from the drive (see
-[storage-environments.md](storage-environments.md)). It costs 3% to 5% on batched reads that hit the page
-cache. Its writes hand off to one reactor thread, so they slow down when readers keep every CPU busy.
+In code, use `EmbeddedKahunaOptions.ExtensionOptions` to set the environment. A provider that gets an
+`IStorageEnvironment` in its constructor uses that one. `OpenAt` and `MergeCheckpointInto`, which Kahuna calls
+for backups and restores, use the default environment unless the provider has one. An unknown `solarium.` key or
+environment fails the open with a message that names it.
 
-A `solarium.` key other than `solarium.environment`, or an environment other than `default` and `io_uring`,
-fails the open with a message that names it. A provider given an `IStorageEnvironment` in its constructor
-uses that one whatever the node's settings. `OpenAt` and `MergeCheckpointInto`, which Kahuna calls for
-backups and restores without a context, use the default environment unless the provider was given one. The
-environment changes how the files are read and written, not what they hold.
+`io_uring` needs Linux. All the Solarium databases of the process share one `IoUringStorageEnvironment`. Choose
+it when lookups often miss the page cache: batched reads are then 1.6 to 2.4 times as fast. It costs 3% to 5% on
+batched reads that hit the page cache, and its writes slow down when readers use all CPUs. See
+[storage-environments.md](storage-environments.md).
 
-## What it keeps from the RocksDB backend
+## Compatibility with the RocksDB backend
 
-`SolariumPersistenceBackend` is a port of Kahuna's `RocksDbPersistenceBackend`, not a new design:
+`SolariumPersistenceBackend` is a port of Kahuna's `RocksDbPersistenceBackend`.
 
-- the database at `{storage path}/{revision}`, with the column families `kv` and `locks`;
-- the rows: Kahuna's `RocksDbKeyValueMessage` and `RocksDbLockMessage` protobufs, from `Kahuna.Core`;
-- the keys: `{key}~CURRENT` for the current row, `{key}~{revision}` for each retained revision, and
-  `{key}~NOREV` for the no-revision provenance;
-- the tilde-key registry, the durability floors, and the pruned-history floor with its legacy key;
-- revision pruning, with its memo, its sweep and its quiescence proof. A deleted key is released once age
-  retention has passed its delete record and no snapshot hold is older than it: every row of the key goes
-  except its current row, which holds the revision that the key's next write continues from. The prune
-  writes its deletes in shared batches of up to 2,048 rows, not synced (a batch that a power loss takes
-  takes its pruned-history floor with it, and the next pass deletes the rows again), and asks for a flush
-  of the kv family, without a wait, when a sweep cycle ends;
-- the scans, including the snapshot prefix scan and the seek over a deep revision run;
-- the storage-failure recovery: close and reopen in place, behind a swap fence;
-- checkpoints: plain, exact as-of, key-filtered, and the merge of one node's share into another;
-- the storage-damage contract: the fail-stop on damage, the declared durability floors and the store identity.
+| Part | Layout |
+| --- | --- |
+| Database | `{storage path}/{revision}`, with the column families `kv` and `locks` |
+| Rows | Kahuna's `RocksDbKeyValueMessage` and `RocksDbLockMessage` protobufs |
+| Keys | `{key}~CURRENT` for the current row, `{key}~{revision}` for each retained revision, `{key}~NOREV` for the no-revision provenance |
+
+It also ports the durability floors, the scans, the checkpoints with their merge, the revision pruning, and the
+recovery from a storage failure by a reopen in place.
+
+A deleted key is released when age retention has passed its delete record and no snapshot hold is older. All its
+rows go except the current one, which has the revision that the next write continues from. The prune deletes in
+unsynced batches of up to 2,048 rows, and asks for a flush of the kv family when a sweep ends. If a power loss
+drops a batch, the next pass deletes the rows again.
 
 ## Storage damage
 
-Kahuna 1.15 added a storage-damage contract to `IPersistenceBackend`, with defaults that do nothing;
-`SolariumPersistenceBackend` implements it, as the RocksDB backend does.
+The store implements Kahuna 1.15's storage-damage contract.
 
-- **Fail-stop on damage.** The first `SolariumException` with `IsCorruption` from any read, batched read, scan,
-  write or open (a block that fails its checksum, a table that is not the one the manifest records, a write
-  refused after a compaction met damage) fail-stops the store, with one Critical line. From then on every
-  operation throws `StorageCorruptionException`, which Kahuna answers with the terminal `StorageCorrupt`, not
-  `MustRetry`; the store methods return false; `GetFailStopReason` names the damage, with the failures a refused
-  write wraps; and `TryRecoverFromStorageFailure` declines without closing or reopening the store, so its files
-  stay as they are. A Solarium iterator throws at a damaged block, so no scan ends short. Kahuna then withholds
-  candidacy and steps down every partition the node hosts, and reports the fault in its storage health. A
-  damaged open throws `StorageCorruptionException`, and the node does not start.
-- **Durability floors.** `KeepsDurabilityFloors` is true: the store keeps every floor it is given, so a data
-  partition with none was never flushed here, and Kahuna answers 0 for it, which lets Kommander refuse to replay
-  a compacted suffix onto a store that lost its prefix. A floor row that is not 8 bytes is damage: it fails the
-  open, and a read of it fail-stops the store.
-- **Store identity.** `SupportsStoreIdentity` is true. The identity, the node's Raft endpoint, a creation id and
-  a time, is a synced row in the reserved `\0` namespace, `\0store_identity`, which no scan sees and which is
-  not durable state (`HoldsDurableState`). Kahuna stamps a fresh store at its first open, refuses a store
-  stamped by another node, stamps a store written before the identity existed, and reports a store found empty
-  under a log with history as lost or replaced. An as-of image and a merge carry no identity, so a restore
-  or a seed is stamped by the node that opens it, not refused as foreign; a plain checkpoint, a copy of the
-  node's own store, keeps it, as the RocksDB backend's does. A row that does not decode is damage.
+- **Fail-stop.** The first `SolariumException` with `IsCorruption` fail-stops the store and logs one Critical
+  line. Later operations throw `StorageCorruptionException`, which Kahuna answers with the terminal
+  `StorageCorrupt`. `GetFailStopReason` names the damage. `TryRecoverFromStorageFailure` declines, and the files
+  are not changed. A scan throws at a damaged block and cannot end short. Kahuna then withholds candidacy and
+  steps down the node's partitions. If the damage is found at open, the node does not start.
+- **Durability floors.** `KeepsDurabilityFloors` is true. A data partition that lacks a floor was not flushed to
+  this store. Kahuna answers 0 for it, and Kommander can refuse to replay a compacted suffix onto a store that
+  lost its prefix. A floor row that is not 8 bytes is damage.
+- **Store identity.** `SupportsStoreIdentity` is true. The identity is a synced row, `\0store_identity`, with the
+  node's Raft endpoint, a creation id and a time. Scans do not return it. Kahuna stamps a new or older store at its first open. A
+  store that another node stamped fails to open, and an empty store under a log with history is reported as lost
+  or replaced. As-of images and merges carry no identity, and the node that opens them stamps them. A plain
+  checkpoint has the identity of its store. A row that does not decode is damage.
 
 ## Differences from the RocksDB backend
 
-- **An index and filter cache, not a block cache.** Without `--storage-shared-cache-mb`, the store's tables keep
-  their index and filter blocks in a 256 MiB cache that every Solarium store of the process shares, pinned at
-  level 0, as the RocksDB backend keeps them in its process-wide 256 MiB block cache. The cache holds no data
-  blocks: the OS page cache serves them. 256 MiB holds the indexes and filters of about 12 GB of tables, 6 GB with LZ4 (2% and 4% of the
-  table bytes). Past that, a lookup that misses reads one partition of its table's index and filter again,
-  a few kilobytes: with a cache of a quarter of them, lookups from one thread ran about 2.5 times slower in
-  [benchmarks.md](benchmarks.md). Tables written before partitions keep one whole index and filter until a
-  compaction rewrites them, and a miss on one of them reads it all.
-- **No RocksDB tuning.** Direct reads, Bloom filter settings, statistics and `--rocksdb-shared-memory` do not
-  apply; the shared cache and memtable budget do. Solarium's tables have a fixed 10-bit Bloom filter. The kv
-  family keeps a 64 MiB memtable with up to three, and the locks family 8 MiB with up to two, as the RocksDB
-  backend sizes them.
-- **Checkpoints hold no WAL.** A checkpoint is `SolariumDb.CreateCheckpoint`: its tables are hard links to
-  the store's, as RocksDB's are, or copies when the checkpoint is on another file system, and what the
-  memtables hold goes to tables of the copy, so the live store is not flushed. A live checkpoint is staged
-  on the store's file system, as the RocksDB backend's is (`StagesLiveCheckpointsInStore` is true). The
-  checkpoint directory is a database directory, opened at `{root}/{revision}`, as RocksDB's.
-- **LZ4, and RocksDB's levels.** Both families compress their tables with LZ4, where the RocksDB backend
-  uses RocksDB's default, Snappy. Solarium compacts into RocksDB's levels, sized as RocksDB sizes them.
-  Without `--storage-compaction-rate-mbps`, it runs one compaction at a time, where the RocksDB backend runs
-  `max(2, CPUs / 2)`: unpaced, several compactions take the disk from the synced writes and slow them.
-  [benchmarks.md](benchmarks.md) measures both backends.
-- **The trim is not rate limited.** Solarium's `RateLimiter` paces flush and compaction writes only, where
-  `BackupCaptureThrottleBytesPerSec` charges the trim's reads too (RocksDB's `kAllIo`), so the backend does
-  not give it to the as-of trim of a checkpoint copy.
-- **The purge flushes first.** Solarium's `CompactRange` does not flush a memtable first, so the trim and
-  the merge flush each family before they compact it, which a full purge of the copy needs.
-- **A key's rows go with one range tombstone.** `DeleteKeyValues` and `DeleteLocks` delete each key's rows,
-  `key~` up to `key\x7F`, with one `DeleteRange`, where the RocksDB backend walks the rows and deletes each
-  one. The rows are the same, but the batch has one operation per key, however deep its history. A
-  whole-partition purge before a snapshot install deletes 256 keys a call; with a delete per row, a call on a
-  store with millions of history rows built them all on the managed heap at once, where the RocksDB backend's
-  batch is native memory.
-- **No compaction that starts from deletes.** The RocksDB backend marks a kv table for compaction when half
-  of its entries are deletes (RocksDB's `CompactOnDeletionCollector`), so the prune's deletes travel down to
-  the rows they cover with no other writes. Solarium picks compactions by level size only, so on a store with
-  no other writes, the deletes of a released key space stay in a table above the rows they cover, and the
-  store does not give back the space until writes push them down.
-- **Batched reads go one family per call.** Solarium's `MultiGet` reads one column family per call; every
-  batched read here reads the kv family only.
+- **Cache.** By default, the Solarium stores of a process share a 256 MiB cache for index and filter blocks,
+  pinned at level 0. This is enough for about 12 GB of tables, or 6 GB with LZ4. Past that, a lookup that misses
+  reads one partition again, a few kilobytes. With a cache of a quarter of the partitions, lookups from
+  one thread were about 2.5 times slower. A miss on a table written before partitions reads its complete index
+  and filter. Data blocks use the OS page cache, where RocksDB has them in its block cache.
+- **Tuning.** Direct reads, Bloom filter settings, statistics and `--rocksdb-shared-memory` do not apply. The
+  Bloom filter has 10 bits per key. The kv family has up to three memtables of 64 MiB and the locks family up to
+  two of 8 MiB, as in the RocksDB backend.
+- **Checkpoints.** They have no WAL, and the live store is not flushed. The tables are hard links, or copies on
+  another file system. The content of the memtables goes to tables of the copy.
+- **Compression.** Both families use LZ4. The RocksDB backend uses Snappy.
+- **Compactions.** Unless a rate is set, one compaction is active at a time. The RocksDB backend allows
+  `max(2, CPUs / 2)`. Several unpaced compactions slow the synced writes.
+- **Trim rate.** The as-of trim of a checkpoint copy is not rate limited. `BackupCaptureThrottleBytesPerSec`
+  also charges reads (RocksDB's `kAllIo`), and Solarium's limiter paces writes only.
+- **Purge.** The trim and the merge flush each family before they compact it, because `CompactRange` does not
+  flush a memtable.
+- **Deletes.** `DeleteKeyValues` and `DeleteLocks` use one `DeleteRange` per key, from `key~` up to `key\x7F`.
+  The RocksDB backend deletes row by row. A batch has one operation per key, which bounds the managed memory of a
+  purge on a store with a deep history.
+- **Delete-triggered compaction.** There is no equivalent of `CompactOnDeletionCollector`. On a store that takes
+  no other writes, the disk space of deleted keys is not released until writes push the deletes down.
+- **`MultiGet`** reads one column family per call. Batched reads here use the kv family only.
 
 ## Building against Kahuna
 
-`Solarium.Kahuna` references the `Kahuna.Core` package from nuget.org. The server's loader hands an extension
-the server's own copy of every assembly the server has, so the server's `Kahuna.Core` must have at least the
-assembly version this package was built against: a server older than the referenced `Kahuna.Core` fails to load
-the extension. Raise the reference only to a Kahuna release the servers that load it already run.
+The package references `Kahuna.Core` from nuget.org. The server gives an extension its copy of each assembly it
+has. If its `Kahuna.Core` is older than the referenced version, the extension fails to load. Raise the
+reference only to a Kahuna release that the servers already use.
 
 ## Tests
 
-`tests/Solarium.Kahuna.Tests` holds the behavior tests of Kahuna's RocksDB backend, ported to
-`SolariumPersistenceBackend`: the backend tests of `TestPersistenceBackends`, revision pruning (memo, sweep
-quiescence, time budget, snapshot floor, the release of deleted keys), as-of reads (revision at or before, probes, run seeks, prefix
-scans, batched gets, the monotonic current head, no-revision writes), checkpoints (as-of, the pruned-history
-floor, key-filtered composition and merge) and the storage-failure recovery. The tests of Kahuna's memory
-and SQLite backends, its background writer and its backup driver stay in Kahuna. A recovery test injects a
-write failure through `HookedEnvironment` on the default and io_uring environments; the other ported tests
-run on the default environment, as Kahuna's do.
+`tests/Solarium.Kahuna.Tests` has the behavior tests of Kahuna's RocksDB backend, ported to
+`SolariumPersistenceBackend`. They use the default environment, as Kahuna's do. The failure and damage tests use
+both environments.
 
-`TestStorageCorruption` damages real files, on both environments: a flipped byte in a data block makes a range
-scan, a point read, a batched read and a whole-family scan throw `StorageCorruptionException`, and fail-stops the
-store, which then refuses everything and declines the recovery with its files unchanged; damage that a
-compaction finds fail-stops it through the refused write; a truncated table, a floor row of the wrong length and
-an identity row that does not decode are refused; and it checks the identity, the durable state, and that an
-as-of image and a merge carry no identity. `TestStorageCorruptionNode` runs a whole embedded node on a Solarium
-store and WAL: a damaged block answers the first read with `StorageCorrupt` and takes the node out of
-consensus, and a single node whose store directory was lost under a surviving log reports it as replaced and
-rebuilds it from the log. When the log was compacted below a checkpoint first, the store's floor of 0 falls below
-the log's compaction floor: a single node refuses the replay, reports `ApplicationFloorBelowCompaction` and never
-leads, so it answers no read with a missing key, and in a three-node cluster the follower that lost its store is
-rebuilt whole from the leader's snapshot before it leads. Both fail when the store declares no floors, as before
-the storage-damage contract. `TestDeletedKeyDiskRelease` runs a node whose prune releases a deleted key with no
-further write, then restarts it and writes the key again above its delete record. `TestPruneWriteFailure` fails
-the first batch of a sweep through `HookedEnvironment`, on both environments: no row and no floor moves, the pass
-after the recovery releases every key, and a reopen keeps the result.
+| Tests | What they check |
+| --- | --- |
+| `TestStorageCorruption` | Damaged blocks, tables and rows fail-stop the store or fail its open. It also checks the identity. |
+| `TestStorageCorruptionNode` | A complete embedded node on damage or a lost store. A single node does not lead when its store's floor is below the log's compaction floor. In a three-node cluster, the follower is rebuilt from the leader's snapshot. |
+| `TestDeletedKeyDiskRelease` | A pruned key is released, and can be written again after a restart. |
+| `TestPruneWriteFailure` | A failed first batch of a sweep changes no row and no floor. The pass after the recovery releases all the keys. |
 
-Three ported tests are skipped. The two cases of `DeletedKeySpace_GivesItsDiskSpaceBack_WithNoOtherWrites`
-need the compaction that starts from deletes (above).
-`DeleteRecordInsideTheRetentionAge_KeepsItsHistoryRow_UntilTheAgePassesIt` needs age retention to count a
-revision's age from the commit of the revision that replaced it. This store and the released RocksDB backend
-count it from the revision's own commit.
+Three ported tests are skipped. The two cases of `DeletedKeySpace_GivesItsDiskSpaceBack_WithNoOtherWrites` need
+delete-triggered compaction. `DeleteRecordInsideTheRetentionAge_KeepsItsHistoryRow_UntilTheAgePassesIt` needs age
+retention to count from the commit of the replacing revision. This store and the released RocksDB backend count
+it from the revision's commit.
 
-End to end, a Kahuna server loaded the published extension, took writes over REST on `--storage solarium
---wal-storage solarium`, and read every key back after a SIGKILL and a restart, as the same run did on
-RocksDB.
+The package was also tested end to end. A Kahuna server loaded the published extension, took writes over REST,
+and read all the keys back after a SIGKILL and a restart.

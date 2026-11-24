@@ -4,7 +4,7 @@
 dotnet test
 ```
 
-The storage, SSTable, and database tests take the environment as a parameter. On Linux with io_uring, they run once for each environment. To test the io_uring environment from macOS or Windows, use Docker:
+The storage, SSTable and database tests take the storage environment as a parameter. On Linux with io_uring, they execute once for each environment. On other platforms, they cover the default environment only. You can test io_uring from macOS or Windows through Docker.
 
 ```sh
 docker build -t solarium-test .
@@ -13,14 +13,33 @@ docker run --rm --security-opt seccomp=unconfined --ulimit memlock=-1 solarium-t
 
 Docker needs both flags. The default seccomp profile blocks io_uring, and each ring counts against the locked-memory limit.
 
-Without io_uring, the suite runs the default environment only and still passes. CI (`.github/workflows/ci.yml`) runs on Linux and fails when a test ran on the default environment but not on io_uring. The `Windows` workflow (`.github/workflows/windows.yml`) runs the suite on Windows, on the default environment, when started by hand: Windows enforces file share modes and has no directory fsync, and runner minutes there count against the plan.
+CI (`.github/workflows/ci.yml`) uses Linux. It fails when a test ran on the default environment but did not run on io_uring. The `Windows` workflow (`.github/workflows/windows.yml`) is started by hand. Windows matters because it enforces file share modes and has no directory fsync.
 
-`CrashTests` cuts the power at random operations of a random workload: batches across column families, synced and not, with flushes, WAL rotation, compactions, and Kommander's floor pass with `DeleteFilesInRange`. `PowerLossEnvironment` keeps what each file and the directory held at their last flush, and a crash writes out what a power loss can leave: only that, or also part of the rest, written in order or sector by sector in any order. Each run crashes and reopens three times, so recovery itself is cut too. After each reopen, the database must hold exactly the first batches up to one point, at or after the last synced write that returned, and nothing of a later batch. The suite runs 30 runs on each environment; `SOLARIUM_CRASH_ITERATIONS` sets more, and `SOLARIUM_CRASH_SEED` the first seed. A failure names its seed and keeps the directories of the run.
+## Crash tests
 
-`CheckpointTests` holds a checkpoint at its first write, with `HookedEnvironment`, and writes, flushes and compacts the source meanwhile; the copy must read as the source did when the checkpoint began. `PowerLossEnvironment` models one directory, so no test cuts the power during a checkpoint. Instead, a recording environment checks the order that makes a cut-short copy refuse to open: the tables and `MANIFEST`, each made durable, before `FORMAT`. A directory gate holds a checkpoint between its check that the directory does not exist and its creation, while another checkpoint, an open checkpoint or a new database takes the directory; the held checkpoint must fail and leave every file there as it was. `Dispose` runs while a checkpoint is held at a memtable table, a table copy, `MANIFEST` or `FORMAT`; it must stop the checkpoint, or wait for one that writes `FORMAT`.
+| Test | What it simulates | Iterations per environment | Settings |
+| --- | --- | ---: | --- |
+| `CrashTests` | A power loss at random operations of a random workload | 30 | `SOLARIUM_CRASH_ITERATIONS`, `SOLARIUM_CRASH_SEED` |
+| `KillTests` | SIGKILL of a real process at a random moment | 4 | `SOLARIUM_KILL_ITERATIONS`, `SOLARIUM_KILL_SEED` |
+| `WalCrashTests` | Power losses and process crashes of a `SolariumWAL` (see [kommander.md](kommander.md)) | 24 | `SOLARIUM_WAL_CRASH_ITERATIONS`, `SOLARIUM_WAL_CRASH_SEED` |
 
-`SolariumDbTests` deletes the `MANIFEST` of a checkpoint, of a flushed database and of one with WAL files only, and checks that `Open` refuses each and changes no byte of its files, and that each opens again with its manifest back. `MemTableTests` checks the memtable's runs of range tombstones against a scan of all of them, after every range delete and at every snapshot, while readers race the writer that builds them. In Kommander's tests, a read gate holds a commit marker at its first SSTable probe while a higher commit of the same partition, or a partition delete, races it; the persisted commit frontier must not move back.
+### Power loss
 
-`KillTests` kills a real process with SIGKILL instead. `tests/Solarium.CrashWorker` writes the same kind of workload to a directory and reports each batch on standard output before it writes it, and the sequence number after the write returns; the test kills it at a random moment, sometimes while it still opens the database, reopens the directory, and checks it against the reports. A killed process loses nothing that the OS holds, so every acknowledged batch must be there, synced or not, and the batch in flight whole or not at all. Each run kills three workers in a row in one directory. The suite runs 4 runs on each environment; `SOLARIUM_KILL_ITERATIONS` and `SOLARIUM_KILL_SEED` change that.
+`PowerLossEnvironment` records what each file and the directory contained at their last flush. A crash leaves that content, and can also leave part of the later writes. That part is either in order or sector by sector in any order. With its `None` loss, which models a process crash, all writes and directory changes remain.
 
-`tests/Solarium.Kommander.Tests` holds Kommander's conformance suite, the ported `RocksDbWAL` behavior tests, `WalCrashTests`, the crash test of the WAL, `ClusterTests`, three-node Kommander clusters on `SolariumWAL`, and `MetricsTests`, the package's instruments read through a `MeterListener`; [kommander.md](kommander.md) describes them. `PowerLossEnvironment`'s `None` loss is a process crash: it keeps every write and directory change, flushed or not.
+The workload of `CrashTests` writes synced and unsynced batches across column families. It also covers flushes, compactions and Kommander's floor pass. Each run crashes and reopens three times, which means that recovery is cut too. After each reopen, the database must contain exactly the first batches up to one point, at or after the last synced write that returned. A failure prints its seed, and the directories of the run are preserved.
+
+### Process kill
+
+`tests/Solarium.CrashWorker` writes the same kind of workload. It prints each batch before the write, and the sequence number after the write returns. The test kills the worker and compares the reopened database with that output. All acknowledged batches must be there, synced or unsynced. The batch in flight must be complete or absent. Each run kills three workers in a row in one directory.
+
+## Race and failure tests
+
+- `CheckpointTests` pauses a checkpoint at its first write while the source takes writes, flushes and compactions. The copy must match the source as it was when the checkpoint began.
+- `CheckpointTests` also checks the write order that makes an incomplete copy fail to open: the tables and `MANIFEST`, each made durable, before `FORMAT`. No test cuts the power during a checkpoint, since `PowerLossEnvironment` models one directory.
+- Other checkpoint tests take the target directory during a checkpoint, or call `Dispose` at each of its stages.
+- `SolariumDbTests` deletes a `MANIFEST`. `Open` must fail and must not change a byte, and it must succeed when the manifest is back.
+- `MemTableTests` compares the index of range tombstones with a scan of all the tombstones, while readers race the writer.
+- In Kommander's tests, a commit marker is paused while a higher commit or a partition delete races it. The persisted commit frontier must not move back.
+
+For the tests of the Kommander and Kahuna packages, see [kommander.md](kommander.md) and [kahuna.md](kahuna.md).

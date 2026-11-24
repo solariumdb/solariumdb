@@ -1,17 +1,17 @@
 # Solarium
 
-Solarium is an embedded key-value store for .NET, written in managed code. Its design and its API follow RocksDB: a database in one directory, column families, atomic write batches across them, a write-ahead log (WAL), sorted in-memory tables (memtables), sorted files on disk (SSTables), compaction, range deletes, and ordered iterators.
+Solarium is an embedded key-value store for .NET, written in managed code. Its design and API follow RocksDB: one database per directory, with column families, atomic write batches and ordered iterators.
 
-It exists to be a durable log store for [Kommander](https://github.com/kahunakv/kommander), the Raft library: it covers the part of RocksDB that Kommander's Raft log uses, with RocksDB as the reference behavior, and it ships a Kommander WAL backend, `SolariumDb.Kommander`, that a host plugs into Kommander in place of RocksDB, with no native library.
+It is built as the log store of [Kommander](https://github.com/kahunakv/kommander), a Raft library. It covers the part of RocksDB that Kommander uses, and RocksDB is its reference behavior. The `SolariumDb.Kommander` package is a Kommander WAL backend that replaces RocksDB and needs no native library.
 
 ## Packages
 
 | Package | What it is |
 | --- | --- |
-| `SolariumDb` | The store. Managed code, on every platform .NET 10 runs on; its memtables and cached data blocks are native memory, outside the GC heap, as RocksDB's. |
-| `SolariumDb.IoUring` | A storage environment for Linux 6.1 or later that does its file writes through io_uring, on the [ioxide](https://github.com/MDA2AV/ioxide) runtime. |
-| `SolariumDb.Kommander` | `SolariumWAL`, a Kommander `IWAL` on Solarium, with the on-disk layout of Kommander's `RocksDbWAL`. |
-| `SolariumDb.Kahuna` | A Kahuna storage engine: the persistence backend and the Raft WAL on Solarium, which a Kahuna server loads with `--extension-assembly`. |
+| `SolariumDb` | The store, for all platforms that .NET 10 supports. Memtables and cached data blocks are native memory, outside the GC heap. |
+| `SolariumDb.IoUring` | A storage environment for Linux 6.1 or later that writes files through io_uring, on the [ioxide](https://github.com/MDA2AV/ioxide) runtime. |
+| `SolariumDb.Kommander` | `SolariumWAL`, a Kommander `IWAL` with the on-disk layout of Kommander's `RocksDbWAL`. |
+| `SolariumDb.Kahuna` | A Kahuna storage engine: the persistence backend and the Raft WAL. A Kahuna server loads it with `--extension-assembly`. |
 
 All four are MIT-licensed.
 
@@ -42,7 +42,7 @@ for (iterator.Seek("log:"u8); iterator.Valid(); iterator.Next())
 db.DeleteRange("log:0000"u8, "log:0001"u8);
 ```
 
-As Kommander's WAL:
+You can also use it as Kommander's WAL.
 
 ```csharp
 using Solarium.Kommander;
@@ -51,39 +51,42 @@ using SolariumWAL wal = new("/var/lib/node1/raft", "v1", logger, syncWrites: tru
 RaftManager raft = new(configuration, discovery, wal, communication, new HybridLogicalClock(), logger);
 ```
 
-Every member is safe to call from any thread. Writes from many threads share their WAL appends and flushes through group commit, and reads take no locks.
+All members are safe to call from any thread. Concurrent writes share their WAL appends and flushes through group commit, and reads take no locks.
 
 ## Status
 
-Solarium is young, and its on-disk format may still change. Done:
+Solarium is young, and its on-disk format may change.
 
-- the embedded API, column families, atomic batches across them, `DeleteRange`, and iterators with an upper bound;
-- group commit with pipelined writes, and lock-free reads on a skip-list memtable;
-- WAL recovery that cuts a torn tail and refuses damage to flushed data, checked by power-loss and kill tests;
-- SSTable checksums bound to each block's table and offset, data blocks checked against their index entries, and opens that refuse a table file the manifest does not record, all reported as corruption (`SolariumException.IsCorruption`);
-- memtable flushes to SSTables, LZ4 block compression, WAL rotation with a size cap, the manifest, leveled compaction into RocksDB's seven levels with its dynamic level sizing and concurrent compactions, a rate limiter and `bytes_per_sync` for flushes and compactions, a memtable budget shared across databases (`WriteBufferManager`), a block cache that bounds the memory of the tables' index and filter blocks, can hold the memtable budget too, and caches data blocks when asked, `DeleteFilesInRange`, checkpoints, and write stalls;
-- the RocksDB properties and live-file metadata that Kommander reads;
-- `Solarium.Kommander`, which passes Kommander's conformance suite for WAL backends and the behavior tests of its RocksDB backend, runs three-node Kommander clusters in the tests, and publishes the engine `raft.wal.*` metrics, with Kommander's storage-damage contract: the term and vote flushed before they count, the acknowledged-presence watermark, a sync ledger and a hard-state ledger that find a WAL file cut after its fsync, and a fail-stop on corruption;
-- `Solarium.Kahuna`, a port of Kahuna's RocksDB persistence backend that passes its behavior tests, with providers that a Kahuna server loads as an extension for `--storage solarium` and `--wal-storage solarium`, and Kahuna's storage-damage contract: a fail-stop on corruption, declared durability floors, and the store stamped with its node's identity.
+| Area | What works |
+| --- | --- |
+| API | Column families, atomic batches across them, `DeleteRange`, `DeleteFilesInRange`, checkpoints, and iterators with an upper bound. |
+| Writes and reads | Group commit with pipelined writes, and lock-free reads on a skip-list memtable. |
+| Recovery | A torn WAL tail is cut. Damage to flushed data fails the open. Power-loss and kill tests check both. |
+| Corruption checks | Checksums are bound to a block's table and offset, and each table file is checked against the manifest. Damage throws `SolariumException` with `IsCorruption`. |
+| Storage | Memtable flushes, LZ4 compression, WAL rotation with a size cap, and leveled compaction with dynamic level sizing and concurrent compactions. |
+| Resource limits | A rate limiter, `bytes_per_sync`, write stalls, a memtable budget that databases can share (`WriteBufferManager`), and a block cache. |
+| Monitoring | The RocksDB properties and live-file metadata that Kommander reads. |
+| `Solarium.Kommander` | Passes Kommander's conformance suite and the behavior tests of its RocksDB backend, and implements its storage-damage contract. |
+| `Solarium.Kahuna` | Passes the behavior tests of Kahuna's RocksDB backend, and implements its storage-damage contract. |
 
-Not done yet:
+These parts are not done yet.
 
-- a block cache that pays for data blocks on stores larger than the cache: with the LRU cache, caching them (`CacheDataBlocks`, off by default) made reads faster on a store that fits in the cache but slower on one ten times its size, so the OS page cache serves them;
-- recovery after a WAL, flush or compaction failure inside the engine: the database refuses all writes until it is opened again (`SolariumWAL` and the Kahuna store reopen it on their own, except after corruption, on which they fail-stop);
-- subcompactions, which split one large merge across threads, and more than one flush thread.
+- A block cache that helps data blocks on stores larger than the cache. With `CacheDataBlocks` (off by default), reads are faster on a store that fits in the cache and slower on a store ten times its size.
+- Recovery in the engine after a WAL, flush or compaction failure. The database refuses writes until you reopen it. `SolariumWAL` and the Kahuna store reopen it themselves, except after corruption, where they fail-stop.
+- Subcompactions, which split one large merge across threads, and more than one flush thread.
 
 ## Documentation
 
 | Document | Content |
 | --- | --- |
-| [docs/api.md](docs/api.md) | Every public member and option, with its RocksDB equivalent, and the supported properties. |
-| [docs/design.md](docs/design.md) | Column families, group commit, lock-free reads, flushes, compactions, write stalls, SSTables, and the files in the data directory. |
-| [docs/durability.md](docs/durability.md) | What a write survives, the WAL format, and recovery after a crash or a power loss. |
-| [docs/storage-environments.md](docs/storage-environments.md) | The default and the io_uring environments, and what io_uring costs and gains. |
-| [docs/rocksdb-differences.md](docs/rocksdb-differences.md) | Every deliberate difference from RocksDB. |
-| [docs/kommander.md](docs/kommander.md) | `Solarium.Kommander`: what it keeps from `RocksDbWAL`, its options, and its recovery. |
-| [docs/kahuna.md](docs/kahuna.md) | `Solarium.Kahuna`: loading it into a Kahuna server, what it keeps from Kahuna's RocksDB backend, and its differences. |
-| [docs/testing.md](docs/testing.md) | Running the tests, on io_uring through Docker, and the crash and kill tests. |
+| [docs/api.md](docs/api.md) | The public members and options with their RocksDB equivalents, and the supported properties. |
+| [docs/design.md](docs/design.md) | The write and read paths, flushes, compactions, SSTables, and the files in the data directory. |
+| [docs/durability.md](docs/durability.md) | What a write survives, the WAL format, and recovery. |
+| [docs/storage-environments.md](docs/storage-environments.md) | The default and the io_uring environments, and when to choose each one. |
+| [docs/rocksdb-differences.md](docs/rocksdb-differences.md) | The deliberate differences from RocksDB. |
+| [docs/kommander.md](docs/kommander.md) | `Solarium.Kommander`: its options, its recovery, and its differences from `RocksDbWAL`. |
+| [docs/kahuna.md](docs/kahuna.md) | `Solarium.Kahuna`: how to load it into a Kahuna server, and its differences from Kahuna's RocksDB backend. |
+| [docs/testing.md](docs/testing.md) | How to run the tests, with io_uring through Docker, and what the crash tests check. |
 | [docs/benchmarks.md](docs/benchmarks.md) | The benchmarks against RocksDB, and their results. |
 
 ## Build and test
@@ -93,7 +96,7 @@ dotnet build
 dotnet test
 ```
 
-The SDK is pinned in `global.json` (.NET 10). On Linux with io_uring, the storage tests run on both environments; [docs/testing.md](docs/testing.md) explains how to run them elsewhere through Docker.
+The SDK is pinned in `global.json` (.NET 10). On Linux with io_uring, the storage tests use both environments. For other platforms, see [docs/testing.md](docs/testing.md).
 
 ## License
 

@@ -1,18 +1,21 @@
 # Durability and recovery
 
-What a write survives, how the WAL is laid out on disk, and how an open recovers after a crash or a power loss.
-
 ## What a write survives
 
-- A synced write (`WriteOptions.Sync`) survives a power loss once `Write` returns.
-- A write that is not synced survives a process crash, but not a power loss, as in RocksDB. After a clean close it survives a power loss too: `Dispose` flushes the current WAL file.
-- A WAL, flush or compaction failure stops all later writes until the database is opened again: the WAL tail is unknown after a failed append. Reads continue.
+| Write | Process crash | Power loss |
+| --- | --- | --- |
+| Synced (`WriteOptions.Sync`) | Yes | Yes, once `Write` returns |
+| Unsynced | Yes | Only after a clean close: `Dispose` flushes the current WAL file |
+
+After a WAL, flush or compaction failure, writes fail until you reopen the database. A failed append leaves the WAL tail unknown. Reads continue.
 
 ## WAL files
 
-A new WAL file starts at the first write group after a memtable switch. The old file is flushed first, so only the newest file can have a torn tail. At open, every WAL file is replayed in order, and entries that an SSTable already holds are skipped. A memtable that fills during the replay is written as a level 0 table at once, as RocksDB's recovery does, so the WAL files need not fit in memory; the manifest saved at the end of the open records those tables. Then a new WAL file starts.
+A new WAL file starts at the first write group after a memtable switch. The old file is flushed first, which means that only the newest file can have a torn tail.
 
-The WAL file and record format (all integers little-endian, one record for each batch):
+At open, the WAL files are replayed in order, and entries that an SSTable already has are skipped. A memtable that fills during the replay is written as a level 0 table immediately, so the WAL files do not need to fit in memory. The manifest is saved at the end of the open and records those tables. Then a new WAL file starts.
+
+All integers are little-endian, and each batch is one record.
 
 ```
 file      = [u32 magic "SWAL"][u32 version = 2][record]...
@@ -22,21 +25,44 @@ operation = [u8 kind = 2][u32 family id][u32 key length][key]                   
           | [u8 kind = 1 or 3][u32 family id][u32 key length][key][u32 length][bytes]  put, delete range (bytes = end key)
 ```
 
-The durable offset is how much of the file a completed flush had made durable when the record was appended: a synced group raises it for the records after it, and so does the flush of the WAL before a memtable flush. The header is written and flushed when the file is created, before any record. A WAL file of version 1, from format 2, has no header and no durable offset; it still replays.
+The durable offset is how much of the file a completed flush had made durable when the record was appended. A synced group raises it for the records that follow, and so does the WAL flush before a memtable flush. The header is written and flushed when the file is created, before any record.
 
-A process crash can only cut the last write short. A power loss can also lose any sector written since the last flush, in any order, so the newest WAL file can end with damage that has intact records after it. Recovery cuts the newest file at its first damage, with everything after it, unless an intact record after the damage has a durable offset past it: that record proves the damaged bytes had been flushed, no crash explains the damage, and the open fails rather than drop data. A record can start at any byte after the damage, so the search for that record has a limit: it checksums at most four times the bytes after the damage, and 64 MiB more. A file with more records with bad checksums than that is not what a crash leaves, and fails the open too. Damage in an older file, a gap in the sequence numbers, or a missing WAL file that the manifest lists cannot come from a crash either, and fail the open too. A version 1 file keeps the rule it was written under: any damage with data after it, other than the end of a record or zeros, fails the open.
+A version 1 file, from format 2, has neither a header nor durable offsets. These files can be replayed.
 
-The cut can drop a synced write only when flushed data was damaged in a way no crash causes, and no record after it was written: damage inside the last synced group of the file, with nothing appended since. Then nothing in the file shows that the group had been flushed. RocksDB's two recovery modes for this case are `TolerateCorruptedTailRecords`, which Kommander uses and which fails the open after any power loss that left such a hole, and `PointInTimeRecovery`, which drops everything after the first damage whatever its cause. The power-loss test opens after every kind of loss it simulates.
+## Recovery after a crash
+
+A process crash can only cut the last write short. A power loss can also lose any sector written since the last flush, in any order. The newest WAL file can therefore end with damage that has intact records after it.
+
+Recovery cuts the newest file at its first damage, together with the bytes that follow. The open fails when there is proof that the damage did not come from a crash.
+
+- An intact record after the damage has a durable offset past it. The damaged bytes had been flushed, and cutting them would drop data.
+- The search for that record reaches its limit. It checksums at most four times the bytes after the damage plus 64 MiB. A crash does not leave that many records with bad checksums.
+- An older file is damaged, the sequence numbers have a gap, or a WAL file in the manifest is missing.
+- A version 1 file has any damage with data after it, other than the end of a record or zeros.
+
+One case cannot be detected. If no crash caused the damage, and it lies in the last synced group of the file with no record after it, the file does not show that the group was flushed. The cut then drops a synced write. `SolariumWAL` detects this case with its sync ledger (see [kommander.md](kommander.md)).
+
+In RocksDB, `TolerateCorruptedTailRecords`, which Kommander uses, fails the open after any power loss that left such a hole. `PointInTimeRecovery` drops everything after the first damage, whatever its cause.
 
 ## Damage to the SSTables
 
-A table file is written once, flushed before the manifest names it, and never written again, so damage to it is never a crash's torn tail: whatever a read finds wrong is corruption, which throws `SolariumException` with `IsCorruption` set and names the file and the offset. A retry fails the same way; the data must come from another copy. What is checked:
+A table file is written once and flushed before the manifest names it. Damage to it is therefore always corruption. A read of the damage throws `SolariumException` with `IsCorruption` set, and the message has the file and the offset. A retry gives the same result, and the data must come from another copy.
 
-- At open, the footer (its magic, version and CRC-32) and every block but the data blocks, each against its checksum, and each index partition against the key the top-level index holds for it. The table must then be the one the manifest records: the same table id (from table version 5, when the manifest records one), size, entry count, sequence numbers and key range. A table file that another, whole and valid one replaced, an older table of the same size or the same-numbered table of another database, fails here, before the open replays the WAL or saves the manifest, so every file the manifest lists stays as it was.
-- At each read of a data block from the file, by `Get`, `MultiGet`, an iterator or a compaction: its checksum, bound in table version 5 to the table's id and the block's offset, so a block copied from another place of the table or from another table fails it; its keys against its index entry, the last one equal to it and the first after the block before it, which finds a misplaced block in a table of any version; and the decoding of every length, count and entry kind it reads. A version 5 data block names the offset of its last entry, so this check decodes its first and last entries only, and the last must end the block; the entries between them are decoded, and refused if they do not decode, when a read reaches them. In an older table the check walks every entry of the block. A block that a cache holds passed these checks before it went in.
+### Checks at open
 
-A read that hits corruption fails, and nothing else changes: other keys still read. A compaction that hits it stops the database's writes, as any compaction failure does.
+- The footer is checked by its magic number, version and CRC-32, and all blocks except the data blocks by their checksums. Each index partition is checked against its key in the top-level index.
+- The table must match its manifest record: the size, the entry count, the sequence numbers and the key range. From table version 5, the table id must match too, when the manifest records one.
 
-## How it is tested
+These checks come before the open replays the WAL or saves the manifest. If a valid table file replaced another one, the open fails and the files in the manifest are unchanged.
 
-[testing.md](testing.md) describes the power-loss and kill tests that check these rules.
+### Checks at each read of a data block
+
+- The block's checksum. In table version 5 it includes the table's id and the block's offset, which detects a block copied from another place.
+- The block's keys against its index entry. The last key must equal the entry, and the first key must come after the previous block. This detects a misplaced block in any table version.
+- The lengths, counts and entry kinds that the read decodes.
+
+In a version 5 table, the key check decodes the first and last entries only. The entries between them are checked when a read reaches them. In an older table, the check walks the complete block. A block in a cache passed these checks before it was cached.
+
+A read that finds corruption fails, and other keys can be read. A compaction that finds it stops the database's writes.
+
+For the power-loss and kill tests that check these rules, see [testing.md](testing.md).

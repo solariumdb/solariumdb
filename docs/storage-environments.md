@@ -1,6 +1,6 @@
 # Storage environments
 
-All file I/O goes through a storage environment, as in RocksDB's `Env`. The default environment works on every platform; the `Solarium.IoUring` package adds an io_uring environment for Linux, on the [ioxide](https://github.com/MDA2AV/ioxide) runtime.
+All file I/O goes through a storage environment, as in RocksDB's `Env`. The default environment works on all platforms. The `Solarium.IoUring` package adds an io_uring environment for Linux, on the [ioxide](https://github.com/MDA2AV/ioxide) runtime.
 
 ```csharp
 using Solarium.IoUring;
@@ -9,49 +9,47 @@ using IoUringStorageEnvironment environment = new();   // dispose after every da
 using SolariumDb db = SolariumDb.Open("./data", new DbOptions { Environment = environment });
 ```
 
-| Environment | I/O | Flush |
+| | `DefaultStorageEnvironment` | `IoUringStorageEnvironment` |
 | --- | --- | --- |
-| `DefaultStorageEnvironment` (all platforms) | `RandomAccess` (pread / pwrite) | `fdatasync` on Linux; `RandomAccess.FlushToDisk` elsewhere (`F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows) |
-| `IoUringStorageEnvironment` (Linux) | writes: `IORING_OP_WRITE` on one ioxide reactor thread; reads: pread on the calling thread; batch reads: `preadv2(RWF_NOWAIT)` on the calling thread, then `IORING_OP_READ` for what the page cache misses | `fdatasync` on the calling thread |
+| Platforms | All | Linux |
+| Writes | `pwrite` | `IORING_OP_WRITE` on one ioxide reactor thread |
+| Reads | `pread` | `pread` on the calling thread |
+| Batch reads (`MultiRead`) | `pread`, one request after another | `preadv2(RWF_NOWAIT)` on the calling thread, then `IORING_OP_READ` for page cache misses |
+| Flush | `fdatasync` on Linux, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows | `fdatasync` on the calling thread |
 
-Both environments flush with `fdatasync` on Linux, as RocksDB does by default: it makes the data and the length durable and skips the journal commit that a changed timestamp alone needs with `fsync`, which a write in place over allocated blocks, such as a slot of Kommander's sync ledger, would otherwise pay at every flush. ioxide has no fsync operation in its API, so the io_uring environment flushes on the calling thread, not through the ring. Every read and write is a hand-off to the reactor thread, and that hand-off costs more than the system call it replaces. Measured on Linux 6.1 with ext4 on an NVMe drive:
+## Which one to choose
 
-- A 4 KB read from the page cache takes 2.6 µs instead of 0.4 µs. The kernel completes it inline, so the extra cost is the hand-off alone, about 2.3 µs.
-- A 4 KB write takes 6.9 µs instead of 1.5 µs, and a 64 KB write 29 µs instead of 20 µs. On this kernel, io_uring cannot complete a buffered ext4 write inline and passes it to one of its worker threads (`iou-wrk`). The extra cost is the hand-off plus that second hop, and it grows with the size of the write.
-- An unsynced `Put` from one thread takes 6.9 µs instead of 3.0 µs.
-- A synced `Put` costs the same in both. The device flush takes milliseconds, and neither environment sends it through the ring.
+Choose io_uring when `MultiGet` calls often miss the page cache. Its batched reads then reach the drive together. For other workloads, the default environment is usually as fast or faster.
 
-One operation at a time, as the engine issues them, io_uring is never faster. It can only win when many operations are in flight at once.
+Each io_uring write is a hand-off to the reactor thread, and the hand-off costs more than the system call it replaces. These are measurements on Linux 6.1 with ext4 on an NVMe drive.
 
-So the io_uring environment reads with `pread` on the calling thread. A table read is one blocking read, usually from the page cache, and through the ring the reads of every thread ran one at a time on the reactor thread. On Kahuna's `large` dataset (2,000,000 rows of 1 KiB, `Solarium.Kahuna.Benchmarks`, Linux 6.12, ext4 on NVMe, 2026-10-26, one repeat), before and after:
+| Operation | Default | io_uring |
+| --- | ---: | ---: |
+| 4 KB write | 1.5 µs | 6.9 µs |
+| 64 KB write | 20 µs | 29 µs |
+| Unsynced `Put`, one thread | 3.0 µs | 6.9 µs |
 
-| Case | default | io_uring, reads on the ring | io_uring, reads with pread |
-| --- | ---: | ---: | ---: |
-| get, 1 thread | 278,806 | 142,851 | 289,846 |
-| get, 8 threads | 1,249,720 | 504,846 | 1,177,798 |
-| get-batch16, 8 threads | 1,174,790 | 515,716 | 1,276,174 |
-| drain after load | 12 s | 26 s | 14 s |
+A synced `Put` costs the same in both, because the device flush takes milliseconds and does not go through the ring. When readers use all CPUs, io_uring writes also wait for the reactor thread to get a CPU. With six readers and one writer on four CPUs, the writer flushed 151 to 166 tables in 3 seconds on io_uring and 700 to 970 on the default environment.
 
-The drain is the compactions that the load left behind, whose input reads went through the ring too. A thread that writes reuses one completion and its event for every write, since it has at most one write in flight. The cost of reads that no longer wait for the reactor: where readers keep every CPU busy, a write waits for the reactor thread to get one. In a test with six readers in a tight loop beside one writer on four CPUs, the writer flushed 151 to 166 tables in 3 seconds on io_uring, against 390 with reads on the ring and 700 to 970 on the default environment.
+## Batch reads
 
-`MultiRead` reads a batch of requests, across files, for `MultiGet`. The default environment reads them one after another. The io_uring environment first reads what the page cache holds on the calling thread, with `preadv2(RWF_NOWAIT)`, which fails with `EAGAIN` rather than wait for the drive, and sends the rest to the ring together, then waits for all of them: the drive serves them at once, where `pread` would wait for each in turn. Reads that the page cache holds stay off the ring, where they would run one at a time on the reactor thread. A file system without `RWF_NOWAIT`, such as tmpfs, is read with `pread`. Cold random reads of 4 KiB from the NVMe drive above, in batches of 16, from one thread: 8,300 to 10,200 per second with `pread`, 60,000 to 65,600 through the ring; from 8 threads, 133,000 to 135,000 against 147,000 to 153,000, where the drive is near its limit either way.
+`MultiGet` reads its blocks with `MultiRead`, across files. The io_uring environment first reads what the page cache has, with `preadv2(RWF_NOWAIT)`. It sends the misses to the ring together, and the drive serves them at once. A file system that does not support `RWF_NOWAIT`, such as tmpfs, is read with `pread`.
 
-`MultiGet` reads through it, on Kahuna's `large` dataset (`get-batch16`, `GetKeyValues` of 16 keys, keys per second, 2026-10-26). Under the 2 GiB memory limit of [benchmarks.md](benchmarks.md), where blocks come from the drive, one repeat:
+These are the keys per second of `get-batch16` (16 keys per call) on Kahuna's `large` dataset, 2026-10-26. The drive rows used the 2 GiB memory limit described in [benchmarks.md](benchmarks.md), with one repeat. The page cache rows are medians of three repeats.
 
-| Case | default, before | default, after | io_uring, before | io_uring, after |
-| --- | ---: | ---: | ---: | ---: |
-| 1 thread | 40,757 | 41,529 | 43,503 | 104,353 |
-| 8 threads | 271,074 | 277,956 | 277,763 | 450,378 |
+| Case | Default | io_uring |
+| --- | ---: | ---: |
+| From the drive, 1 thread | 41,529 | 104,353 |
+| From the drive, 8 threads | 277,956 | 450,378 |
+| Page cache, 1 thread | 285,456 | 276,094 |
+| Page cache, 8 threads | 1,228,266 | 1,186,966 |
 
-In the page cache, the medians of three repeats:
+From the drive with one thread, the p99 of a call fell from 1,065 to 397 µs when `MultiGet` moved to `MultiRead`. In the page cache, io_uring pays 3% to 5% for the `preadv2` and the batch.
 
-| Case | default, before | default, after | io_uring, before | io_uring, after |
-| --- | ---: | ---: | ---: | ---: |
-| 1 thread | 285,442 | 285,456 | 290,372 | 276,094 |
-| 8 threads | 1,191,326 | 1,228,266 | 1,221,028 | 1,186,966 |
+## Implementation notes
 
-Before, `MultiGet` read each key's block with its own `pread`. From the drive, io_uring now reads 2.4 times as many keys from one thread and 1.6 times from eight; the p99 of a call from one thread fell from 1,065 to 397 µs. In the page cache, io_uring pays 3% to 5% for the `preadv2` and the batch, and the default environment is unchanged.
-
-A write that the ring completes with `ECANCELED` is done again with `pwrite` on the calling thread, and counted in `IoUringStorageEnvironment.CanceledOperations`. The kernel reports `ECANCELED` for io-wq work that never ran; one path on 6.1 is an io-wq that cannot start the first worker for a kind of work, which fails what it queued. It was seen once, on the first write of an `Open`, in a full parallel test run; a load of 205,000 new reactors writing new files did not repeat it, so the exact cause is not established. A retry on the calling thread is safe whatever the cause, because a positional write done again at the same offset leaves the same bytes, and it does not depend on the reactor or io-wq. Without it, the cancelled write failed that `Open`, and a cancelled WAL write would stop a database's writes until it is opened again.
-
-Every file of a database goes through its environment, the directory operations included, as in RocksDB's `FileSystem`: `FileExists`, `GetChildren`, `DeleteFile`, `RenameFile`, `TryLinkFile` (a hard link, which a checkpoint makes of each table), `CreateDirectory` and `FlushDirectory` (an fsync of the directory). A file adds `SyncRange`, which starts the writeback of a range without waiting for it: `sync_file_range(SYNC_FILE_RANGE_WRITE)` on Linux, on the calling thread on io_uring too, since the reactor has no such operation; nothing elsewhere. They have implementations on .NET's file APIs, and on libc or Win32 for the link and the directory fsync, which both environments use; a test environment overrides them to record or drop what a crash would lose. Only the `LOCK` file, a process lock, is opened directly.
+- Both environments flush with `fdatasync` on Linux, as RocksDB does by default. It makes the data and the length durable and skips the journal commit for a changed timestamp. The io_uring environment flushes on the calling thread, since ioxide does not offer an fsync operation.
+- Single reads use `pread` because they block one thread and usually hit the page cache. Through the ring, the reads of all threads were serialized on the reactor thread, and `get` from 8 threads was less than half as fast.
+- If the ring completes a write with `ECANCELED`, the calling thread repeats it with `pwrite`. `IoUringStorageEnvironment.CanceledOperations` counts these writes. A positional write at the same offset is safe to repeat. The kernel uses `ECANCELED` for io-wq work that did not run. It was seen once in a test run, and its cause is not established. Without the retry, a canceled WAL write would stop a database's writes until it is reopened.
+- `SyncRange` starts the writeback of a range and does not wait for it. It calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` on Linux, on the calling thread. On other platforms it is a no-op.
+- Directory operations also go through the environment, for example `RenameFile`, `TryLinkFile` and `FlushDirectory`. Both environments share their implementations. A test environment can override them to record or drop what a crash would lose. Only the `LOCK` file, a process lock, is opened directly.

@@ -1,28 +1,22 @@
 # Benchmarks
 
-Four benchmark projects compare Solarium with RocksDB, the reference behavior:
+Three benchmark projects compare Solarium with RocksDB.
 
 | Project | Measures |
 | --- | --- |
-| `benchmarks/Solarium.Benchmarks` | BenchmarkDotNet: `Put`, memtable and range tombstone reads, raw `IStorageFile` I/O. Also three whole-workload scenarios: compaction, synced writes beside background writes, and a hyperthread sibling load. |
+| `benchmarks/Solarium.Benchmarks` | BenchmarkDotNet cases for `Put`, reads and storage files, and scenarios that execute a complete workload. |
 | `benchmarks/Solarium.Kommander.Benchmarks` | Kommander's Raft log: `SolariumWAL` against `RocksDbWAL` through Kommander's `IWAL`. |
 | `benchmarks/Solarium.Kahuna.Benchmarks` | Kahuna's store: `SolariumPersistenceBackend` against `RocksDbPersistenceBackend` through Kahuna's `IPersistenceBackend`. |
 
-Every result below comes from one session on 2026-10-29, on the commit that moved memtables and cached data blocks to native memory, unless its section gives another date:
+The results come from one session on 2026-10-29, unless a section gives another date. The machine was a 13th Gen Intel Core i7-13620H (16 CPUs) with 31 GiB of memory and Linux 6.12. The drive was a Samsung PM9B1 NVMe with ext4, where a synced 1 KiB append took about 1 ms at the median. The benchmarks used the server GC, as Kahuna's and Kommander's servers do.
 
-- 13th Gen Intel Core i7-13620H (16 CPUs), 31 GiB of memory, Linux 6.12;
-- ext4 on a Samsung PM9B1 NVMe drive, where a synced 1 KiB append took about 1 ms at the median;
-- every benchmark under the server GC, as Kahuna's and Kommander's servers run.
-
-Results taken on the same machine before 2026-10-29 are in this file's history. Synced writes then took 4 to 8 ms on this drive, so synced rates there are 2 to 5 times lower than here; the ratios between the engines carry over.
-
-The GC changes the result of a change. Under the workstation GC, BenchmarkDotNet's default, collections took 20% to 29% of an unsynced `Put`, against 7% to 9% under the server GC. A change measured under one GC can therefore lose under the other.
+Note that the GC changes the results. Under the workstation GC, BenchmarkDotNet's default, collections took 20% to 29% of an unsynced `Put`. Under the server GC they took 7% to 9%.
 
 ## Running them
 
 ### `Solarium.Benchmarks`
 
-It needs io_uring and stops if it is not available. In Docker:
+It needs io_uring. You can use Docker.
 
 ```sh
 docker build -t solarium-test .
@@ -30,44 +24,43 @@ docker run --rm --security-opt seccomp=unconfined --ulimit memlock=-1 --entrypoi
     run -c Release --no-build --project benchmarks/Solarium.Benchmarks -- --filter '*'
 ```
 
-On the host, run it from the repository, so BenchmarkDotNet finds the project, with `TMPDIR` on the drive to measure: every case writes under the temporary directory.
+On the host, start it in the repository, and point `TMPDIR` at the drive to measure. All cases write under the temporary directory.
 
-The `Put` cases compare these stores:
+The `Put` cases compare several stores.
 
-- Solarium on each storage environment (`solarium-default`, `solarium-io_uring`);
-- RocksDB through `Kommander.RocksDB`, Kommander's binding, with its defaults (`rocksdb`);
-- RocksDB with `enable_pipelined_write` (`rocksdb-pipelined`);
-- RocksDB with `allow_concurrent_memtable_write` off (`rocksdb-serial`), with `enable_write_thread_adaptive_yield` off (`rocksdb-block`), or with both off (`rocksdb-serial-block`).
+| Store | Configuration |
+| --- | --- |
+| `solarium-default`, `solarium-io_uring` | Solarium on each storage environment |
+| `rocksdb` | RocksDB through `Kommander.RocksDB`, with its defaults |
+| `rocksdb-pipelined` | RocksDB with `enable_pipelined_write` |
+| `rocksdb-serial` | RocksDB with `allow_concurrent_memtable_write` off |
+| `rocksdb-block` | RocksDB with `enable_write_thread_adaptive_yield` off |
+| `rocksdb-serial-block` | RocksDB with both off |
 
-The cases:
+| Case | Workload |
+| --- | --- |
+| `SyncedPut` | Synced `Put`s |
+| `UnsyncedPut` | Unsynced `Put`s, with memtable flushes (`NoFlush: False`) or into one large memtable |
+| `UnsyncedPutWithReaders` | Unsynced `Put`s beside 4 or 16 threads that `Get` existing keys |
 
-- **`SyncedPut`**: synced `Put`s.
-- **`UnsyncedPut`**: unsynced `Put`s, with memtable flushes (`NoFlush: False`) or into one memtable that holds the whole iteration.
-- **`UnsyncedPutWithReaders`**: unsynced `Put`s beside 4 or 16 threads that `Get` keys already written.
+The cases use 1, 2, 4 and 16 writer threads and 128-byte values. Each iteration opens a new database and writes the same number of `Put`s.
 
-Each runs from 1, 2, 4 and 16 writer threads, with 128-byte values. Every iteration opens a new, empty database and writes the same number of `Put`s.
+A `--filter` selects cases by their parameters, in the order `NoFlush` or `Readers`, then `Store`, then `Threads`. An example is `'*UnsyncedPut(NoFlush: True, Store: "solarium-default"*'`. The `Allocated` column counts managed memory only, which excludes RocksDB's allocations and Solarium's memtables.
 
-A `--filter` selects cases by their parameters, in the order `NoFlush` or `Readers`, then `Store`, then `Threads`. For example: `'*UnsyncedPut(NoFlush: True, Store: "solarium-default"*'`. The `Allocated` column counts managed memory only, so it leaves out RocksDB's allocations and Solarium's memtables.
+At the end, a `Put` case prints diagnostic lines that start with `//`: `Write groups`, `CPU time`, `Threads` (Linux) and `Reads`.
 
-At the end of each `Put` case, the benchmark prints diagnostic lines that start with `//`:
-
-- `// Write groups`: the write groups by their number of writers, the waits for a leader, the spins and the concurrent inserts.
-- `// CPU time`: the process's user and system time during the writes.
-- `// Threads`: the time each kind of thread ran and waited in a run queue, on Linux.
-- `// Reads`: the reads per second, in the cases with readers.
-
-Environment variables change a run:
+Environment variables change the configuration.
 
 | Variable | Effect |
 | --- | --- |
-| `SOLARIUM_BENCH_THREADS` | A comma-separated list of writer thread counts in place of 1, 2, 4 and 16. |
+| `SOLARIUM_BENCH_THREADS` | A comma-separated list of writer thread counts. |
 | `SOLARIUM_WRITER_SPIN_US`, `SOLARIUM_WRITER_SHORT_SPIN_US` | The long and the short spin of a waiting writer, in microseconds. |
 | `SOLARIUM_WRITER_SPIN_PROBE_INTERVAL` | The interval of the spin probes; 0 gives a fixed spin of `SOLARIUM_WRITER_SPIN_US`. |
 | `SOLARIUM_ALLOW_CONCURRENT_MEMTABLE_WRITE=0` | The leader inserts every batch of its group. |
-| `SOLARIUM_ENABLE_PIPELINED_WRITE=0` | Turns off pipelined commits, RocksDB's `enable_pipelined_write`, which Solarium turns on by default. |
+| `SOLARIUM_ENABLE_PIPELINED_WRITE=0` | Turns off pipelined commits. |
 | `SOLARIUM_MEASURE_GROUP_STAGES=1` | Times the stages of each group on the leader's thread and prints them. |
 
-The scenarios run a whole workload to its end:
+The scenarios execute a complete workload.
 
 ```sh
 dotnet run -c Release --project benchmarks/Solarium.Benchmarks -- compaction own|shared|random solarium|rocksdb [name=value ...]
@@ -75,19 +68,21 @@ dotnet run -c Release --project benchmarks/Solarium.Benchmarks -- synced [compac
 dotnet run -c Release --project benchmarks/Solarium.Benchmarks -- sibling-load writer-spin|busy <threads>
 ```
 
-The compaction scenarios run with Kommander's shard options: at most 8 background jobs, level 0 triggers of 8, 28 and 44, a WAL cap of two memtables, 16 MiB memtables, and no compression in either engine.
+The compaction scenarios use Kommander's shard options: at most 8 background jobs, level 0 triggers of 8, 28 and 44, a WAL cap of two memtables, and 16 MiB memtables. Compression is off in both engines.
 
-- `own` is Kommander's Raft log with one partition per family. 4 partitions append 4 million rows each, 256-byte values in batches of 100. Every 100,000 rows, each partition raises its floor to keep 1 million rows and drops the files below the floor.
-- `shared` puts 16 partitions on 8 families, as Kommander does past 8 partitions, so the floors' tombstones cover the whole dead range.
-- `random` writes 12 million `Put`s of keys drawn uniformly from 4 million, from 4 threads.
+| Scenario | Workload |
+| --- | --- |
+| `own` | Kommander's Raft log with one partition per family. 4 partitions append 4 million rows each, 256-byte values in batches of 100. Each 100,000 rows, a partition raises its floor to retain 1 million rows and drops the files below it. |
+| `shared` | 16 partitions on 8 families. The floors' tombstones cover the complete dead range. |
+| `random` | 12 million `Put`s from 4 threads, with keys drawn from 4 million. |
+| `synced` | Loads 2 million random keys with 1 KiB values, then writes synced batches of 1,024 rows over them. |
+| `sibling-load` | A load on the container's CPUs, to measure the cost of a busy hyperthread sibling. |
 
-Each scenario prints its write amplification (flush and compaction bytes over the user's, without the WAL), the deepest level 0, the stall time, and the live table bytes against the rows kept. The `name=value` arguments set its sizes and options; `compactions` sets Solarium's compaction threads, 6 by default.
-
-`synced` loads 2 million random keys with 1 KiB values, then writes synced batches of 1,024 rows over them. Each second it prints the rows written, the memtable switches that waited for a flush, the stalls, and the time in the WAL append. `sibling-load` runs a load on the CPUs given to its container, to measure what a busy hyperthread sibling costs a case.
+A compaction scenario prints its write amplification (flush and compaction bytes over the user's, excluding the WAL), the deepest level 0, the stall time, and the live table bytes against the rows kept. The `name=value` arguments set sizes and options. For example, `compactions` sets Solarium's compaction threads, 6 by default.
 
 ### `Solarium.Kommander.Benchmarks`
 
-It measures `RocksDbWAL` from Kommander 1.11.3, and `SolariumWAL` on the default and the io_uring environment, each with its default tuning. Each writer thread writes its own partition, as `RaftManager` does.
+It measures `RocksDbWAL` from Kommander 1.11.3 and `SolariumWAL` on both environments, with their default tuning. Each writer thread has one partition, as in `RaftManager`.
 
 ```sh
 dotnet run -c Release --project benchmarks/Solarium.Kommander.Benchmarks -- [--cases quick|full] [--only <text>] \
@@ -95,24 +90,20 @@ dotnet run -c Release --project benchmarks/Solarium.Kommander.Benchmarks -- [--c
     [--rate <ops/s per writer>] [--dir <path>] [--csv <file>]
 ```
 
-The workloads:
+| Workload | Operations |
+| --- | --- |
+| `append` | One `Proposed` entry per `Write` |
+| `commit` | An entry, then its `Committed` marker |
+| `batch` | 64 entries per `Write` |
+| `mixed` | An append and a commit per entry, with a checkpoint and a compaction pass each 1,000 entries. One reader per 4 writers reads the last 64 entries of a random partition. |
 
-- **`append`**: one `Proposed` entry per `Write`.
-- **`commit`**: an entry, then its `Committed` marker.
-- **`batch`**: 64 entries per `Write`.
-- **`mixed`**: an append and its commit per entry, with a checkpoint and a compaction pass every 1,000 entries. Reader threads, one per 4 writers, read the last 64 entries of a random partition.
+The engines of a case take turns in a rotating order. A run warms up for 2 s, measures for 8 s, and checks the log afterward. The summary has the median of three repeats.
 
-The engines of a case take turns in an order that rotates. Each run warms up for 2 s and measures for 8, and checks the log afterward. The summary takes the median of three repeats.
-
-Run synced cases on the drive and unsynced cases on tmpfs (`--dir /dev/shm`). On a disk, unsynced runs measure the kernel's writeback, not the engine: repeats differed up to ten times. On a 16 GB tmpfs, measure Solarium's unsynced 4 KiB appends and batches for 4 to 5 s: 8 s of them fill it.
+You should put synced cases on the drive and unsynced cases on tmpfs (`--dir /dev/shm`). Unsynced runs on a disk measure the kernel's writeback, and repeats differed up to ten times. On a 16 GB tmpfs, limit Solarium's unsynced 4 KiB appends and batches to 4 to 5 s, or they fill it.
 
 ### `Solarium.Kahuna.Benchmarks`
 
-It opens each backend through its storage provider with Kahuna's default configuration:
-
-- `rocksdb`: Kahuna's RocksDB defaults, with direct reads and a 256 MiB block cache;
-- `rocksdb-buffered`: the same with direct reads off, so its tables are read through the page cache, as Solarium's are;
-- Solarium on the default environment (`solarium`) and on io_uring (`solarium-io_uring`).
+It opens each backend through its storage provider, with Kahuna's default configuration. `rocksdb` has direct reads and a 256 MiB block cache. `rocksdb-buffered` turns direct reads off and uses the page cache, as Solarium does.
 
 ```sh
 dotnet run -c Release --project benchmarks/Solarium.Kahuna.Benchmarks -- --dir <path on the disk> [--cases quick|full] \
@@ -120,36 +111,35 @@ dotnet run -c Release --project benchmarks/Solarium.Kahuna.Benchmarks -- --dir <
     [--warmup 2] [--seconds 8] [--threads 1,8] [--only <text>] [--csv <file>]
 ```
 
-The datasets:
-
 | Dataset | Keys | Values | Note |
 | --- | --- | --- | --- |
 | `small` | 200,000 | 256 bytes | Fits in the page cache. |
 | `large` | 2,000,000 | 1 KiB | About 2 GB of values. |
 | `history` | 10,000 | 256 bytes | Each key written 8 times. |
 
-Keys come in groups of 100 that share a prefix, and every row has its own random value, so compression does not shrink the store to nothing.
+Keys come in groups of 100 that share a prefix, and each row has a random value.
 
-A session runs these steps:
-
-1. Load the dataset in synced batches of 1,024 rows, as Kahuna's background writer does.
+1. Load the dataset in synced batches of 1,024 rows.
 2. Reopen the store.
 3. Wait for the drive to go quiet ("drain").
-4. Run the measured cases:
-   - `get`, `get-miss` and `get-batch16` (16 keys);
-   - `prefix100` and `range100` (100 rows);
-   - `store` of 1, 64 and 1,024 rows per synced call;
-   - `mixed`: 8 readers beside a writer paced to 20,000 rows per second;
-   - `checkpoint` and `checkpoint-asof`;
-   - on `history` only, a `prune` sweep.
+4. Measure the cases.
 
-Each case also gives the CPU, the allocations, and the bytes read from and written to the drive per operation, from `/proc/self/io`.
+| Case | Operation |
+| --- | --- |
+| `get`, `get-miss`, `get-batch16` | Point reads, misses, and batches of 16 keys |
+| `prefix100`, `range100` | Scans of 100 rows |
+| `store b1`, `store b64`, `store b1024` | Synced writes of 1, 64 and 1,024 rows per call |
+| `mixed` | 8 readers beside a writer paced to 20,000 rows per second |
+| `checkpoint`, `checkpoint-asof` | Checkpoints |
+| `prune` | A revision sweep, on `history` only |
+
+The output also has the CPU, the allocations and the drive I/O per operation.
 
 ## Results
 
 ### `Put`
 
-Time per unsynced `Put`, with memtable flushes (`UnsyncedPut`, `NoFlush: False`). The fastest RocksDB variant for each thread count is named in the last column:
+Time per unsynced `Put`, with memtable flushes (`UnsyncedPut`, `NoFlush: False`).
 
 | Threads | Solarium | Solarium, io_uring | RocksDB | Fastest RocksDB variant |
 | ---: | ---: | ---: | ---: | ---: |
@@ -158,16 +148,15 @@ Time per unsynced `Put`, with memtable flushes (`UnsyncedPut`, `NoFlush: False`)
 | 4 | 864 ns | 3,820 ns | 1,184 ns | 906 ns (`pipelined`) |
 | 16 | 808 ns | 2,260 ns | 1,304 ns | 1,255 ns (`pipelined`) |
 
-- **Unsynced writes are faster than RocksDB's.** Without flushes (`NoFlush: True`), Solarium took 704 to 1,032 ns and RocksDB 1,194 to 1,931 ns.
-- **Readers slow them down less.** With 4 readers, Solarium took 1.0 to 1.5 µs per `Put`, against 1.6 to 3.0 µs for RocksDB with its defaults. With 16 readers on the 16 CPUs, it took 2.8 to 3.3 µs. RocksDB took 4.4 to 21.8 µs with its defaults, and 4.3 to 7.0 µs with its best variant for each thread count. The 16 readers made 9.1 to 9.9 million `Get`s per second beside Solarium's writers, and 5.4 to 5.9 million beside those of RocksDB's variants.
-- **io_uring is slow for unsynced writes.** Each write is a hand-off to the reactor thread, so it took 3 to 7 times as long as on the default environment. With 16 readers taking every CPU, the reactor waits for a CPU: 37 to 44 µs per `Put`. On the commit before memtables moved to native memory, the case with 1 writer took 25 µs, with readers that made 8.8 million `Get`s per second against 10.7 million now. Faster reads probably leave the reactor less CPU; that was not measured further.
-- **Synced writes are bound by the drive.** From 1 and 16 threads, Solarium matched RocksDB within 4%: 975 µs and 130 µs per `Put`, against 974 µs and 125 µs. From 2 and 4 threads it took 875 µs and 467 µs, against 636 µs and 384 µs. Solarium on io_uring took 740 µs and 501 µs there.
-
-Solarium allocated 560 to 580 B of managed memory per synced `Put`, and RocksDB's binding none.
+- **Unsynced writes** are faster than RocksDB's. With flushes off, Solarium took 704 to 1,032 ns and RocksDB 1,194 to 1,931 ns.
+- **Readers** slow Solarium's writes down less. With 4 readers, Solarium took 1.0 to 1.5 µs per `Put` and RocksDB's defaults 1.6 to 3.0 µs. With 16 readers, Solarium took 2.8 to 3.3 µs, RocksDB's defaults 4.4 to 21.8 µs, and its best variants 4.3 to 7.0 µs. The 16 readers made 9.1 to 9.9 million `Get`s per second beside Solarium's writers, and 5.4 to 5.9 million beside RocksDB's.
+- **io_uring** took 3 to 7 times as long for unsynced writes, since each write is a hand-off to the reactor thread. With 16 readers it took 37 to 44 µs per `Put`.
+- **Synced writes** are bound by the drive. From 1 and 16 threads, Solarium matched RocksDB within 4%: 975 µs and 130 µs per `Put`, against 974 µs and 125 µs. From 2 and 4 threads it took 875 µs and 467 µs, against 636 µs and 384 µs. Solarium on io_uring took 740 µs and 501 µs there.
+- **Allocations** were 560 to 580 B of managed memory per synced `Put`. RocksDB's binding allocated none.
 
 ### Memtable and range tombstone reads
 
-`MemTableReadBenchmarks`, on a memtable of 921,600 entries:
+`MemTableReadBenchmarks` uses a memtable of 921,600 entries.
 
 | | Time | Allocated |
 | --- | ---: | ---: |
@@ -175,9 +164,9 @@ Solarium allocated 560 to 580 B of managed memory per synced `Put`, and RocksDB'
 | `IteratorNext` | 19.9 ns | 0 B |
 | `IteratorPrev` | 296 ns | 264 B |
 
-A memtable node and its key are one place in its native arena, so each step of a search reads one place where a managed node, its links and its key were three objects. `Prev` copies the key of each source at each step. The iterator copies each position into buffers it reuses, so `Next` allocates nothing, and `Key()` and `Value()` are valid until the iterator moves, as in RocksDB. A `Get` allocates its value and no copy of its key.
+`Next` allocates nothing, since the iterator reuses its buffers. `Prev` copies the key of each source at each step.
 
-`TableReadBenchmarks` reads the same 921,600 entries from one SSTable that a flush wrote: `Get` of keys that are there, `GetMissing` of keys inside the table's range that are not, which the Bloom filter answers, and `IteratorNext` over 65,536 rows. `Blocks` selects where the data blocks come from: the file, or a block cache that holds the whole table (`CacheDataBlocks`). On a development machine (macOS, Apple silicon, the file in the OS page cache), not the machine of the other tables:
+`TableReadBenchmarks` reads the same entries from one SSTable. `GetMissing` reads absent keys in the table's range, which the Bloom filter answers. `IteratorNext` covers 65,536 rows. The blocks come from the file or from a block cache that fits the table (`CacheDataBlocks`). These results are from a development machine (macOS, Apple silicon, the file in the page cache).
 
 | | Time, file | Time, cached | Allocated |
 | --- | ---: | ---: | ---: |
@@ -185,18 +174,16 @@ A memtable node and its key are one place in its native arena, so each step of a
 | `GetMissing` | 97 ns | 89 ns | 0 B |
 | `IteratorNext` | 38 ns | 26 ns | 0 B |
 
-A table cursor reads each key and value in place in its data block, and reads the file ahead once its reads follow one another, so a step of a scan allocates nothing. An iterator asks only the sources that hold a range tombstone whether one covers a key, so in a store with none a step asks no source: with a question to every source, a step took 44 ns and 31 ns. When the cursor copied each entry of a block into new arrays and read one block at a time, a step took 69 ns from the file and 44 ns from the cache, and allocated 208 B.
-
-`CompactRangeBenchmarks` times one manual compaction and one flush, each on a store that its iteration builds: 1,000,000 `Put`s of a 31-byte key and a 128-byte value, keys drawn at random from 500,000, in four level 0 tables that the compaction merges; the flush writes the last quarter of them. On the same development machine, the median of 10 runs, which include the flush of the output to the drive:
+`CompactRangeBenchmarks` times one manual compaction and one flush on the same development machine. The store has 1,000,000 `Put`s of 31-byte keys, drawn from 500,000, and 128-byte values, in four level 0 tables. The flush writes the last quarter. The results are medians of 10 iterations and include the flush to the drive.
 
 | | Time, no compression | Time, LZ4 | Allocated |
 | --- | ---: | ---: | ---: |
 | `CompactRange` | 103 ms | 99 ms | 7.4 MB |
 | `Flush` | 45 ms | 46 ms | 2.8 MB |
 
-The merge and the flush take each entry from the input's block or the memtable's memory into the output's block with no array between. With an array for each key and value, the compaction took 113 ms and 109 ms and allocated 163 MB, and the flush 53 ms and 52 ms and 42 MB. A compaction's cursor reads 256 KiB of its file at a time: with RocksDB's 2 MiB, the merge without compression took 144 ms, since four windows of that size do not fit a processor's cache. The whole-workload scenario `compaction random` showed no difference outside its noise: its time is the writers'.
+With a compaction readahead of 2 MiB, RocksDB's default, the uncompressed merge took 144 ms. Solarium uses 256 KiB.
 
-`RangeTombstoneReadBenchmarks`, live keys beside range tombstones that the memtable or the table keeps fragmented:
+`RangeTombstoneReadBenchmarks` reads live keys beside fragmented range tombstones.
 
 | Tombstones | `Get`, memtable | `Next`, memtable | `Get`, table | `Next`, table |
 | ---: | ---: | ---: | ---: | ---: |
@@ -205,13 +192,11 @@ The merge and the flush take each entry from the input's block or the memtable's
 | 1,024 | 195 ns | 42 ns | 661 ns | 112 ns |
 | 8,192 | 204 ns | 48 ns | 687 ns | 120 ns |
 
-Before fragmentation, a read scanned every tombstone of each source: 37 µs per `Get` beside 8,192 of them.
-
-`RangeTombstoneChurnBenchmarks` alternates a `DeleteRange` with a `Get` or with the `Seek` of a new iterator, with 0 or 4 threads reading meanwhile. A pair took 3 to 12 µs at every tombstone count from 0 to 8,192, and allocated 1.3 to 3.1 KB without readers. The runs that each delete builds keep the read after it from rebuilding all the fragments (see [design.md](design.md)). When the memtable fragmented all its tombstones at the first read after each delete, as RocksDB does, a pair took 2 ms at 8,192.
+`RangeTombstoneChurnBenchmarks` alternates a `DeleteRange` with a `Get` or the `Seek` of a new iterator, beside 0 or 4 reader threads. A pair took 3 to 12 µs at all tombstone counts from 0 to 8,192.
 
 ### Storage files
 
-`StorageFileBenchmarks` and `StorageFileWriteBenchmarks`, time per positional read or write, on the drive:
+Time per positional read or write on the drive (`StorageFileBenchmarks`, `StorageFileWriteBenchmarks`).
 
 | | 4 KB | 64 KB |
 | --- | ---: | ---: |
@@ -220,11 +205,11 @@ Before fragmentation, a read scanned every tombstone of each source: 37 µs per 
 | write, default | 0.93 µs | 13.8 µs |
 | write, io_uring | 6.33 µs | 21.7 µs |
 
-Reads match because the io_uring environment reads with `pread` on the calling thread. A write is a hand-off to the reactor (see [storage-environments.md](storage-environments.md)).
+For the reasons, see [storage-environments.md](storage-environments.md).
 
 ### Compaction scenarios
 
-One run of each:
+Each scenario ran once.
 
 | | `own`, Solarium | `own`, RocksDB | `shared`, Solarium | `shared`, RocksDB | `random`, Solarium | `random`, RocksDB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -235,13 +220,13 @@ One run of each:
 | writes stalled | 0 s | 0 s | 0 s | 0 s | 0.5 s | 6.0 s |
 | settled live tables against the rows kept | 1.07x | 0.98x | 1.78x | 1.25x | 1.27x | 1.23x |
 
-- **Appended keys write nothing.** In Kommander's `own` layout, Solarium moved all 289 flushed files down without a rewrite, and RocksDB wrote no compaction byte either.
-- **`random` ran 1.8 times as fast as RocksDB,** for 7% more compaction bytes, with level 0 at the slowdown trigger in 24 of 1,056 samples.
-- **`shared` settles with more dead rows.** It wrote less than RocksDB, but settled at 1.78 times the rows kept, against 1.25; the cause was not measured.
+- **`own`** wrote no compaction bytes in either engine. Solarium moved all 289 flushed files down as they were.
+- **`random`** was 1.8 times as fast as RocksDB, for 7% more compaction bytes.
+- **`shared`** wrote less than RocksDB but settled at 1.78 times the rows kept, against 1.25. The cause was not measured.
 
 ### Synced writes beside background writes
 
-`synced`, 60 seconds of synced batches after the load:
+The table shows 60 seconds of synced batches after the load (`synced`).
 
 | Compaction threads, pacing | Synced rows per second |
 | --- | ---: |
@@ -253,19 +238,19 @@ One run of each:
 | 8, limiter of 50 MiB/s | 25,160 |
 | 8, limiter of 50 MiB/s, auto-tuned | 25,215 |
 
-Without a limiter, no memtable switch waited and no write stalled. The rate moved from second to second with the compactions running, from 16,000 to 100,000 rows per second.
+When the limiter was off, no write stalled. The rate moved between 16,000 and 100,000 rows per second with the active compactions.
 
 ### Paced background writes
 
-`DbOptions.RateLimiter` paces flushes as well as compactions. At 25 or 50 MiB/s, flushes fell behind the 50 to 65 MB/s that the synced batches wrote unpaced: a memtable switch waited for a flush in every sample, and the batches slowed to 0.2 to 0.4 times the unpaced rate.
+`DbOptions.RateLimiter` paces flushes as well as compactions. At 25 or 50 MiB/s, flushes fell behind the 50 to 65 MB/s that the synced batches wrote unpaced, and the batches slowed to 0.2 to 0.4 times the unpaced rate.
 
-A limiter helps only while its rate stays above the store's ingest and leaves the WAL part of the drive. On 2026-10-27, synced writes on this drive took 4 to 8 ms, and the batches made 11,000 to 13,000 rows per second. There, a limiter of 50 MiB/s brought 8 compaction threads back to the rate of one, and made Kahuna's `store b64` 2.5 to 3 times as fast. An auto-tuned limiter dropped to about 3 MiB/s after a quiet period, and the batches waited for level 0.
+A limiter helps only if its rate is above the store's ingest and leaves the WAL part of the drive. On 2026-10-27, synced writes on this drive took 4 to 8 ms. There, a limiter of 50 MiB/s brought 8 compaction threads back to the rate of one and made Kahuna's `store b64` 2.5 to 3 times as fast. An auto-tuned limiter dropped to about 3 MiB/s after a quiet period, and the batches waited for level 0.
 
-`BytesPerSync` alone changed the rate by -5% to +18%, within the spread of the compactions.
+`BytesPerSync` alone changed the rate by -5% to +18%, which is within the spread of the compactions.
 
 ### The Kommander WAL
 
-Entries per second, the median of three repeats. Synced cases ran on the drive, unsynced ones on tmpfs:
+Entries per second, the median of three repeats. Synced cases used the drive, and unsynced cases used tmpfs.
 
 | Case | RocksDB | Solarium | Solarium, io_uring | Solarium / RocksDB |
 | --- | ---: | ---: | ---: | ---: |
@@ -289,12 +274,13 @@ Entries per second, the median of three repeats. Synced cases ran on the drive, 
 | batch of 64, unsynced, 4 writers (4 s) | 610,612 | 1,683,181 | 1,584,192 | 2.76 |
 | mixed, unsynced, 4 writers | 189,440 | 286,339 | 98,292 | 1.51 |
 
-- **Synced writes are bound by the drive.** Both engines group concurrent writers into one sync and came out within 8% of each other, except batches from 16 writers at 1.2 times. Solarium spent less CPU per entry: 25 to 54 µs per synced append, against 39 to 112 µs for RocksDB.
-- **Unsynced writes measure the CPU.** Solarium wrote 1.5 to 2.8 times RocksDB's entries, with a lower median latency. Its p99.9 was higher in the appends and commits of 1 KiB or more from 4 writers or more: 0.2 to 1.9 ms, against RocksDB's 0.02 to 0.4 ms. Collections paused it 230 to 390 ms of each 10 s run. It allocated 1.6 to 9.2 KB of managed memory per entry, about twice the payload, where RocksDB's binding allocated 0 to 216 B. Where those allocations come from was not profiled; the memtable is native, so they come from the write path above it.
-- **io_uring is slower for unsynced writes,** 0.36 to 1.03 times RocksDB's: each write is a hand-off to the reactor. Batches of 64 amortize it, at 2.59 times RocksDB's.
-- **The mixed workload's readers read more on Solarium.** Synced, they made 218,000 to 230,000 reads per second, against RocksDB's 126,000. Unsynced, they made 41,000 to 45,000 on the default environment and 50,000 to 58,000 on io_uring, against 35,000 to 37,000.
+- **Synced writes** are bound by the drive. The engines were within 8% of each other, except batches from 16 writers at 1.2 times. Solarium used 25 to 54 µs of CPU per synced append, and RocksDB 39 to 112 µs.
+- **Unsynced writes** measure the CPU. Solarium wrote 1.5 to 2.8 times RocksDB's entries, with a lower median latency. Its p99.9 was higher for appends and commits of 1 KiB or more from 4 or more writers: 0.2 to 1.9 ms, against 0.02 to 0.4 ms. Collections paused it 230 to 390 ms in 10 s.
+- **Allocations** were 1.6 to 9.2 KB of managed memory per entry, about twice the payload. RocksDB's binding allocated 0 to 216 B. The source was not profiled.
+- **io_uring** wrote 0.36 to 1.03 times RocksDB's unsynced entries, and 2.59 times in batches of 64, which amortize the hand-off.
+- **The mixed readers** made 218,000 to 230,000 reads per second in the synced case, against RocksDB's 126,000. In the unsynced case they made 41,000 to 45,000 on the default environment and 50,000 to 58,000 on io_uring, against 35,000 to 37,000.
 
-`--rate` paces each writer. Four unsynced writers of 1 KiB entries, 20 s measured, one repeat:
+`--rate` paces each writer. This test used four unsynced writers of 1 KiB entries, with 20 s measured and one repeat.
 
 | Ingest | p99.9, RocksDB / Solarium | Longest write, RocksDB / Solarium | GC pause, Solarium |
 | --- | --- | --- | ---: |
@@ -304,9 +290,9 @@ Entries per second, the median of three repeats. Synced cases ran on the drive, 
 
 ### Kahuna's persistence backend
 
-Operations per second (rows for writes and scans, keys for batched reads), or seconds for the cases that run once. The median of three repeats, in the page cache.
+Operations per second (rows for writes and scans, keys for batched reads), or seconds. The values are medians of three repeats, in the page cache.
 
-`large`:
+This table is for `large`.
 
 | Case | rocksdb | rocksdb-buffered | Solarium | Solarium, io_uring | Solarium / rocksdb-buffered |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -327,7 +313,7 @@ Operations per second (rows for writes and scans, keys for batched reads), or se
 | checkpoint | 0.03 s | 0.04 s | 0.04 s | 0.04 s | 1.0 |
 | checkpoint-asof | 12.1 s | 16.9 s | 16.7 s | 18.1 s | 1.01 |
 
-`small` and `history`, Solarium against `rocksdb-buffered`:
+This table compares `small` and `history` with `rocksdb-buffered`.
 
 | Case | `small`, rocksdb-buffered | `small`, Solarium | `history`, rocksdb-buffered | `history`, Solarium |
 | --- | ---: | ---: | ---: | ---: |
@@ -343,16 +329,16 @@ Operations per second (rows for writes and scans, keys for batched reads), or se
 | checkpoint-asof | 3.72 s | 3.22 s | 3.55 s | 3.05 s |
 | prune | - | - | 180,340 | 236,408 |
 
-- **Reads from the page cache beat RocksDB's, with no block cache for data.** On `large`, Solarium made 1.05 to 1.8 times `rocksdb-buffered`'s gets and scans; on `history`, 1.4 to 1.95 times; on `small`, 0.93 to 1.35 times. Misses are the exception on `small` and `history`: 0.68 to 0.99 times. Those stores are small enough that part of them is probably still in memtables, which Solarium replays from its WAL at open, where RocksDB flushes them; that was not measured.
-- **io_uring reads as fast as the default environment,** except misses from 8 threads on `large`, at 0.8 times: its reads are `pread`s on the calling thread.
-- **Kahuna's RocksDB defaults lose on every read that misses the block cache.** With direct reads, each such block comes from the drive. On `large`, `rocksdb` read 3 KB per get from the drive and made 14,000 gets per second from one thread.
-- **Writes.** Synced writes of one row are bound by the drive on every engine. Larger synced batches, and loads, ran 1.07 to 1.32 times `rocksdb-buffered`'s. Solarium wrote fewer bytes per row than RocksDB: 7,013 against 7,958 for the `large` load, and 9,771 against 12,561 for `store b1024`. The mixed writer reached its 20,000 rows per second on every engine but `rocksdb`.
-- **The drain after the load is longer.** Every store settled at 2.4 to 2.6 GB. The compactions that the load left behind wrote 2.2 to 4.3 GB on Solarium, against 0.7 to 1.6 GB on RocksDB, which runs up to 8 compactions at once where `Solarium.Kahuna` runs one.
-- **Checkpoints link tables,** as RocksDB's do. `checkpoint-asof` trims the copy and compacts it, and took as long as `rocksdb-buffered`'s.
+- **Reads** from the page cache are faster than `rocksdb-buffered`'s: 1.05 to 1.8 times on `large`, 1.4 to 1.95 times on `history`, and 0.93 to 1.35 times on `small`. Misses on `small` and `history` are slower, at 0.68 to 0.99 times. The cause was not measured. It may be that part of these stores is in memtables, which Solarium replays from its WAL at open.
+- **io_uring** reads as fast as the default environment, except misses from 8 threads on `large`, at 0.8 times.
+- **Kahuna's RocksDB defaults** are slow on reads that miss the block cache. With direct reads, each of these blocks comes from the drive.
+- **Writes** of one synced row are bound by the drive. Larger synced batches and loads were 1.07 to 1.32 times as fast as `rocksdb-buffered`'s. Solarium wrote 7,013 bytes per row for the `large` load, against 7,958, and 9,771 for `store b1024`, against 12,561.
+- **The drain** after the load is longer. The remaining compactions wrote 2.2 to 4.3 GB on Solarium and 0.7 to 1.6 GB on RocksDB, which uses up to 8 compactions at once. `Solarium.Kahuna` uses one.
+- **Checkpoints** link tables, as RocksDB's do. `checkpoint-asof` also trims and compacts the copy.
 
 ### Larger than memory
 
-The `large` dataset again, one repeat per engine, each in its own process under a 2 GiB memory limit (`systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0`). The limit bounds the page cache to less than any store:
+This is the `large` dataset with one repeat per engine, under a 2 GiB memory limit (`systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0`). The limit makes the page cache smaller than the stores.
 
 | Case | rocksdb | rocksdb-buffered | Solarium | Solarium, io_uring |
 | --- | ---: | ---: | ---: | ---: |
@@ -367,12 +353,12 @@ The `large` dataset again, one repeat per engine, each in its own process under 
 | mixed, writer rows per second | 7,320 | 13,191 | 7,176 | 11,120 |
 | checkpoint-asof | 37.1 s | 30.1 s | 17.4 s | 25.7 s |
 
-- **Gets and scans are bound by the drive.** Each engine read about 3 to 4 KB from the drive per get. Solarium made 1.2 to 1.3 times `rocksdb-buffered`'s gets, and 1.8 times its scans; a scan read 0.7 KB where RocksDB read 2.1 KB.
-- **Writes lose under the limit.** Solarium's load ran at 0.9 times, `store b1024` at 0.33 times, and its mixed writer at 0.54 times. Solarium on io_uring loaded slower, but wrote `store b1024` at 1.4 times `rocksdb-buffered`'s rows. Each engine ran once, so these rows vary more than the medians above.
+- **Gets and scans** are bound by the drive. Solarium made 1.2 to 1.3 times `rocksdb-buffered`'s gets and 1.8 times its scans. A scan read 0.7 KB, where RocksDB read 2.1 KB.
+- **Writes** are slower under the limit. Solarium's load was 0.9 times as fast, `store b1024` 0.33 times, and the mixed writer 0.54 times. On io_uring, the load was slower and `store b1024` was 1.4 times as fast as `rocksdb-buffered`'s. With one repeat, these rows vary more than the medians above.
 
 ### Data blocks in a cache
 
-`ColumnFamilyOptions.CacheDataBlocks` puts the data blocks that reads take into the block cache, verified and decompressed, in native memory. The read cases of a build in which every family of the Kahuna store caches its data blocks in Kahuna's shared 256 MiB cache. Three sessions on `small`, which fits in the cache, and two on `large`, about ten times its size. Ratios to the results above, for the default environment and io_uring:
+For this test, all families of the Kahuna store cached their data blocks (`ColumnFamilyOptions.CacheDataBlocks`) in Kahuna's shared 256 MiB cache. `small` fits in the cache, and `large` is about ten times its size. The values are ratios to the results above, for the default environment and io_uring. There were three sessions on `small` and two on `large`.
 
 | Case | `small` | `large` |
 | --- | ---: | ---: |
@@ -387,14 +373,14 @@ The `large` dataset again, one repeat per engine, each in its own process under 
 | range100, 8 threads | 1.05, 1.01 | 0.78, 0.78 |
 | mixed | 1.25, 1.34 | 0.87, 0.87 |
 
-- **On a store that fits, it pays from 1 and from 8 threads:** 1.14 to 1.46 times the gets, and 1.25 to 1.34 times in the mixed workload. Each hit saves a system call, a checksum and an LZ4 decompression. Misses from 8 threads lose, at 0.75 times; that was not profiled.
-- **On a store ten times the cache, it loses, at 0.65 to 0.93 times,** except misses from 8 threads on io_uring. Most reads miss, and a miss copies its block into the cache and evicts another under the shard's lock. The garbage collector no longer pays for it: a get allocated about 2.4 KB of managed memory with the cache or without, and gen 2 collections stayed at 0 to 2 per case.
+- **On a store that fits,** gets were 1.14 to 1.46 times as fast, and the mixed workload 1.25 to 1.34 times. Misses from 8 threads were 0.75 times as fast. That was not profiled.
+- **On a store ten times the cache,** reads were 0.65 to 0.93 times as fast, except misses from 8 threads on io_uring. Most reads miss, and a miss copies its block into the cache and evicts another under the shard's lock.
 
-So `CacheDataBlocks` stays off by default, and neither `SolariumWAL` nor `Solarium.Kahuna` sets it. A store that fits in its cache gains from it.
+For this reason `CacheDataBlocks` is off by default, and `SolariumWAL` and `Solarium.Kahuna` do not set it.
 
 ### Index and filter blocks in a cache
 
-This one comes from a scratch program, run on 2026-10-26 on fully compacted stores in tmpfs, and is not in the repository. It measured `Get` on stores of Kahuna's shapes, with each table's index and filter split into partitions of about 4 KB under a top-level index:
+A scratch program, which is not in the repository, measured `Get` on 2026-10-26. The stores had Kahuna's shapes, were fully compacted, and were in tmpfs.
 
 | `Get`, thousands per second | Resident | Cache holds all | Cache of a quarter |
 | --- | ---: | ---: | ---: |
@@ -403,6 +389,6 @@ This one comes from a scratch program, run on 2026-10-26 on fully compacted stor
 | `large` LZ4, 1 thread | 489 | 464 | 213 |
 | `large` LZ4, 16 threads | 4,394 | 4,068 | 289 |
 
-- A cache that holds every partition read 2% to 7% slower than resident ones.
-- A cache of a quarter of them read 2.5 times slower from one thread, and 11 to 20 times slower from 16, where the misses' decoded partitions were garbage. Before partitions, a miss decoded a table's whole index and filter, about 1 MB, and lookups ran hundreds of times slower.
-- Opening a store adds about 1.2% to 1.7% of its table bytes to the heap, 2.4% to 3.4% with LZ4. A reader whose partitions are cached keeps only the top-level index, 0.04% of its table.
+- A cache that fits all the partitions was 2% to 7% slower than resident ones.
+- A cache of a quarter of them was 2.5 times slower from one thread, and 11 to 20 times slower from 16, where the misses' decoded partitions were garbage.
+- Opening a store adds about 1.2% to 1.7% of its table bytes to the heap, or 2.4% to 3.4% with LZ4. A reader whose partitions are cached has only the top-level index, 0.04% of its table.
